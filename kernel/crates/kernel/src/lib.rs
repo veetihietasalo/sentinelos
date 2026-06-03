@@ -26,6 +26,17 @@ pub fn kmain() -> ! {
     // is caught and reported rather than causing a triple fault → silent reset.
     interrupts::init();
 
+    // One-shot runtime self-test of the live IDT: `int3` → #BP handler → resume.
+    // Runs with interrupts still disabled (int3 is a software exception), so it
+    // is independent of the hardware-IRQ wiring set up further below.
+    interrupts::self_test();
+
+    // Bring up the hardware-interrupt foundation: remap the 8259 PIC pair to
+    // vectors 32–47, register the vector-32 timer handler, program the PIT to
+    // ~100 Hz, and unmask IRQ0. Interrupts stay DISABLED until `sti` below — we
+    // only enable them once every handler is registered.
+    interrupts::init_timer();
+
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");
     // Use concat! to bake the version into a literal at compile time, avoiding
@@ -45,9 +56,59 @@ pub fn kmain() -> ! {
     // boot test sees `boot-bringup-ok` immediately and is never delayed by the
     // (slow, per-pixel) software rendering. If no framebuffer was provided, we
     // simply skip it and stay headless.
-    if let Some(fb) = hal::framebuffer::get() {
-        ui::draw_boot_screen(&fb);
+    let framebuffer = hal::framebuffer::get();
+    if let Some(fb) = framebuffer.as_ref() {
+        ui::draw_boot_screen(fb);
     }
 
-    hal::cpu::halt_loop()
+    // Now that every handler is registered, open the interrupt window. From here
+    // the PIT fires IRQ0 (vector 32) at ~100 Hz; `hlt` in the idle loop wakes on
+    // each tick. (Safe wrapper over `sti`; the IDT + handlers are all live.)
+    hal::cpu::enable_interrupts();
+
+    idle_loop(framebuffer.as_ref())
+}
+
+/// The kernel idle loop: park on `hlt` and tick the on-screen clock.
+///
+/// `hlt` halts the core until the next interrupt — the PIT timer wakes us ~100
+/// times a second. Each wake we read the monotonic tick counter; when it crosses
+/// a new whole second we derive `HH:MM:SS` (counting up from the boot screen's
+/// 21:04:00) and redraw **only** the clock region (cheap), leaving the rest of
+/// the Cyber Dusk screen untouched. Diverging (`-> !`): the kernel never returns.
+fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
+    let tick_hz = hal::pit::TICK_HZ;
+    // Seconds elapsed at the previous redraw; start at "none drawn yet" so the
+    // first whole second triggers a draw.
+    let mut last_secs: u64 = u64::MAX;
+
+    loop {
+        // Sleep until the next interrupt (the PIT tick, at minimum).
+        hal::cpu::halt();
+
+        let secs = hal::pit::ticks() / tick_hz;
+        if secs == last_secs {
+            continue; // still within the same wall-clock second
+        }
+        last_secs = secs;
+
+        if let Some(fb) = fb {
+            let (h, m, s) = wall_clock(secs);
+            ui::draw_clock(fb, h, m, s);
+        }
+    }
+}
+
+/// Derive `HH:MM:SS` from whole seconds elapsed since boot, counting up from the
+/// boot screen's start time (21:04:00) and wrapping at 24 h.
+fn wall_clock(elapsed_secs: u64) -> (u8, u8, u8) {
+    const DAY: u64 = 24 * 60 * 60;
+    let start = (ui::CLOCK_START_H as u64 * 3600)
+        + (ui::CLOCK_START_M as u64 * 60)
+        + ui::CLOCK_START_S as u64;
+    let t = (start + elapsed_secs) % DAY;
+    let h = (t / 3600) as u8;
+    let m = ((t % 3600) / 60) as u8;
+    let s = (t % 60) as u8;
+    (h, m, s)
 }

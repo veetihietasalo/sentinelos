@@ -114,14 +114,12 @@ const GLOW_PINK: Rgb = Rgb::new(255, 120, 220);
 /// composite the pink over the recomputed gradient backdrop. A smoothstep keeps
 /// the falloff soft (no banding, no hard edge).
 fn draw_corner_glow(fb: &Framebuffer, gradient: &Gradient, w: usize, h: usize) {
-    // Ellipse centre and radii, in pixels.
+    // The glow vanishes at d == 0.6, so only scan the bounding box of that
+    // sub-ellipse (centre ± 0.6·r) — everything outside is fully transparent.
     let cx = (w * 70 / 100) as i64;
     let cy = (h * 8 / 100) as i64;
     let rx = ((w * 80 / 100).max(1)) as i64;
     let ry = ((h * 50 / 100).max(1)) as i64;
-
-    // The glow vanishes at d == 0.6, so only scan the bounding box of that
-    // sub-ellipse (centre ± 0.6·r) — everything outside is fully transparent.
     let edge_x = (rx * 6) / 10;
     let edge_y = (ry * 6) / 10;
     let x0 = (cx - edge_x).max(0) as usize;
@@ -129,37 +127,55 @@ fn draw_corner_glow(fb: &Framebuffer, gradient: &Gradient, w: usize, h: usize) {
     let y0 = (cy - edge_y).max(0) as usize;
     let y1 = ((cy + edge_y + 1).max(0) as usize).min(h);
 
+    for py in y0..y1 {
+        for px in x0..x1 {
+            // `backdrop_at` already composites the glow over the gradient, so the
+            // initial paint and any later region-repaint (e.g. the live clock)
+            // are pixel-identical.
+            let out = backdrop_at(gradient, px, py, w, h);
+            fb.put_pixel(px, py, out.pack(fb));
+        }
+    }
+}
+
+/// The fully-composited boot-screen backdrop colour at `(px, py)`: the
+/// three-stop gradient with the top-right pink corner glow blended over it.
+///
+/// This is the single source of truth for "what colour is the background here",
+/// so both the initial paint ([`draw_corner_glow`]) and any partial repaint
+/// (the live [`draw_clock`] erasing old digits) agree exactly — no seams.
+fn backdrop_at(gradient: &Gradient, px: usize, py: usize, w: usize, h: usize) -> Rgb {
+    let backdrop = gradient.color_at(px, py);
+
+    // Glow ellipse centre and radii, in pixels (must match `draw_corner_glow`).
+    let cx = (w * 70 / 100) as i64;
+    let cy = (h * 8 / 100) as i64;
+    let rx = ((w * 80 / 100).max(1)) as i64;
+    let ry = ((h * 50 / 100).max(1)) as i64;
+
     // Work in fixed-point: d2 is the squared normalised elliptical distance
     // scaled by DEN² so we can compare against the 0.6 cutoff without floats.
     const DEN: i64 = 1024;
     let cutoff2 = (6 * DEN / 10) * (6 * DEN / 10); // (0.6)² in DEN² units
 
-    for py in y0..y1 {
-        for px in x0..x1 {
-            let dx = px as i64 - cx;
-            let dy = py as i64 - cy;
-            // (dx/rx)² + (dy/ry)², each term scaled to DEN².
-            let nx = dx * DEN / rx;
-            let ny = dy * DEN / ry;
-            let d2 = nx * nx + ny * ny;
-            if d2 >= cutoff2 {
-                continue;
-            }
-            // Linear falloff in *distance*: t = 1 - d/0.6, with a smoothstep
-            // (t²·(3-2t)) for a soft, edge-free bloom.
-            let d = isqrt_u64(d2 as u64) as i64; // d·DEN
-            let t = DEN - (d * DEN / (6 * DEN / 10)); // 0..DEN over [0.6 → 0]
-            let t = t.clamp(0, DEN);
-            let s = (t * t / DEN) * (3 * DEN - 2 * t) / DEN; // smoothstep, 0..DEN
-            let alpha = ((s as u32) * GLOW_PEAK_ALPHA / DEN as u32) as u8;
-            if alpha == 0 {
-                continue;
-            }
-            let backdrop = gradient.color_at(px, py);
-            let out = raster::blend(backdrop, GLOW_PINK, alpha);
-            fb.put_pixel(px, py, out.pack(fb));
-        }
+    let dx = px as i64 - cx;
+    let dy = py as i64 - cy;
+    let nx = dx * DEN / rx;
+    let ny = dy * DEN / ry;
+    let d2 = nx * nx + ny * ny;
+    if d2 >= cutoff2 {
+        return backdrop; // outside the glow: pure gradient
     }
+    // Linear falloff in *distance*: t = 1 - d/0.6, with a smoothstep
+    // (t²·(3-2t)) for a soft, edge-free bloom.
+    let d = isqrt_u64(d2 as u64) as i64; // d·DEN
+    let t = (DEN - (d * DEN / (6 * DEN / 10))).clamp(0, DEN); // 0..DEN over [0.6 → 0]
+    let s = (t * t / DEN) * (3 * DEN - 2 * t) / DEN; // smoothstep, 0..DEN
+    let alpha = ((s as u32) * GLOW_PEAK_ALPHA / DEN as u32) as u8;
+    if alpha == 0 {
+        return backdrop;
+    }
+    raster::blend(backdrop, GLOW_PINK, alpha)
 }
 
 /// Integer square root (Newton's method) — `no_std`, no float, for the glow's
@@ -178,26 +194,111 @@ fn isqrt_u64(n: u64) -> u64 {
     x
 }
 
+/// The date line shown above the clock (no RTC wired in, so this is static).
+const CLOCK_DATE: &str = "TUESDAY  JUNE 3";
+/// Text scale of the date line.
+const DATE_SCALE: usize = 2;
+/// Text scale of the large `HH:MM:SS` clock.
+const CLOCK_SCALE: usize = 8;
+/// Initial wall-clock time the boot screen starts from: 21:04:00. The live
+/// timer advances from here as PIT ticks accumulate.
+pub const CLOCK_START_H: u8 = 21;
+/// Initial minute (see [`CLOCK_START_H`]).
+pub const CLOCK_START_M: u8 = 4;
+/// Initial second (see [`CLOCK_START_H`]).
+pub const CLOCK_START_S: u8 = 0;
+
+/// `y` of the date line's top edge for a screen of height `h` (~14 % down).
+#[inline]
+const fn date_y(h: usize) -> usize {
+    h / 8
+}
+
+/// `y` of the clock's top edge for a screen of height `h`.
+#[inline]
+const fn clock_y(h: usize) -> usize {
+    date_y(h) + font::GLYPH_SIZE * DATE_SCALE + h / 40
+}
+
 /// Centered date line and a large clock, placed in the upper third.
 fn draw_clock_block(fb: &Framebuffer, cx: usize, h: usize) {
-    // Static placeholder time/date — there is no RTC wired in yet, so the boot
-    // frame shows a representative value (the design's reference time).
-    let date = "TUESDAY  JUNE 3";
-    let clock = "21:04";
-
-    let date_scale = 2usize;
-    let clock_scale = 8usize;
-
-    // Date sits ~14 % down the screen, clock just below it.
-    let date_w = font::text_width(date, date_scale);
+    let date_w = font::text_width(CLOCK_DATE, DATE_SCALE);
     let date_x = cx.saturating_sub(date_w / 2);
-    let date_y = h / 8;
-    font::draw_text(fb, date_x, date_y, date, date_scale, TEXT_SECONDARY.pack(fb));
+    font::draw_text(
+        fb,
+        date_x,
+        date_y(h),
+        CLOCK_DATE,
+        DATE_SCALE,
+        TEXT_SECONDARY.pack(fb),
+    );
 
-    let clock_w = font::text_width(clock, clock_scale);
+    // Initial clock string, drawn through the shared formatter so the static and
+    // live paths render identically.
+    draw_clock(fb, CLOCK_START_H, CLOCK_START_M, CLOCK_START_S);
+}
+
+/// Format a two-digit field into `buf[off..off+2]` (00–99), zero-padded.
+#[inline]
+fn write_two(buf: &mut [u8; 8], off: usize, value: u8) {
+    buf[off] = b'0' + (value / 10) % 10;
+    buf[off + 1] = b'0' + value % 10;
+}
+
+/// Redraw **only** the clock region with the time `h:m:s`, fast.
+///
+/// Repaints the tight bounding box behind the `HH:MM:SS` digits from the
+/// gradient backdrop (so the previous digits are erased without a full-screen
+/// repaint), then draws the new time centered over it. This is the per-second
+/// update the kernel's idle loop calls; the rest of the boot screen is left
+/// untouched, keeping each tick cheap.
+///
+/// The region is centered horizontally and positioned with the same geometry as
+/// the static boot frame, so it lands exactly where [`draw_boot_screen`] drew
+/// the clock. Fields wider than two digits are clamped by the `%`-formatting.
+pub fn draw_clock(fb: &Framebuffer, h: u8, m: u8, s: u8) {
+    let w = fb.width();
+    let screen_h = fb.height();
+    if w == 0 || screen_h == 0 {
+        return;
+    }
+    let cx = w / 2;
+
+    // Build "HH:MM:SS" without any heap or format machinery.
+    let mut text = *b"00:00:00";
+    write_two(&mut text, 0, h);
+    text[2] = b':';
+    write_two(&mut text, 3, m);
+    text[5] = b':';
+    write_two(&mut text, 6, s);
+    // SAFETY-free: every byte written above is ASCII, so this is valid UTF-8.
+    let clock = core::str::from_utf8(&text).unwrap_or("00:00:00");
+
+    let clock_w = font::text_width(clock, CLOCK_SCALE);
     let clock_x = cx.saturating_sub(clock_w / 2);
-    let clock_y = date_y + font::GLYPH_SIZE * date_scale + h / 40;
-    font::draw_text(fb, clock_x, clock_y, clock, clock_scale, TEXT_PRIMARY.pack(fb));
+    let cy = clock_y(screen_h);
+    let glyph_h = font::GLYPH_SIZE * CLOCK_SCALE;
+
+    // 1) Erase the previous digits by repainting the *exact* boot-screen
+    //    backdrop (gradient + corner glow, via `backdrop_at`) in the clock's
+    //    bounding box, with a small pad. Using the same compositing as the
+    //    initial paint means the repaint is seamless even where the top-right
+    //    glow reaches into the clock region — no darker rectangle behind it.
+    let gradient = Gradient::three_stop(GRAD_START, GRAD_MID, GRAD_END, w, screen_h);
+    let pad = CLOCK_SCALE; // one source-pixel of slack
+    let x0 = clock_x.saturating_sub(pad);
+    let y0 = cy.saturating_sub(pad);
+    let x1 = (clock_x + clock_w + pad).min(w);
+    let y1 = (cy + glyph_h + pad).min(screen_h);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let c = backdrop_at(&gradient, px, py, w, screen_h);
+            fb.put_pixel(px, py, c.pack(fb));
+        }
+    }
+
+    // 2) Draw the new time.
+    font::draw_text(fb, clock_x, cy, clock, CLOCK_SCALE, TEXT_PRIMARY.pack(fb));
 }
 
 /// The central translucent glass card with the wordmark, tagline and pill.

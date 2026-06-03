@@ -1,9 +1,11 @@
-//! CPU exception handlers — the safe kernel side of sub-project #2a.
+//! CPU exception handlers + hardware-IRQ wiring — the safe kernel side of
+//! sub-projects #2 and #2a.
 //!
 //! This module registers handler functions for the four most-critical CPU
-//! exception vectors and calls [`hal::interrupts::init`] to arm the GDT, TSS,
-//! and IDT. Everything here is **safe** Rust; the raw ISR stubs and descriptor
-//! table loads live in `hal` (the TCB).
+//! exception vectors plus the PIT timer IRQ, and calls [`hal::interrupts::init`]
+//! to arm the GDT, TSS, and IDT. Everything here is **safe** Rust; the raw ISR
+//! stubs, descriptor-table loads, PIC/PIT port I/O, and the `int3`/`sti`
+//! instructions live in `hal` (the TCB).
 //!
 //! # Vectors handled
 //!
@@ -12,7 +14,8 @@
 //! | 3      | #BP Breakpoint     | Print RIP, then **return** (execution resumes after `int3`). |
 //! | 8      | #DF Double Fault   | Print + [`hal::cpu::halt_loop`]. |
 //! | 13     | #GP General Protection | Print error code + RIP + [`hal::cpu::halt_loop`]. |
-//! | 14     | #PF Page Fault     | Decode error-code bits, print, [`hal::cpu::halt_loop`]. |
+//! | 14     | #PF Page Fault     | Decode error-code bits + CR2 faulting address, print, [`hal::cpu::halt_loop`]. |
+//! | 32     | IRQ0 PIT timer     | Bump the tick counter + EOI, then **return** (resumes). |
 //!
 //! Vectors without a registered handler fall through to `hal`'s `default_handler`,
 //! which already reports and halts — no action needed here.
@@ -29,6 +32,10 @@ const VECTOR_DOUBLE_FAULT: u8 = 8;
 const VECTOR_GENERAL_PROTECTION: u8 = 13;
 /// Vector 14: Page Fault.
 const VECTOR_PAGE_FAULT: u8 = 14;
+/// Vector 32 (`0x20`): IRQ0 — the PIT timer, after the PIC remap.
+const VECTOR_TIMER: u8 = hal::pic::PIC1_OFFSET;
+/// IRQ line the PIT is wired to (IRQ0).
+const IRQ_TIMER: u8 = 0;
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -39,10 +46,12 @@ const VECTOR_PAGE_FAULT: u8 = 14;
 /// this slice; it is safe to return because the CPU pushed a resumable exception
 /// frame and the ISR stub will `iretq` after we return.
 fn handle_breakpoint(frame: &InterruptFrame) {
-    // Copy the RIP out of the packed struct into a local before passing to
-    // format machinery, to avoid a reference into a potentially-unaligned field.
+    // Copy the RIP out of the packed struct into a local first, to avoid a
+    // reference into a potentially-unaligned field. Use the fmt-arg-free hex
+    // printer: the exception path must not depend on `core::fmt`'s integer
+    // argument machinery (see `hal::serial::print_labeled_hex`).
     let rip = frame.rip;
-    hal::println!("EXCEPTION: BREAKPOINT at rip={:#018x}", rip);
+    hal::serial::print_labeled_hex("EXCEPTION: BREAKPOINT at rip=", rip);
     // Return normally: the stub will `iretq` back to the instruction after `int3`.
 }
 
@@ -53,7 +62,7 @@ fn handle_breakpoint(frame: &InterruptFrame) {
 /// is corrupt. It reports and halts; recovery is not possible at this slice.
 fn handle_double_fault(frame: &InterruptFrame) {
     let rip = frame.rip;
-    hal::println!("EXCEPTION: DOUBLE FAULT at rip={:#018x}", rip);
+    hal::serial::print_labeled_hex("EXCEPTION: DOUBLE FAULT at rip=", rip);
     hal::cpu::halt_loop()
 }
 
@@ -61,11 +70,9 @@ fn handle_double_fault(frame: &InterruptFrame) {
 fn handle_general_protection(frame: &InterruptFrame) {
     let error_code = frame.error_code;
     let rip = frame.rip;
-    hal::println!(
-        "EXCEPTION: #GP error_code={:#x} rip={:#018x}",
-        error_code,
-        rip
-    );
+    hal::serial::print_line("EXCEPTION: #GP (general protection)");
+    hal::serial::print_labeled_hex("  error_code = ", error_code);
+    hal::serial::print_labeled_hex("  rip        = ", rip);
     hal::cpu::halt_loop()
 }
 
@@ -126,23 +133,38 @@ fn decode_pf_error(ec: u64) -> &'static str {
 
 /// Vector 14 — Page Fault.
 ///
-/// Decodes the CPU's error code and prints a human-readable fault summary.
-/// Halts via [`hal::cpu::halt_loop`] — no recovery at this slice.
+/// Reads `CR2` (the faulting linear address the CPU latched on the fault),
+/// decodes the error code, and prints a human-readable fault summary. Halts via
+/// [`hal::cpu::halt_loop`] — no recovery at this slice.
 ///
-/// Note: CR2 (the faulting linear address) is not yet printed here because the
-/// HAL has not yet exposed a safe `hal::cpu::read_cr2()` wrapper.
-// TODO(#2a-polish): also print CR2 (faulting address) once hal::cpu::read_cr2() is exposed
+/// `CR2` is read first thing, before any other memory access could clobber it.
 fn handle_page_fault(frame: &InterruptFrame) {
+    // Read CR2 immediately: it holds the faulting linear address and is only
+    // valid until the next page fault overwrites it.
+    let fault_addr = hal::cpu::read_cr2();
     let error_code = frame.error_code;
     let rip = frame.rip;
     let description = decode_pf_error(error_code);
-    hal::println!(
-        "EXCEPTION: PAGE FAULT  error_code={:#x}  rip={:#018x}",
-        error_code,
-        rip
-    );
-    hal::println!("  fault type: {}", description);
+    // Report via the fmt-arg-free path: an exception reporter must never depend
+    // on `core::fmt`'s integer-argument machinery (which faults on this target).
+    hal::serial::print_line("EXCEPTION: PAGE FAULT");
+    hal::serial::print_labeled_hex("  error_code             = ", error_code);
+    hal::serial::print_labeled_hex("  rip                    = ", rip);
+    hal::serial::print_labeled_hex("  faulting address (CR2) = ", fault_addr);
+    // `description` is a fixed `&'static str`; print it on its own labelled line.
+    hal::serial::print_line("  fault type:");
+    hal::serial::print_line(description);
     hal::cpu::halt_loop()
+}
+
+/// Vector 32 (IRQ0) — the PIT timer tick.
+///
+/// Delegates to [`hal::pit::on_tick`], which bumps the monotonic tick counter
+/// and signals End-Of-Interrupt to the PIC. Returns normally so the interrupted
+/// code resumes — this is a resumable handler like the breakpoint one. All the
+/// privileged work (the PIC EOI port write) stays inside `hal`.
+fn handle_timer(_frame: &InterruptFrame) {
+    hal::pit::on_tick();
 }
 
 // ── Public initialisation ─────────────────────────────────────────────────────
@@ -171,6 +193,43 @@ pub fn init() {
 
     // Load GDT + TSS + IDT — from this point forward CPU exceptions are caught.
     hal::interrupts::init();
+}
+
+/// Run a one-shot runtime self-test of the live IDT by executing `int3`.
+///
+/// `int3` raises a breakpoint exception (vector 3), which the CPU vectors
+/// through the just-loaded IDT to our [`handle_breakpoint`] handler. That
+/// handler prints and **returns**, so the `int3` resumes normally — proving the
+/// whole path (IDT gate → ISR stub → trampoline → registered handler → `iretq`)
+/// is live. Call this **after** [`init`] but it does not require interrupts to
+/// be enabled (`int3` is a software exception, not a maskable IRQ).
+///
+/// Emits a confirmation line over serial so the boot test can assert the IDT is
+/// armed. Safe: `hal::cpu::breakpoint()` is a safe wrapper over the `int3`
+/// instruction, and the breakpoint handler is resumable.
+pub fn self_test() {
+    hal::println!("[selftest] executing int3 to probe the live IDT ...");
+    hal::cpu::breakpoint();
+    hal::println!("[selftest] int3 -> #BP handler ran; IDT live");
+}
+
+/// Bring up the PIT timer interrupt: register the vector-32 handler, remap the
+/// PIC pair, program the PIT to ~100 Hz, and unmask IRQ0.
+///
+/// Does **not** enable interrupts — the caller (`kmain`) must `sti` only after
+/// every handler is registered. Order matters: remap the PIC (so IRQ0 lands on
+/// vector 32, clear of the CPU exceptions) before programming the PIT, and
+/// register the handler before unmasking the line so no tick can arrive before
+/// its handler exists.
+pub fn init_timer() {
+    // Register the vector-32 handler first.
+    hal::interrupts::set_handler(VECTOR_TIMER, handle_timer as Handler);
+
+    // Remap the 8259A pair to vectors 32–47 (every line masked), then program
+    // PIT channel 0 to ~100 Hz, then open IRQ0.
+    hal::pic::init();
+    hal::pit::init();
+    hal::pic::unmask_irq(IRQ_TIMER);
 }
 
 // ── Unit tests (host) ─────────────────────────────────────────────────────────

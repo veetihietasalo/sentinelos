@@ -252,6 +252,75 @@ pub fn _print(args: fmt::Arguments<'_>) {
     });
 }
 
+/// Print a `&str` label followed by `value` as zero-padded 64-bit hex
+/// (`0x` + 16 digits) and a newline — **without** `core::fmt`'s argument
+/// machinery.
+///
+/// The exception/fault path runs in contexts where pulling in the full
+/// `core::fmt` integer-formatting machinery is undesirable: it routes integer
+/// arguments through function-pointer indirection that has proven fragile on the
+/// bare-metal target (an early fault while *reporting* a fault is the worst time
+/// to discover it). This routine builds the digits into a fixed stack buffer
+/// using only arithmetic and a static lookup table, then writes raw bytes to the
+/// console, so it is allocation-free, panic-free, and independent of the fmt
+/// arg path. Used by the kernel's exception handlers and the IDT self-test.
+pub fn print_labeled_hex(label: &str, value: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    // "0x" + 16 hex digits.
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    let mut shift = 60i32;
+    let mut i = 2;
+    while shift >= 0 {
+        let nibble = ((value >> shift) & 0xF) as usize;
+        buf[i] = HEX[nibble];
+        i += 1;
+        shift -= 4;
+    }
+    with_console(|serial| {
+        serial.write_bytes(label.as_bytes());
+        serial.write_bytes(&buf);
+        serial.write_byte(b'\n');
+    });
+}
+
+/// Print a `&str` label followed by `value` as a decimal `u64` and a newline,
+/// **without** `core::fmt`'s argument machinery (see [`print_labeled_hex`] for
+/// why the fault path avoids it). Allocation-free and panic-free.
+pub fn print_labeled_dec(label: &str, value: u64) {
+    // u64 max is 20 digits.
+    let mut buf = [0u8; 20];
+    let mut n = value;
+    let mut i = buf.len();
+    // Emit at least one digit (handles value == 0).
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    with_console(|serial| {
+        serial.write_bytes(label.as_bytes());
+        serial.write_bytes(&buf[i..]);
+        serial.write_byte(b'\n');
+    });
+}
+
+/// Print a `&str` line (no formatting args) followed by a newline.
+///
+/// A thin, fmt-arg-free convenience for the fault path: it writes the literal
+/// bytes and a newline directly. Equivalent to `println!("{}", s)` but without
+/// routing through `core::fmt`.
+pub fn print_line(s: &str) {
+    with_console(|serial| {
+        serial.write_bytes(s.as_bytes());
+        serial.write_byte(b'\n');
+    });
+}
+
 /// Print formatted text to the COM1 serial console (no trailing newline).
 ///
 /// Mirrors the standard library `print!`. Available as `hal::print!`.

@@ -8,6 +8,8 @@ sound, and its formal-verification status.
 
 - **Owner:** hal-specialist
 - **Scope:** sub-project #1 (boot bring-up) — serial console + CPU primitives;
+  sub-project #2 (hardware interrupts) — 8259 PIC remap + EOI (`hal::pic`),
+  8254 PIT timer (`hal::pit`), and the `sti`/`int3`/`CR2` CPU primitives;
   sub-project #2a (interrupts) — GDT/TSS/IST, IDT, and the raw ISR stubs;
   sub-project #5 (UI, first slice) — the Limine framebuffer surface (`hal::framebuffer`)
 - **Crate lints:** `#![deny(unsafe_op_in_unsafe_fn)]`,
@@ -38,6 +40,18 @@ documented with a `# Safety` rustdoc section.
 | S5 | `serial.rs` · `Serial::write_byte()` | `outb(base + DATA, byte)` | Transmit one byte | Reached only after the LSR reports THR empty, so no overrun; writes the data register, device-only effect. Satisfies `outb`'s contract. | Reasoned + QEMU (**pending**) |
 | S6 | `serial.rs` · `interrupts_enabled()` | `pushfq; pop {}` (read RFLAGS) | Read IF so the console guard can restore prior interrupt state | Balanced push/pop reads RFLAGS into a register; `nomem`, `preserves_flags`, stack-balanced (no `nostack`). Reading flags cannot violate memory safety. | Reasoned (**pending**) |
 
+> **Fault-path printing (no new `unsafe`).** `serial::print_labeled_hex` /
+> `print_labeled_dec` / `print_line` build digits into a fixed stack buffer with
+> plain arithmetic and write raw bytes through the existing (already-documented)
+> `Serial::write_bytes` path — they add **no** new unsafe op. They exist because
+> `core::fmt`'s *integer-argument* machinery (the `format_args!("{:#x}", n)`
+> path) routes through function-pointer indirection that **page-faults on the
+> `x86_64-unknown-none` target** — so an exception reporter using `{:#018x}`
+> would fault *while reporting a fault*. The exception/IDT-default handlers and
+> the `int3` self-test therefore report via these fmt-arg-free helpers. (String
+> literals with no formatted args — the banner, status lines — are unaffected and
+> still use `println!`.)
+
 ### Concurrency note
 
 The global console (`static CONSOLE: Serial`) is shared, but `Serial` has no
@@ -58,6 +72,8 @@ at bring-up).
 | C2 | `cpu.rs` · `enable_interrupts()` | `sti` | Re-open the interrupt window after a critical section | Sets RFLAGS.IF only; not itself UB. At bring-up no IDT/handlers exist, so this is for symmetry; handler safety is the IDT owner's responsibility (sub-project #2). | Reasoned (**pending**) |
 | C3 | `cpu.rs` · `halt()` | `hlt` (single) | Idle the core until the next interrupt | Idles the CPU; accesses no memory/registers; `preserves_flags`. Cannot violate memory safety. | Reasoned (**pending**) |
 | C4 | `cpu.rs` · `halt_loop()` | `hlt` (in a `loop`) | Terminal park for boot path + panic handler (`-> !`) | Same as C3; re-halts on every wake so the core never spins hot and never falls through. Diverging, safe wrapper. | Reasoned (**pending**) |
+| C5 | `cpu.rs` · `breakpoint()` | `int3` (vector 3) | One-shot runtime self-test of the live IDT (the `[selftest]` boot line) | Software interrupt that vectors through the IDT's gate 3; touches no memory (`nomem`); the CPU's interrupt-frame push is balanced by the ISR stub. With a resumable #BP handler it returns; with none, `hal`'s default reporter halts. Cannot create UB. | Reasoned + QEMU (`int3` → #BP, resumes) |
+| C6 | `cpu.rs` · `read_cr2()` | `mov {}, cr2` (read CR2) | Report the faulting linear address in the #PF handler | Pure read of the CR2 control register at CPL 0; accesses no program memory (`nomem`), no stack (`nostack`), `preserves_flags`. Observing the last faulting address cannot affect memory validity/aliasing. | Reasoned + QEMU |
 
 ---
 
@@ -134,6 +150,46 @@ confined to the two ops below.
 > responsibility (documented on the drawing methods) — single-core at bring-up.
 > `pack_rgb`, the dimension/mask getters, and the bounds/clip arithmetic are pure
 > safe logic (Kani candidates).
+
+## 2e. `hal::pic` — 8259A PIC pair remap + EOI (sub-project #2)
+
+Remaps the cascaded master/slave 8259A PIC pair (ports `0x20/0x21` and
+`0xA0/0xA1`) from their power-on vectors (which **collide** with CPU exceptions
+0–31) to vectors `0x20`–`0x2F` (32–47), masks every line, and provides
+per-line mask/unmask plus an End-Of-Interrupt routine. All hardware access is
+funnelled through two private primitives, `inb`/`outb`, each documented with a
+`# Safety` rustdoc section. The public surface (`init`, `mask_irq`,
+`unmask_irq`, `end_of_interrupt`) is **safe**. `init` runs once on the boot core
+with interrupts disabled; `end_of_interrupt` runs inside an interrupt handler
+(interrupts already masked by the interrupt gate) — single-core, no SMP lock.
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| P1 | `pic.rs` · `inb()` | `in al, dx` (port read) | Only way to read a PIC Interrupt Mask Register before a read-modify-write | `unsafe fn` whose `# Safety` requires a read-safe PIC port; all callers pass a master/slave data port. Pure device read, `nomem`/`nostack`. | Reasoned + QEMU |
+| P2 | `pic.rs` · `outb()` / `outb_wait()` | `out dx, al` (port write) | Only way to program the 8259A (ICW1–4, masks, EOI) | `unsafe fn` whose `# Safety` requires a write-safe PIC port; all callers pass a master/slave command/data port with a documented ICW/OCW/mask value. `outb_wait` adds a throwaway write to the conventional I/O-delay port `0x80`. Device-only effect, `nomem`/`nostack`. | Reasoned + QEMU |
+| P3 | `pic.rs` · `init()` | ICW1–ICW4 `outb` sequence + final mask writes | Remap both PICs to `0x20`–`0x2F` in 8086 cascade mode and mask all lines | Standard, well-defined 8259A init sequence; each `outb` targets a constant PIC port with a defined value; only reconfigures where the PICs vector and which lines are masked. Runs once, boot core, interrupts off → no concurrent PIC access. | Reasoned + QEMU (timer IRQ delivered to vector 32) |
+| P4 | `pic.rs` · `mask_irq()` / `unmask_irq()` | `inb` then `outb` of the IMR | Open/close a single IRQ line (e.g. IRQ0 for the PIT) | Read-modify-write of one mask bit (`line < 8`) on the master/slave IMR; device-only effect (enables/disables one line). `inb`/`outb` contracts hold. | Reasoned + QEMU |
+| P5 | `pic.rs` · `end_of_interrupt()` | `outb(PIC_EOI)` to master (and slave if a slave line) | Tell the PIC the serviced interrupt is done so it delivers further IRQs | Writes the non-specific EOI (OCW2 `0x20`) to the master command port, plus the slave for vectors `0x28`–`0x2F`; vectors outside `0x20`–`0x2F` are ignored. EOI is device-only; cannot corrupt memory. | Reasoned + QEMU (sustained 100 Hz ticks) |
+
+## 2f. `hal::pit` — 8254 PIT channel-0 timer (sub-project #2)
+
+Programs PIT channel 0 (ports `0x40`/`0x43`) as a ~100 Hz rate generator
+(mode 2, divisor 11931 of the 1.193182 MHz input), whose output drives the
+master PIC's IRQ0 → vector `0x20`. A free-running `static AtomicU64 TICKS` is
+incremented by the kernel's vector-32 handler via the safe `on_tick`, which also
+calls `pic::end_of_interrupt`. The only privileged op is the channel-0
+programming write; `TICKS` is a plain atomic (no `unsafe`), and `ticks`/`on_tick`
+are safe API.
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| T1 | `pit.rs` · `outb()` | `out dx, al` (port write) | Only way to program PIT channel 0 | `unsafe fn` whose `# Safety` requires a write-safe PIT port; all callers pass `0x40`/`0x43` with a defined mode/reload value. Device-only effect, `nomem`/`nostack`. | Reasoned + QEMU |
+| T2 | `pit.rs` · `init()` | mode-byte + lo/hi reload `outb` sequence | Configure channel 0 to ~100 Hz rate-generator mode | Documented 8254 channel-0 programming sequence (`0x34` then divisor low/high); only sets the PIT's mode and reload count — device-only, cannot alias Rust memory. Runs once, boot core, interrupts off. | Reasoned + QEMU (clock advances 1 s/s on the boot screen) |
+
+> The PIT's IRQ0 handler (`hal::pit::on_tick`) does a `fetch_add` on the
+> `AtomicU64 TICKS` and a `pic::end_of_interrupt` — both safe. The privileged EOI
+> port write lives in `hal::pic` (P5), so the kernel's registered vector-32
+> handler stays `#![forbid(unsafe_code)]`-clean.
 
 ---
 

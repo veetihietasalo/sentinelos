@@ -254,20 +254,24 @@ extern "C" fn isr_trampoline(frame: *const InterruptFrame) {
 /// registered anything, and it deliberately uses only `&'static str` + simple
 /// hex formatting (no allocation, no panics) on the fault path.
 fn default_handler(frame: &InterruptFrame) {
-    // Copy out of the packed/`#[repr(C)]` frame into locals before formatting so
+    // Copy out of the packed/`#[repr(C)]` frame into locals before reporting so
     // we never take a reference into a potentially misaligned field.
     let vector = frame.vector;
     let error_code = frame.error_code;
     let rip = frame.rip;
     let rflags = frame.rflags;
 
-    crate::println!();
-    crate::println!("!!! UNHANDLED CPU EXCEPTION !!!");
-    crate::println!("  vector     = {}", vector);
-    crate::println!("  error_code = {:#018x}", error_code);
-    crate::println!("  rip        = {:#018x}", rip);
-    crate::println!("  rflags     = {:#018x}", rflags);
-    crate::println!("[hal] no handler registered; halting core.");
+    // Report via the fmt-arg-free serial helpers. The fault path must not route
+    // integer arguments through `core::fmt`'s machinery, which page-faults on
+    // this bare-metal target (an early fault while *reporting* a fault would be
+    // catastrophic). See `crate::serial::print_labeled_hex`.
+    crate::serial::print_line("");
+    crate::serial::print_line("!!! UNHANDLED CPU EXCEPTION !!!");
+    crate::serial::print_labeled_dec("  vector     = ", vector);
+    crate::serial::print_labeled_hex("  error_code = ", error_code);
+    crate::serial::print_labeled_hex("  rip        = ", rip);
+    crate::serial::print_labeled_hex("  rflags     = ", rflags);
+    crate::serial::print_line("[hal] no handler registered; halting core.");
 
     crate::cpu::halt_loop()
 }

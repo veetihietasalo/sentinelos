@@ -15,7 +15,7 @@
 //!
 //! - [`serial`] — a 16550 UART driver on COM1 (`0x3F8`) with a global console
 //!   and the [`print!`] / [`println!`] macros.
-//! - [`cpu`] — safe wrappers over `hlt`, `cli`, and `sti`.
+//! - [`cpu`] — safe wrappers over `hlt`, `cli`, `sti`, and the `CR2` read.
 //! - [`framebuffer`] — the Limine linear framebuffer wrapped as a safe,
 //!   bounds-checked drawing surface ([`framebuffer::Framebuffer`]).
 //! - [`gdt`] — the 64-bit GDT + TSS with an IST double-fault stack (`lgdt`/`ltr`).
@@ -23,6 +23,11 @@
 //! - [`interrupts`] — the **safe** registration API ([`interrupts::init`],
 //!   [`interrupts::set_handler`], [`interrupts::InterruptFrame`]) the `kernel`
 //!   crate uses to hook exception handlers without a `hal → kernel` cycle.
+//! - [`pic`] — the 8259A PIC pair remapped to vectors 32–47 ([`pic::init`],
+//!   [`pic::unmask_irq`], [`pic::end_of_interrupt`]) so hardware IRQs don't
+//!   collide with CPU exceptions.
+//! - [`pit`] — the 8254 PIT channel-0 timer at ~100 Hz ([`pit::init`],
+//!   [`pit::ticks`], [`pit::on_tick`]) driving the monotonic [`pit::TICKS`].
 //!
 //! # `unsafe` discipline
 //!
@@ -36,7 +41,11 @@
 //! - [`println!`] / [`print!`]
 //! - [`serial::init`]
 //! - [`cpu::halt_loop`]
-//! - [`cpu::disable_interrupts`]
+//! - [`cpu::halt`] — single `hlt` (build an idle loop on top).
+//! - [`cpu::disable_interrupts`] / [`cpu::enable_interrupts`] (`cli` / `sti`).
+//! - [`cpu::read_cr2`] — faulting linear address for a `#PF` handler.
+//! - [`pic::init`] / [`pic::unmask_irq`] / [`pic::end_of_interrupt`].
+//! - [`pit::init`] / [`pit::ticks`] / [`pit::on_tick`] / [`pit::TICK_HZ`].
 //! - [`interrupts::init`] — load GDT+TSS+IDT (call once at boot).
 //! - [`interrupts::set_handler`] — register a `fn(&InterruptFrame)` for a vector.
 //! - [`interrupts::InterruptFrame`] — the `#[repr(C)]` fault view passed to a
@@ -59,4 +68,6 @@ pub mod framebuffer;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
+pub mod pic;
+pub mod pit;
 pub mod serial;
