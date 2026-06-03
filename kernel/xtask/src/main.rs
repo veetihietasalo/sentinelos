@@ -22,7 +22,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, ExitCode},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn main() -> ExitCode {
@@ -224,6 +224,11 @@ fn do_run() -> ExitCode {
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
+/// End-marker written by `kmain` after the full banner has been flushed.
+const END_MARKER: &str = "boot-bringup-ok";
+/// Full banner line we require to be present as well.
+const BANNER_LINE: &str = "SentinelOS \u{2014} boot bring-up OK";
+
 fn do_test() -> ExitCode {
     let Some(elf) = build_kernel() else {
         return ExitCode::FAILURE;
@@ -234,13 +239,12 @@ fn do_test() -> ExitCode {
 
     let serial_log = kr("target/serial.log");
 
-    // Remove stale log if present.
+    // Remove stale log from a previous run.
     let _ = fs::remove_file(&serial_log);
 
-    println!("Running QEMU for serial capture (8 s) ...");
+    println!("Launching QEMU (serial → file, polling for end-marker) ...");
 
-    // Launch QEMU in the background; write serial to file.
-    // macOS has no `timeout`, so we background QEMU manually, sleep, kill it.
+    // Spawn QEMU in the background; direct COM1 to a file so we can poll it.
     let mut child = Command::new("qemu-system-x86_64")
         .args([
             "-M", "q35",
@@ -253,23 +257,49 @@ fn do_test() -> ExitCode {
         .spawn()
         .expect("failed to spawn qemu-system-x86_64");
 
-    std::thread::sleep(Duration::from_secs(8));
+    // Poll every 200 ms for up to 20 s (safety cap) until the end-marker appears.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let poll_interval = Duration::from_millis(200);
+    let mut found = false;
 
-    // Kill QEMU (it halts forever — no self-exit yet; isa-debug-exit is later).
+    while Instant::now() < deadline {
+        std::thread::sleep(poll_interval);
+        let log = fs::read_to_string(&serial_log).unwrap_or_default();
+        if log.contains(END_MARKER) {
+            found = true;
+            break;
+        }
+    }
+
+    // Always kill QEMU after we're done polling (it halts forever in `halt_loop`).
     let _ = child.kill();
     let _ = child.wait();
 
-    // Read serial log.
+    // Read final log (may have grown slightly after the last poll).
     let log = fs::read_to_string(&serial_log).unwrap_or_default();
     println!("--- serial.log ---");
     println!("{}", log);
     println!("--- end serial.log ---");
 
-    if log.contains("SentinelOS") {
-        println!("TEST PASSED: banner found in serial output.");
-        ExitCode::SUCCESS
-    } else {
-        eprintln!("TEST FAILED: 'SentinelOS' not found in serial output.");
-        ExitCode::FAILURE
+    if !found {
+        eprintln!(
+            "TEST FAILED: end-marker '{}' not found within 20 s.",
+            END_MARKER
+        );
+        return ExitCode::FAILURE;
     }
+
+    if !log.contains(BANNER_LINE) {
+        eprintln!(
+            "TEST FAILED: end-marker present but banner line '{}' missing.",
+            BANNER_LINE
+        );
+        return ExitCode::FAILURE;
+    }
+
+    println!(
+        "TEST PASSED: full banner and end-marker '{}' confirmed in serial output.",
+        END_MARKER
+    );
+    ExitCode::SUCCESS
 }

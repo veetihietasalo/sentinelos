@@ -14,9 +14,6 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-/// Kernel version string, baked in at compile time.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 /// Kernel entry point — called by `boot::_start` after serial initialisation.
 ///
 /// All privileged setup (serial port I/O, CPU control) is performed by `hal`
@@ -25,9 +22,17 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn kmain() -> ! {
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");
-    hal::println!("│  version {}  (stable Rust, no_std)   │", VERSION);
+    // Use concat! to bake the version into a literal at compile time, avoiding
+    // any runtime format-argument machinery (and the GOT-relative vtable calls
+    // it generates) that would fault on a bare-metal target without an IDT.
+    hal::println!(concat!(
+        "│  version ",
+        env!("CARGO_PKG_VERSION"),
+        "  (stable Rust, no_std)   │"
+    ));
     hal::println!("│  serial console: COM1                │");
     hal::println!("└─────────────────────────────────────┘");
+    hal::println!("[sentinelos] boot-bringup-ok; entering idle");
 
     hal::cpu::halt_loop()
 }

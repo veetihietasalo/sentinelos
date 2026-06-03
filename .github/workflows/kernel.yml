@@ -1,0 +1,103 @@
+name: Kernel CI
+
+# Trigger on changes to kernel source or this workflow file.
+on:
+  push:
+    paths:
+      - "kernel/**"
+      - ".github/workflows/kernel.yml"
+  pull_request:
+    paths:
+      - "kernel/**"
+      - ".github/workflows/kernel.yml"
+
+# Cancel in-progress runs for the same ref so redundant pushes don't pile up.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Limine tag pinned to match kernel/limine (branch v11.x-binary, tag v11.4.1).
+  LIMINE_TAG: v11.4.1-binary
+  LIMINE_REPO: https://github.com/limine-bootloader/limine.git
+
+jobs:
+  kernel-ci:
+    name: Build · Lint · Boot-test
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Source ──────────────────────────────────────────────────────────
+      - name: Checkout SentinelOS
+        uses: actions/checkout@v4
+
+      # ── 2. Rust toolchain ─────────────────────────────────────────────────
+      # rust-toolchain.toml (stable, rustfmt + clippy + llvm-tools,
+      # target x86_64-unknown-none) is honoured automatically by dtolnay/rust-toolchain.
+      - name: Install Rust stable toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Duplicate what rust-toolchain.toml declares so the action pins
+          # exactly the same set without requiring nightly.
+          components: rustfmt,clippy,llvm-tools
+          targets: x86_64-unknown-none
+
+      # ── 3. Cargo cache ────────────────────────────────────────────────────
+      - name: Cache Cargo registry + build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            kernel/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('kernel/Cargo.lock', 'kernel/xtask/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # ── 4. System dependencies ────────────────────────────────────────────
+      - name: Install QEMU and xorriso
+        run: sudo apt-get install -y qemu-system-x86 xorriso
+
+      # ── 5. Limine (pinned to tag v11.4.1-binary on branch v11.x-binary) ──
+      # Clone the exact tag so we get the pre-built BIOS/EFI binaries and the
+      # host `limine` tool source, then build the host tool.
+      - name: Clone Limine ${{ env.LIMINE_TAG }}
+        run: |
+          git clone \
+            --branch ${{ env.LIMINE_TAG }} \
+            --depth 1 \
+            ${{ env.LIMINE_REPO }} \
+            kernel/limine
+          make -C kernel/limine
+
+      # ── 6. Format check ───────────────────────────────────────────────────
+      - name: cargo fmt --check
+        working-directory: kernel
+        run: cargo fmt --all --check
+
+      # ── 7. Clippy (deny warnings) ─────────────────────────────────────────
+      - name: cargo clippy
+        working-directory: kernel
+        run: cargo clippy --target x86_64-unknown-none -- -D warnings
+
+      # ── 8. Build ──────────────────────────────────────────────────────────
+      - name: cargo build
+        working-directory: kernel
+        run: cargo build --target x86_64-unknown-none
+
+      # ── 9. Boot test (deterministic QEMU serial-output check) ─────────────
+      # cargo xtask test builds the ISO, spawns QEMU for 8 s, captures serial
+      # output to target/serial.log, and asserts the "SentinelOS" banner.
+      - name: cargo xtask test
+        working-directory: kernel
+        run: cargo xtask test
+
+      # ── 10. Upload serial log on failure ─────────────────────────────────
+      - name: Upload serial log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serial-log
+          path: kernel/target/serial.log
+          if-no-files-found: ignore
