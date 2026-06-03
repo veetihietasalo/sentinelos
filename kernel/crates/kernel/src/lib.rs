@@ -14,6 +14,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod input;
 pub mod interrupts;
 
 /// Kernel entry point — called by `boot::_start` after serial initialisation.
@@ -69,32 +70,122 @@ pub fn kmain() -> ! {
     idle_loop(framebuffer.as_ref())
 }
 
-/// The kernel idle loop: park on `hlt` and tick the on-screen clock.
+/// The kernel idle loop: park on `hlt`, service keyboard input, and run the
+/// lock-screen state machine to its desktop.
 ///
-/// `hlt` halts the core until the next interrupt — the PIT timer wakes us ~100
-/// times a second. Each wake we read the monotonic tick counter; when it crosses
-/// a new whole second we derive `HH:MM:SS` (counting up from the boot screen's
-/// 21:04:00) and redraw **only** the clock region (cheap), leaving the rest of
-/// the Cyber Dusk screen untouched. Diverging (`-> !`): the kernel never returns.
+/// `hlt` halts the core until the next interrupt — the PIT wakes us ~100×/s, and
+/// any keystroke (IRQ1) wakes us too. On each wake we:
+///
+/// 1. **Drain & decode keyboard input.** Pull every raw scancode byte the IRQ1
+///    handler queued ([`hal::keyboard::poll_scancode`]) and feed it through the
+///    safe [`input::ScancodeDecoder`]. While [`Locked`](input::LockState::Locked),
+///    a right-arrow (or Enter) press starts the unlock.
+/// 2. **Drive the state machine.**
+///    - `Locked`: redraw the per-second clock and re-draw the gently pulsing
+///      "press → to unlock" hint (driven by the tick counter).
+///    - `Unlocking`: step the unlock animation by the elapsed ticks; when it
+///      completes, paint the desktop and enter `Desktop`.
+///    - `Desktop`: keep the top-bar clock ticking once per second.
+///
+/// Diverging (`-> !`): the kernel never returns.
 fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
+    use input::{KeyEvent, LockState, ScancodeDecoder};
+
     let tick_hz = hal::pit::TICK_HZ;
-    // Seconds elapsed at the previous redraw; start at "none drawn yet" so the
-    // first whole second triggers a draw.
+    // Seconds elapsed at the previous clock redraw; "none drawn yet" so the first
+    // whole second forces a draw.
     let mut last_secs: u64 = u64::MAX;
+    // Last hint-pulse phase we drew, so we only repaint the hint when its
+    // brightness step actually changes (keeps the locked screen cheap).
+    let mut last_hint_phase: u64 = u64::MAX;
+    // Last animation progress byte we drew, so we don't redraw an identical frame.
+    let mut last_anim_p: i32 = -1;
+
+    let mut decoder = ScancodeDecoder::new();
+    let mut state = LockState::Locked;
 
     loop {
-        // Sleep until the next interrupt (the PIT tick, at minimum).
+        // Sleep until the next interrupt (a PIT tick or a keystroke).
         hal::cpu::halt();
 
-        let secs = hal::pit::ticks() / tick_hz;
-        if secs == last_secs {
-            continue; // still within the same wall-clock second
+        // 1) Service all pending keyboard bytes through the safe decoder.
+        while let Some(scancode) = hal::keyboard::poll_scancode() {
+            if let Some(event) = decoder.feed(scancode) {
+                let is_unlock =
+                    matches!(event, KeyEvent::RightArrowPressed | KeyEvent::EnterPressed);
+                if is_unlock && state.accepts_unlock() {
+                    // Log via the fmt-arg-free helper (core::fmt int args fault on
+                    // this target — see hal::serial::print_labeled_*).
+                    hal::serial::print_line("[input] right-arrow -> unlocking");
+                    state = LockState::Unlocking {
+                        start_tick: hal::pit::ticks(),
+                    };
+                    // Force the first animation frame to draw on this pass.
+                    last_anim_p = -1;
+                }
+            }
         }
-        last_secs = secs;
 
-        if let Some(fb) = fb {
-            let (h, m, s) = wall_clock(secs);
-            ui::draw_clock(fb, h, m, s);
+        let now = hal::pit::ticks();
+
+        // 2) Advance whichever state we are in.
+        match state {
+            LockState::Locked => {
+                // Per-second clock.
+                let secs = now / tick_hz;
+                if secs != last_secs {
+                    last_secs = secs;
+                    if let Some(fb) = fb {
+                        let (h, m, s) = wall_clock(secs);
+                        ui::draw_clock(fb, h, m, s);
+                    }
+                }
+                // Pulse the hint. Quantise the phase to a handful of steps per
+                // pulse so we redraw only when the brightness visibly changes.
+                let phase = now % ui::HINT_PULSE_PERIOD_TICKS;
+                let step = phase / (ui::HINT_PULSE_PERIOD_TICKS / 16).max(1);
+                if step != last_hint_phase {
+                    last_hint_phase = step;
+                    if let Some(fb) = fb {
+                        ui::draw_unlock_hint(fb, now);
+                    }
+                }
+            }
+
+            LockState::Unlocking { start_tick } => {
+                let elapsed = now.saturating_sub(start_tick);
+                if elapsed >= ui::UNLOCK_ANIM_TICKS {
+                    // Animation done → arrive at the desktop.
+                    if let Some(fb) = fb {
+                        ui::draw_desktop(fb);
+                    }
+                    hal::serial::print_line("[input] unlock complete -> desktop");
+                    state = LockState::Desktop;
+                    last_secs = u64::MAX; // force the desktop clock to redraw
+                } else {
+                    // Map elapsed ticks → progress byte 0..=255 and draw the frame
+                    // (only when the byte changes, so identical frames are skipped).
+                    let p = (elapsed * 255 / ui::UNLOCK_ANIM_TICKS.max(1)).min(255) as i32;
+                    if p != last_anim_p {
+                        last_anim_p = p;
+                        if let Some(fb) = fb {
+                            ui::draw_unlock_frame(fb, p as u8);
+                        }
+                    }
+                }
+            }
+
+            LockState::Desktop => {
+                // Keep the top-bar clock ticking once per second.
+                let secs = now / tick_hz;
+                if secs != last_secs {
+                    last_secs = secs;
+                    if let Some(fb) = fb {
+                        let (h, m, s) = wall_clock(secs);
+                        ui::draw_desktop_clock(fb, h, m, s);
+                    }
+                }
+            }
         }
     }
 }

@@ -28,6 +28,10 @@
 //!   collide with CPU exceptions.
 //! - [`pit`] — the 8254 PIT channel-0 timer at ~100 Hz ([`pit::init`],
 //!   [`pit::ticks`], [`pit::on_tick`]) driving the monotonic [`pit::TICKS`].
+//! - [`keyboard`] — the PS/2 keyboard on IRQ1 ([`keyboard::init`],
+//!   [`keyboard::on_irq`], [`keyboard::poll_scancode`]): the IRQ1 handler drains
+//!   the scancode byte from port `0x60` into a lock-free ring the safe kernel
+//!   polls and decodes (no decoding lives in the TCB).
 //!
 //! # `unsafe` discipline
 //!
@@ -68,6 +72,7 @@ pub mod framebuffer;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
+pub mod keyboard;
 pub mod pic;
 pub mod pit;
 pub mod serial;

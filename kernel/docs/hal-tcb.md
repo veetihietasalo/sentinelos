@@ -11,6 +11,7 @@ sound, and its formal-verification status.
   sub-project #2 (hardware interrupts) — 8259 PIC remap + EOI (`hal::pic`),
   8254 PIT timer (`hal::pit`), and the `sti`/`int3`/`CR2` CPU primitives;
   sub-project #2a (interrupts) — GDT/TSS/IST, IDT, and the raw ISR stubs;
+  sub-project #3 (input) — the PS/2 (i8042) keyboard on IRQ1 (`hal::keyboard`);
   sub-project #5 (UI, first slice) — the Limine framebuffer surface (`hal::framebuffer`)
 - **Crate lints:** `#![deny(unsafe_op_in_unsafe_fn)]`,
   `#![warn(clippy::undocumented_unsafe_blocks)]` — every `unsafe` block is
@@ -190,6 +191,36 @@ are safe API.
 > `AtomicU64 TICKS` and a `pic::end_of_interrupt` — both safe. The privileged EOI
 > port write lives in `hal::pic` (P5), so the kernel's registered vector-32
 > handler stays `#![forbid(unsafe_code)]`-clean.
+
+## 2g. `hal::keyboard` — PS/2 (i8042) keyboard on IRQ1 (sub-project #3)
+
+Captures keyboard scancodes from the legacy PS/2 controller. The IRQ1 handler
+(`on_irq`, called from the kernel's registered vector-33 handler) reads one byte
+from the data port `0x60` on **every** interrupt (mandatory: the i8042 will not
+raise another IRQ1 until its output buffer is drained), pushes the raw byte into
+a lock-free SPSC ring built from plain atomics (no `unsafe`), then EOIs via
+`hal::pic`. `init` programs the i8042 configuration byte to enable the keyboard
+interrupt (IRQ1) before unmasking the PIC line. **All scancode decoding** (the
+`0xE0` extended-prefix state machine, make/break mapping) lives in the safe
+`kernel` crate (`kernel::input`), not the TCB. All hardware access is funnelled
+through two private primitives, `inb`/`outb`, each documented with a `# Safety`
+section. The public surface (`init`, `on_irq`, `poll_scancode`) is **safe**;
+`poll_scancode` and the ring are pure atomics. `init` runs once on the boot core
+with interrupts disabled; `on_irq` runs inside the IRQ1 interrupt gate
+(interrupts already masked) — single-core, no SMP lock.
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| K1 | `keyboard.rs` · `inb()` | `in al, dx` (port read) | Only way to read the i8042 data (`0x60`) and status (`0x64`) registers | `unsafe fn` whose `# Safety` requires a read-safe PS/2 port; all callers pass `0x60`/`0x64`. Pure device read (draining the scancode / reading status), `nomem`/`nostack`. | Reasoned + QEMU (keystroke → `[input]` serial line) |
+| K2 | `keyboard.rs` · `outb()` | `out dx, al` (port write) | Only way to send i8042 commands (`0x64`) and write the config byte (`0x60`) | `unsafe fn` whose `# Safety` requires a write-safe PS/2 port; all callers pass `0x60`/`0x64` with documented i8042 command/config values. Device-only effect (which interrupts the controller raises / which ports are clocked), `nomem`/`nostack`. | Reasoned + QEMU |
+| K3 | `keyboard.rs` · `wait_input_empty()` / `wait_output_full()` | `inb(0x64)` status poll | Gate command/data writes and the config read on the controller's buffer state | Reads the read-only status register in a **bounded** loop (so a wedged controller cannot hang boot); no side effect relevant to memory safety. `inb`'s contract holds. | Reasoned + QEMU |
+| K4 | `keyboard.rs` · `init()` | read-modify-write of the i8042 config byte (`0x20` read → set IRQ1 bit, clear clock-disable → `0x60` write), then drain a stale byte | Enable IRQ1 generation; firmware may leave it disabled, in which case the keyboard never raises an interrupt | Standard i8042 config-byte programming; each `inb`/`outb` targets a constant PS/2 port with a defined value; only toggles controller interrupt/clock bits — device-only, cannot alias Rust memory. Runs once, boot core, interrupts off. | Reasoned + QEMU (after this, IRQ1 fires on keypress) |
+| K5 | `keyboard.rs` · `on_irq()` | `inb(0x60)` scancode read | Drain the scancode byte (mandatory — i8042 stops raising IRQ1 until read) | Reached only from the IRQ1 interrupt gate; a single pure device read of the data port, then a `fetch`-free atomic push to the ring and a `pic::end_of_interrupt`. Cannot corrupt memory. | Reasoned + QEMU (sustained keystrokes delivered) |
+
+> The keyboard's raw-scancode ring (`RING`/`HEAD`/`TAIL`) is built from plain
+> `AtomicU8`/`AtomicUsize` (no `unsafe`); `poll_scancode` is safe API. The
+> *decoding* state machine and the lock-screen logic live in `kernel::input`
+> under `#![forbid(unsafe_code)]`, so the privileged surface stays tiny.
 
 ---
 

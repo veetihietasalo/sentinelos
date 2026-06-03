@@ -65,6 +65,74 @@ const HIGHLIGHT_THICKNESS: usize = 2;
 /// Inner top highlight alpha (~0.30 white).
 const HIGHLIGHT_ALPHA: u8 = 78; // 0.30 * 255 ≈ 78
 
+/// Geometry of the central glass card and its unlock pill, derived purely from
+/// the framebuffer size so every drawing pass (the card, the hint, the unlock
+/// animation) agrees on exact pixel positions without sharing mutable state.
+///
+/// All fields are absolute framebuffer coordinates. Returned by [`layout`].
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+    /// Card top-left x.
+    card_x: usize,
+    /// Card top-left y.
+    card_y: usize,
+    /// Card width.
+    card_w: usize,
+    /// Card height.
+    card_h: usize,
+    /// Unlock pill top-left x.
+    pill_x: usize,
+    /// Unlock pill top-left y.
+    pill_y: usize,
+    /// Unlock pill width.
+    pill_w: usize,
+    /// Unlock pill height.
+    pill_h: usize,
+    /// Unlock pill corner radius (a full pill: `pill_h / 2`).
+    pill_radius: usize,
+}
+
+/// Compute the card + pill [`Layout`] for a screen of size `w × h`.
+///
+/// This mirrors the geometry inside [`draw_glass_card`] exactly (the card sizing
+/// and the pill anchoring), so the hint and the unlock animation land precisely
+/// over the pill the lock screen drew. Kept as one source of truth: change the
+/// card/pill layout in both this function and [`draw_glass_card`] together.
+fn layout(w: usize, h: usize) -> Layout {
+    let card_w = (w * 46 / 100).clamp(220, w.saturating_sub(40).max(220));
+    let card_h = (h * 30 / 100).clamp(150, h.saturating_sub(40).max(150));
+    let card_x = (w.saturating_sub(card_w)) / 2;
+    let card_y = (h.saturating_sub(card_h)) / 2;
+    let cx = card_x + card_w / 2;
+
+    // Pill sizing — must match `draw_glass_card`.
+    let pill_label = UNLOCK_PILL_LABEL;
+    let pill_text_scale = 2usize;
+    let label_w = font::text_width(pill_label, pill_text_scale);
+    let pad_x = 18usize;
+    let pad_y = 10usize;
+    let pill_w = (label_w + pad_x * 2).min(card_w.saturating_sub(card_w / 12));
+    let pill_h = font::GLYPH_SIZE * pill_text_scale + pad_y * 2;
+    let pill_x = cx.saturating_sub(pill_w / 2);
+    let pill_y = (card_y + card_h).saturating_sub(pill_h + card_h / 8);
+    let pill_radius = pill_h / 2;
+
+    Layout {
+        card_x,
+        card_y,
+        card_w,
+        card_h,
+        pill_x,
+        pill_y,
+        pill_w,
+        pill_h,
+        pill_radius,
+    }
+}
+
+/// The unlock pill's label — also the geometry anchor for the hint/animation.
+const UNLOCK_PILL_LABEL: &str = "swipe to unlock →";
+
 /// Compose the full Cyber Dusk boot/lock screen onto `fb`.
 ///
 /// Everything is centered to the live `fb.width()/height()`, so the layout
@@ -97,6 +165,10 @@ pub fn draw_boot_screen(fb: &Framebuffer) {
 
     // 5) Bottom dock of glossy tiles.
     draw_dock(fb, w, h);
+
+    // 6) The "press → to unlock" hint under the pill. Drawn at its brightest for
+    //    the static initial frame; the idle loop re-draws it pulsing thereafter.
+    draw_unlock_hint(fb, HINT_PULSE_PERIOD_TICKS / 4);
 }
 
 /// Peak alpha of the top-right pink corner glow (~0.30 of `GLOW_PINK`).
@@ -376,7 +448,7 @@ fn draw_glass_card(fb: &Framebuffer, gradient: &Gradient, w: usize, h: usize) {
     font::draw_text(fb, tag_x, tag_y, tagline, tag_scale, TEXT_SECONDARY.pack(fb));
 
     // --- Unlock pill -------------------------------------------------------
-    let pill_label = "swipe to unlock →";
+    let pill_label = UNLOCK_PILL_LABEL;
     let pill_text_scale = 2usize;
     let label_w = font::text_width(pill_label, pill_text_scale);
     let pad_x = 18usize;
@@ -423,4 +495,325 @@ fn draw_dock(fb: &Framebuffer, w: usize, h: usize) {
         let tx = start_x + i * (tile + gap);
         raster::glossy_tile(fb, tx, tile_y, tile, radius, *top, *bottom);
     }
+}
+
+// ── Unlock hint (pulsing) ───────────────────────────────────────────────────
+
+/// The unlock hint shown under the pill while locked. The literal `→` glyph
+/// (the font has it) makes the gesture unmistakable.
+const HINT_TEXT: &str = "press  →  to unlock";
+/// Text scale of the hint line.
+const HINT_SCALE: usize = 2;
+/// Pulse period of the hint, in PIT ticks (~100 Hz → ~1.0 s for a gentle pulse).
+pub const HINT_PULSE_PERIOD_TICKS: u64 = 100;
+/// Minimum alpha of the hint at the dim end of its pulse (so it never vanishes).
+const HINT_MIN_ALPHA: u32 = 70;
+/// Maximum alpha of the hint at the bright end of its pulse.
+const HINT_MAX_ALPHA: u32 = 235;
+
+/// `y` of the hint line's top edge: just below the unlock pill, clamped so it
+/// stays clear of the dock at the very bottom of small screens.
+#[inline]
+fn hint_y(lay: &Layout, h: usize) -> usize {
+    let below_pill = lay.pill_y + lay.pill_h + h / 36;
+    // Keep a little breathing room above the bottom edge.
+    below_pill.min(h.saturating_sub(font::GLYPH_SIZE * HINT_SCALE + h / 12))
+}
+
+/// Draw (or re-draw) the pulsing "press → to unlock" hint under the unlock pill.
+///
+/// `phase_ticks` is the current [`hal::pit::ticks`] value; the brightness is a
+/// triangle wave of it over [`HINT_PULSE_PERIOD_TICKS`], ramping the hint's alpha
+/// between [`HINT_MIN_ALPHA`] and [`HINT_MAX_ALPHA`] so it gently breathes and
+/// draws the eye. The hint's bounding box is first repainted from the exact
+/// Cyber-Dusk backdrop (gradient + corner glow), so successive frames don't
+/// smear — identical to how [`draw_clock`] erases the old digits. Cheap: only the
+/// tight text box is touched each frame.
+///
+/// Call this every tick **only while locked**; the unlock animation and the
+/// desktop draw over this region and take ownership of it.
+pub fn draw_unlock_hint(fb: &Framebuffer, phase_ticks: u64) {
+    let w = fb.width();
+    let h = fb.height();
+    if w == 0 || h == 0 {
+        return;
+    }
+    let lay = layout(w, h);
+
+    // Triangle-wave brightness over the pulse period: 0 → 1 → 0.
+    let period = HINT_PULSE_PERIOD_TICKS.max(1);
+    let half = period / 2;
+    let p = phase_ticks % period;
+    let tri = if p < half {
+        p * 255 / half.max(1)
+    } else {
+        255 - ((p - half) * 255 / (period - half).max(1))
+    };
+    let alpha =
+        (HINT_MIN_ALPHA + (HINT_MAX_ALPHA - HINT_MIN_ALPHA) * tri as u32 / 255).min(255) as u8;
+
+    let text_w = font::text_width(HINT_TEXT, HINT_SCALE);
+    let cx = w / 2;
+    let text_x = cx.saturating_sub(text_w / 2);
+    let text_y = hint_y(&lay, h);
+    let glyph_h = font::GLYPH_SIZE * HINT_SCALE;
+
+    // 1) Erase the previous frame by repainting the exact backdrop in the hint's
+    //    bounding box (with a small pad), so the pulse never leaves ghosting.
+    let gradient = Gradient::three_stop(GRAD_START, GRAD_MID, GRAD_END, w, h);
+    let pad = HINT_SCALE;
+    let x0 = text_x.saturating_sub(pad);
+    let y0 = text_y.saturating_sub(pad);
+    let x1 = (text_x + text_w + pad).min(w);
+    let y1 = (text_y + glyph_h + pad).min(h);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let c = backdrop_at(&gradient, px, py, w, h);
+            fb.put_pixel(px, py, c.pack(fb));
+        }
+    }
+
+    // 2) Draw the hint in cyan, alpha-modulated by blending toward the backdrop.
+    //    We pre-blend the cyan over an approximate mid-backdrop so the text can be
+    //    plotted with a single packed colour (text plotting is additive per glyph
+    //    pixel; blending per-glyph-pixel would mean a backdrop read we avoid).
+    let mid_backdrop = gradient.color_at(cx, text_y);
+    let tint = raster::blend(mid_backdrop, ACCENT_CYAN, alpha);
+    font::draw_text(fb, text_x, text_y, HINT_TEXT, HINT_SCALE, tint.pack(fb));
+}
+
+// ── Unlock animation ─────────────────────────────────────────────────────────
+
+/// Total length of the unlock animation, in PIT ticks (~100 Hz → ~0.7 s).
+pub const UNLOCK_ANIM_TICKS: u64 = 70;
+
+/// Draw one frame of the unlock animation for normalised progress `p ∈ [0, 255]`
+/// (0 = just started, 255 = finished). Driven by the kernel idle loop from the
+/// elapsed ticks since the unlock gesture.
+///
+/// The animation reads as a two-beat "unlock":
+///
+/// 1. **Swipe wipe (p: 0 → ~0.6).** A bright cyan→pink fill sweeps the unlock
+///    pill left→right, following the `→` arrow — the pill "lights up" as if the
+///    swipe completed. A soft leading edge keeps it from looking like a hard bar.
+/// 2. **Card dissolve (p: ~0.6 → 1).** The whole glass card (and its hint) fades
+///    back to the bare Cyber-Dusk backdrop, as if the lock surface slides away,
+///    revealing the gradient that the desktop will sit on.
+///
+/// Kept cheap: phase 1 touches only the pill's bounding box; phase 2 repaints the
+/// card's bounding box from the gradient (no per-pixel card re-render). The caller
+/// paints the desktop once when `p` reaches 255.
+pub fn draw_unlock_frame(fb: &Framebuffer, p: u8) {
+    let w = fb.width();
+    let h = fb.height();
+    if w == 0 || h == 0 {
+        return;
+    }
+    let lay = layout(w, h);
+    let gradient = Gradient::three_stop(GRAD_START, GRAD_MID, GRAD_END, w, h);
+
+    // Split point between the swipe (phase 1) and the dissolve (phase 2).
+    const SPLIT: u16 = 150; // ~0.59 of 255
+
+    if (p as u16) < SPLIT {
+        // ── Phase 1: cyan→pink swipe across the pill ───────────────────────
+        let prog = p as usize; // 0..SPLIT
+        // The leading edge of the fill, in pill-local pixels.
+        let edge = lay.pill_w * prog / SPLIT as usize;
+        // A soft feather so the edge isn't a hard vertical line.
+        let feather = (lay.pill_w / 12).max(4);
+
+        for py in lay.pill_y..(lay.pill_y + lay.pill_h).min(h) {
+            for px in lay.pill_x..(lay.pill_x + lay.pill_w).min(w) {
+                if !raster::in_rounded_rect(
+                    px,
+                    py,
+                    lay.pill_x,
+                    lay.pill_y,
+                    lay.pill_w,
+                    lay.pill_h,
+                    lay.pill_radius,
+                ) {
+                    continue;
+                }
+                let lx = px - lay.pill_x;
+                let backdrop = gradient.color_at(px, py);
+                // Fill colour shifts cyan (left) → pink (right) across the pill.
+                let fill = raster::lerp_rgb(ACCENT_CYAN, ACCENT_PINK, lx, lay.pill_w.max(1));
+                // Alpha: full behind the edge, feathering to 0 just ahead of it.
+                let a: u8 = if lx + feather <= edge {
+                    220
+                } else if lx <= edge {
+                    let d = edge - lx; // 0..feather
+                    (220 * d / feather.max(1)) as u8
+                } else {
+                    0
+                };
+                let out = if a == 0 {
+                    // Ahead of the swipe: keep the resting translucent pill look.
+                    raster::blend(backdrop, GLASS_WHITE, PILL_FILL_ALPHA)
+                } else {
+                    raster::blend(backdrop, fill, a)
+                };
+                fb.put_pixel(px, py, out.pack(fb));
+            }
+        }
+    } else {
+        // ── Phase 2: dissolve the glass card back to the backdrop ──────────
+        let prog = (p as u16 - SPLIT) as usize; // 0..(255-SPLIT)
+        let span = (255 - SPLIT) as usize;
+        // Reveal the backdrop top-down: a moving boundary wipes the card away,
+        // so it reads as the lock surface sliding/dissolving off-screen.
+        let reveal = lay.card_h * prog / span.max(1);
+
+        // Bounding box covering the card plus its shadow and the hint below it.
+        let bx0 = lay.card_x.saturating_sub(SHADOW_RINGS + 2);
+        let by0 = lay.card_y.saturating_sub(SHADOW_RINGS + 2);
+        let bx1 = (lay.card_x + lay.card_w + SHADOW_RINGS + 2).min(w);
+        let hint_bottom = hint_y(&lay, h) + font::GLYPH_SIZE * HINT_SCALE + HINT_SCALE;
+        let by1 = (lay.card_y + lay.card_h + SHADOW_OFFSET_Y + SHADOW_RINGS + 2)
+            .max(hint_bottom)
+            .min(h);
+
+        for py in by0..by1 {
+            // Only repaint rows that have been "revealed" so far (top-down wipe),
+            // plus a soft 1-row leading edge, so each frame does a thin strip and
+            // the card appears to peel away progressively.
+            let revealed = py < lay.card_y + reveal || py >= lay.card_y + lay.card_h;
+            if !revealed {
+                continue;
+            }
+            for px in bx0..bx1 {
+                let c = backdrop_at(&gradient, px, py, w, h);
+                fb.put_pixel(px, py, c.pack(fb));
+            }
+        }
+    }
+}
+
+// ── Desktop stub ─────────────────────────────────────────────────────────────
+
+/// Height of the desktop top status bar.
+const STATUS_BAR_H_DIV: usize = 16; // bar height ≈ screen_h / 16
+/// Status-bar fill alpha (a translucent dark glass strip).
+const STATUS_BAR_ALPHA: u8 = 70;
+
+/// Paint the first SentinelOS desktop over the existing Cyber Dusk gradient.
+///
+/// Called **once**, when the unlock animation completes. It assumes the backdrop
+/// is already the bare gradient (the unlock animation dissolved the card away), so
+/// it only adds the desktop chrome: a slim translucent top status bar with the
+/// `SentinelOS` wordmark at the left and a `Welcome` greeting centered on the
+/// canvas. The dock at the bottom is left in place from the lock screen. The live
+/// clock is drawn separately by [`draw_desktop_clock`], which the idle loop keeps
+/// ticking.
+pub fn draw_desktop(fb: &Framebuffer) {
+    let w = fb.width();
+    let h = fb.height();
+    if w == 0 || h == 0 {
+        return;
+    }
+    let gradient = Gradient::three_stop(GRAD_START, GRAD_MID, GRAD_END, w, h);
+
+    // Repaint the whole canvas to the bare backdrop so any animation residue
+    // (and the old lock card region) is cleared, then add desktop chrome on top.
+    for py in 0..h {
+        for px in 0..w {
+            let c = backdrop_at(&gradient, px, py, w, h);
+            fb.put_pixel(px, py, c.pack(fb));
+        }
+    }
+
+    // Slim translucent status bar across the top.
+    let bar_h = (h / STATUS_BAR_H_DIV).clamp(24, 56);
+    raster::fill_rounded_rect_alpha(
+        fb, &gradient, 0, 0, w, bar_h, 0, Rgb::hex(0x10_08_20), STATUS_BAR_ALPHA,
+    );
+
+    // Left: the SentinelOS wordmark in the bar.
+    let label = "SentinelOS";
+    let label_scale = 2usize;
+    let pad = w / 64;
+    let label_y = (bar_h.saturating_sub(font::GLYPH_SIZE * label_scale)) / 2;
+    // Subtle pink under-glow then white, mirroring the lock-screen wordmark.
+    font::draw_text(fb, pad + 1, label_y + 1, label, label_scale, ACCENT_PINK.pack(fb));
+    font::draw_text(fb, pad, label_y, label, label_scale, TEXT_PRIMARY.pack(fb));
+
+    // Centered "Welcome" greeting on the desktop canvas.
+    let greet = "Welcome";
+    let greet_scale = 6usize;
+    let greet_w = font::text_width(greet, greet_scale);
+    let greet_x = (w / 2).saturating_sub(greet_w / 2);
+    let greet_y = h / 2 - font::GLYPH_SIZE * greet_scale / 2;
+    font::draw_text(fb, greet_x + 1, greet_y + 1, greet, greet_scale, ACCENT_PINK.pack(fb));
+    font::draw_text(fb, greet_x, greet_y, greet, greet_scale, TEXT_PRIMARY.pack(fb));
+
+    let sub = "SentinelOS desktop";
+    let sub_scale = 2usize;
+    let sub_w = font::text_width(sub, sub_scale);
+    let sub_x = (w / 2).saturating_sub(sub_w / 2);
+    let sub_y = greet_y + font::GLYPH_SIZE * greet_scale + h / 40;
+    font::draw_text(fb, sub_x, sub_y, sub, sub_scale, TEXT_SECONDARY.pack(fb));
+
+    // Keep the familiar dock at the bottom.
+    draw_dock(fb, w, h);
+
+    // Draw the clock once now; the idle loop refreshes it each second.
+    draw_desktop_clock(fb, CLOCK_START_H, CLOCK_START_M, CLOCK_START_S);
+}
+
+/// Top-right x of the desktop clock text box, for a given clock width.
+#[inline]
+fn desktop_clock_geom(fb: &Framebuffer) -> (usize, usize, usize, usize) {
+    let w = fb.width();
+    let h = fb.height();
+    let bar_h = (h / STATUS_BAR_H_DIV).clamp(24, 56);
+    let scale = 2usize;
+    let clock_w = font::text_width("00:00:00", scale);
+    let pad = w / 64;
+    let x = w.saturating_sub(clock_w + pad);
+    let y = (bar_h.saturating_sub(font::GLYPH_SIZE * scale)) / 2;
+    (x, y, clock_w, scale)
+}
+
+/// Redraw the live clock in the desktop's top status bar (right-aligned).
+///
+/// Mirrors [`draw_clock`]'s "erase then draw" approach but scoped to the status
+/// bar's right side, so the desktop clock keeps ticking once per second without
+/// disturbing the rest of the bar. The idle loop calls this with the current
+/// `HH:MM:SS` each whole second.
+pub fn draw_desktop_clock(fb: &Framebuffer, h: u8, m: u8, s: u8) {
+    let w = fb.width();
+    let screen_h = fb.height();
+    if w == 0 || screen_h == 0 {
+        return;
+    }
+    let (x, y, clock_w, scale) = desktop_clock_geom(fb);
+    let glyph_h = font::GLYPH_SIZE * scale;
+
+    // Build "HH:MM:SS".
+    let mut text = *b"00:00:00";
+    write_two(&mut text, 0, h);
+    text[2] = b':';
+    write_two(&mut text, 3, m);
+    text[5] = b':';
+    write_two(&mut text, 6, s);
+    let clock = core::str::from_utf8(&text).unwrap_or("00:00:00");
+
+    // Erase the previous time by repainting the status-bar strip behind it
+    // (backdrop + translucent bar fill), then draw the new time over it.
+    let gradient = Gradient::three_stop(GRAD_START, GRAD_MID, GRAD_END, w, screen_h);
+    let pad = scale;
+    let x0 = x.saturating_sub(pad);
+    let y0 = y.saturating_sub(pad);
+    let x1 = (x + clock_w + pad).min(w);
+    let y1 = (y + glyph_h + pad).min(screen_h);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let backdrop = backdrop_at(&gradient, px, py, w, screen_h);
+            let out = raster::blend(backdrop, Rgb::hex(0x10_08_20), STATUS_BAR_ALPHA);
+            fb.put_pixel(px, py, out.pack(fb));
+        }
+    }
+    font::draw_text(fb, x, y, clock, scale, TEXT_PRIMARY.pack(fb));
 }

@@ -16,6 +16,7 @@
 //! | 13     | #GP General Protection | Print error code + RIP + [`hal::cpu::halt_loop`]. |
 //! | 14     | #PF Page Fault     | Decode error-code bits + CR2 faulting address, print, [`hal::cpu::halt_loop`]. |
 //! | 32     | IRQ0 PIT timer     | Bump the tick counter + EOI, then **return** (resumes). |
+//! | 33     | IRQ1 PS/2 keyboard | Drain the scancode byte into the ring + EOI, then **return** (resumes). |
 //!
 //! Vectors without a registered handler fall through to `hal`'s `default_handler`,
 //! which already reports and halts — no action needed here.
@@ -36,6 +37,8 @@ const VECTOR_PAGE_FAULT: u8 = 14;
 const VECTOR_TIMER: u8 = hal::pic::PIC1_OFFSET;
 /// IRQ line the PIT is wired to (IRQ0).
 const IRQ_TIMER: u8 = 0;
+/// Vector 33 (`0x21`): IRQ1 — the PS/2 keyboard, after the PIC remap.
+const VECTOR_KEYBOARD: u8 = hal::keyboard::VECTOR_KEYBOARD;
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -167,6 +170,19 @@ fn handle_timer(_frame: &InterruptFrame) {
     hal::pit::on_tick();
 }
 
+/// Vector 33 (IRQ1) — the PS/2 keyboard.
+///
+/// Delegates to [`hal::keyboard::on_irq`], which **must** read the scancode byte
+/// from port `0x60` on every interrupt (the i8042 will not raise another IRQ1
+/// until its output buffer is drained), enqueues the raw byte into a lock-free
+/// ring for the kernel to decode, and signals End-Of-Interrupt to the PIC.
+/// Returns normally so the interrupted code resumes. All the privileged work (the
+/// port read + PIC EOI port write) stays inside `hal`; decoding happens in safe
+/// code (`crate::input`) from the idle loop.
+fn handle_keyboard(_frame: &InterruptFrame) {
+    hal::keyboard::on_irq();
+}
+
 // ── Public initialisation ─────────────────────────────────────────────────────
 
 /// Register CPU exception handlers and arm the GDT + TSS + IDT.
@@ -213,23 +229,26 @@ pub fn self_test() {
     hal::println!("[selftest] int3 -> #BP handler ran; IDT live");
 }
 
-/// Bring up the PIT timer interrupt: register the vector-32 handler, remap the
-/// PIC pair, program the PIT to ~100 Hz, and unmask IRQ0.
+/// Bring up the hardware-IRQ foundation: register the vector-32 (PIT) and
+/// vector-33 (PS/2 keyboard) handlers, remap the PIC pair, program the PIT to
+/// ~100 Hz, and unmask IRQ0 + IRQ1.
 ///
 /// Does **not** enable interrupts — the caller (`kmain`) must `sti` only after
-/// every handler is registered. Order matters: remap the PIC (so IRQ0 lands on
-/// vector 32, clear of the CPU exceptions) before programming the PIT, and
-/// register the handler before unmasking the line so no tick can arrive before
-/// its handler exists.
+/// every handler is registered. Order matters: remap the PIC (so the IRQs land on
+/// vectors 32/33, clear of the CPU exceptions) before programming the PIT, and
+/// register each handler **before** unmasking its line so no interrupt can arrive
+/// before its handler exists.
 pub fn init_timer() {
-    // Register the vector-32 handler first.
+    // Register the vector-32 (timer) and vector-33 (keyboard) handlers first.
     hal::interrupts::set_handler(VECTOR_TIMER, handle_timer as Handler);
+    hal::interrupts::set_handler(VECTOR_KEYBOARD, handle_keyboard as Handler);
 
     // Remap the 8259A pair to vectors 32–47 (every line masked), then program
-    // PIT channel 0 to ~100 Hz, then open IRQ0.
+    // PIT channel 0 to ~100 Hz, then open IRQ0 (timer) and IRQ1 (keyboard).
     hal::pic::init();
     hal::pit::init();
     hal::pic::unmask_irq(IRQ_TIMER);
+    hal::keyboard::init();
 }
 
 // ── Unit tests (host) ─────────────────────────────────────────────────────────
