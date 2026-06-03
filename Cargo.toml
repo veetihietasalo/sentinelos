@@ -1,4 +1,4 @@
 [workspace]
 resolver = "2"
-members = ["sentinel-core"]
+members = ["sentinel-core", "provider-macos"]
 # src-tauri is added when the Tauri app shell is scaffolded (needs tauri-cli).

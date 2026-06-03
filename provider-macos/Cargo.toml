@@ -1,0 +1,8 @@
+[package]
+name = "provider-macos"
+version = "0.1.0"
+edition = "2021"
+description = "macOS implementation of sentinel-core's SecurityProvider (Tauri-free, unit-testable)."
+
+[dependencies]
+sentinel-core = { path = "../sentinel-core" }

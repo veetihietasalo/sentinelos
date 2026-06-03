@@ -1,0 +1,4 @@
+Index Refs Address            Size       Wired      Name (Version) UUID <Linked Against>
+    1   90 0                  0          0          com.apple.kpi.bsd (8.0.0)
+    2   10 0                  0          0          com.apple.iokit.IONetworkingFamily (3.4) <1>
+  120    0 0xffffff7f8a000000 0x8000     0x8000     com.examplevendor.driver.Widget (1.2.3) <5 4 3>

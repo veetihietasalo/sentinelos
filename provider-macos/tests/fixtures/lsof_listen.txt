@@ -1,0 +1,4 @@
+COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+node    52001 user   22u  IPv4  0x1      0t0  TCP 127.0.0.1:4123 (LISTEN)
+sshd    600   root    3u  IPv4  0x2      0t0  TCP *:22 (LISTEN)
+rapportd 700  user    8u  IPv4  0x3      0t0  TCP *:51000 (LISTEN)
