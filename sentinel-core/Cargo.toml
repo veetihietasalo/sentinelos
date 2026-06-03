@@ -1,0 +1,11 @@
+[package]
+name = "sentinel-core"
+version = "0.1.0"
+edition = "2021"
+description = "Portable, OS-agnostic security logic for SentinelOS (model, orchestrator, diff, monitor)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
