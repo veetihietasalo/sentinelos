@@ -7,9 +7,10 @@
 //! # Usage (run from kernel/)
 //!
 //! ```sh
-//! cargo xtask build   # cross-compile the boot binary for x86_64-unknown-none
-//! cargo xtask run     # build ISO, launch QEMU with serial output on stdout
-//! cargo xtask test    # build ISO, run QEMU ~8s, assert banner in serial.log
+//! cargo xtask build      # cross-compile the boot binary for x86_64-unknown-none
+//! cargo xtask run        # build ISO, launch QEMU with serial output on stdout
+//! cargo xtask test       # build ISO, run QEMU ~8s, assert banner in serial.log
+//! cargo xtask screenshot # build ISO, boot in headless QEMU, capture PNG via QMP
 //! ```
 //!
 //! # Dependencies
@@ -31,9 +32,10 @@ fn main() -> ExitCode {
         Some("build") => do_build(),
         Some("run") => do_run(),
         Some("test") => do_test(),
+        Some("screenshot") => do_screenshot(),
         other => {
             eprintln!(
-                "Usage: cargo xtask <build|run|test>\nUnknown subcommand: {:?}",
+                "Usage: cargo xtask <build|run|test|screenshot>\nUnknown subcommand: {:?}",
                 other
             );
             ExitCode::FAILURE
@@ -302,4 +304,192 @@ fn do_test() -> ExitCode {
         END_MARKER
     );
     ExitCode::SUCCESS
+}
+
+// ── screenshot ─────────────────────────────────────────────────────────────────
+
+/// Python script template used to drive QMP and capture a PNG screendump.
+///
+/// The script:
+///   1. Connects to the QMP unix socket (retries up to 15 s — QEMU may not be ready yet).
+///   2. Reads the QMP greeting.
+///   3. Sends `qmp_capabilities` to enter command mode.
+///   4. Sends `screendump` with PNG format.
+///   5. Prints "SCREENDUMP_OK" on success, exits non-zero on any error.
+const QMP_SCRIPT: &str = r#"
+import socket, json, sys, time, pathlib
+
+sock_path = sys.argv[1]
+png_path  = sys.argv[2]
+
+# Retry connecting — QEMU may not have created the socket yet.
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+deadline = time.monotonic() + 15.0
+while True:
+    try:
+        s.connect(sock_path)
+        break
+    except (FileNotFoundError, ConnectionRefusedError):
+        if time.monotonic() > deadline:
+            print("QMP_ERROR: socket not available after 15 s", file=sys.stderr)
+            sys.exit(1)
+        time.sleep(0.25)
+
+def recv_json(sock):
+    """Read one complete JSON object from a line-oriented socket."""
+    buf = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        try:
+            return json.loads(buf.decode())
+        except json.JSONDecodeError:
+            pass  # need more bytes
+    return json.loads(buf.decode())
+
+def send_cmd(sock, cmd):
+    sock.sendall((json.dumps(cmd) + "\n").encode())
+
+# 1. Read greeting.
+greeting = recv_json(s)
+print(f"QMP greeting: {greeting.get('QMP', {}).get('version', {}).get('qemu', 'unknown')}", flush=True)
+
+# 2. Enter command mode.
+send_cmd(s, {"execute": "qmp_capabilities"})
+cap_resp = recv_json(s)
+if "error" in cap_resp:
+    print(f"QMP_ERROR: qmp_capabilities failed: {cap_resp}", file=sys.stderr)
+    sys.exit(1)
+
+# 3. Take screendump.
+send_cmd(s, {"execute": "screendump", "arguments": {"filename": png_path, "format": "png"}})
+dump_resp = recv_json(s)
+if "error" in dump_resp:
+    print(f"QMP_ERROR: screendump failed: {dump_resp}", file=sys.stderr)
+    sys.exit(1)
+
+print("SCREENDUMP_OK", flush=True)
+s.close()
+"#;
+
+fn do_screenshot() -> ExitCode {
+    let Some(elf) = build_kernel() else {
+        return ExitCode::FAILURE;
+    };
+    let Some(iso) = build_iso(&elf) else {
+        return ExitCode::FAILURE;
+    };
+
+    let serial_log = kr("target/serial.log");
+    let qmp_sock   = kr("target/sos-qmp.sock");
+    let png_path   = kr("target/sentinelos-boot.png");
+
+    // Remove stale artefacts from a previous run.
+    let _ = fs::remove_file(&serial_log);
+    let _ = fs::remove_file(&qmp_sock);
+    let _ = fs::remove_file(&png_path);
+
+    println!("Launching QEMU (headless + QMP socket) ...");
+
+    // Spawn QEMU in background:
+    //   - no interactive window (-display none)
+    //   - GOP/VGA framebuffer rendered internally (screendump still works)
+    //   - QMP control socket for programmatic screendump
+    let mut child = Command::new("qemu-system-x86_64")
+        .args([
+            "-M", "q35",
+            "-m", "256M",
+            "-cdrom", iso.to_str().unwrap(),
+            "-display", "none",
+            "-no-reboot",
+            "-serial", &format!("file:{}", serial_log.display()),
+            "-qmp", &format!("unix:{},server,nowait", qmp_sock.display()),
+        ])
+        .spawn()
+        .expect("failed to spawn qemu-system-x86_64");
+
+    // ── Step 1: wait for boot-bringup-ok in serial log (up to 20 s) ──────────
+    println!("Waiting for '{}' in serial log ...", END_MARKER);
+    let boot_deadline = Instant::now() + Duration::from_secs(20);
+    let mut boot_found = false;
+    while Instant::now() < boot_deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        let log = fs::read_to_string(&serial_log).unwrap_or_default();
+        if log.contains(END_MARKER) {
+            boot_found = true;
+            println!("Boot marker found. Waiting 10 s for full framebuffer draw ...");
+            break;
+        }
+    }
+
+    if !boot_found {
+        eprintln!("Timed out waiting for boot marker '{}' (20 s).", END_MARKER);
+        let log = fs::read_to_string(&serial_log).unwrap_or_default();
+        eprintln!("--- serial.log so far ---\n{}\n---", log);
+        let _ = child.kill();
+        let _ = child.wait();
+        return ExitCode::FAILURE;
+    }
+
+    // ── Step 2: wait extra time for the per-pixel framebuffer draw ───────────
+    // Under TCG (software emulation) the VGA/GOP pixel-by-pixel draw is slow.
+    std::thread::sleep(Duration::from_secs(10));
+
+    // ── Step 3: drive QMP via Python to capture screendump ───────────────────
+    println!("Taking screendump via QMP ...");
+
+    // Write the embedded Python script to a temp file.
+    let script_path = kr("target/qmp_screenshot.py");
+    fs::write(&script_path, QMP_SCRIPT).expect("write qmp_screenshot.py");
+
+    let qmp_out = Command::new("python3")
+        .args([
+            script_path.to_str().unwrap(),
+            qmp_sock.to_str().unwrap(),
+            png_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run python3");
+
+    let stdout = String::from_utf8_lossy(&qmp_out.stdout);
+    let stderr = String::from_utf8_lossy(&qmp_out.stderr);
+    println!("QMP stdout:\n{}", stdout);
+    if !stderr.is_empty() {
+        eprintln!("QMP stderr:\n{}", stderr);
+    }
+
+    // ── Step 4: kill QEMU ─────────────────────────────────────────────────────
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // ── Step 5: verify the PNG ────────────────────────────────────────────────
+    if !qmp_out.status.success() || !stdout.contains("SCREENDUMP_OK") {
+        eprintln!("SCREENSHOT FAILED: QMP script reported an error.");
+        return ExitCode::FAILURE;
+    }
+
+    match fs::metadata(&png_path) {
+        Ok(meta) if meta.len() > 5_000 => {
+            println!(
+                "SCREENSHOT SUCCESS: {} ({} bytes)",
+                png_path.display(),
+                meta.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(meta) => {
+            eprintln!(
+                "SCREENSHOT FAILED: PNG exists but is suspiciously small ({} bytes). \
+                 The framebuffer may not have been drawn yet.",
+                meta.len()
+            );
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("SCREENSHOT FAILED: PNG not found after screendump: {}", e);
+            ExitCode::FAILURE
+        }
+    }
 }
