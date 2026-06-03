@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/hal", "crates/kernel", "crates/boot"]
+# xtask is intentionally NOT a member of this workspace.
+# It lives in kernel/xtask/ as its own standalone workspace so it builds for the
+# HOST triple (aarch64-apple-darwin / x86_64-…) rather than inheriting the
+# bare-metal build.target from kernel/.cargo/config.toml.
+# Run it via:  cargo xtask build   (alias defined in kernel/.cargo/config.toml)
+
+# panic=abort required for no_std kernel (no unwinding runtime available)
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

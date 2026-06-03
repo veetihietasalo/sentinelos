@@ -1,0 +1,17 @@
+[package]
+name = "boot"
+version = "0.1.0"
+edition = "2021"
+
+# The bootable binary — the thin entry shim (part of the TCB). It owns `_start`,
+# the Limine protocol marker, and the panic handler, then hands off to the safe
+# `kernel` crate. Output binary name is `sentinelos` (referenced by limine.conf).
+
+[[bin]]
+name = "sentinelos"
+path = "src/main.rs"
+
+[dependencies]
+hal = { path = "../hal" }
+kernel = { path = "../kernel" }
+limine = "0.5.0"

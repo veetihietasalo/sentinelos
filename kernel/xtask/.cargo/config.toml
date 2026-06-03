@@ -1,0 +1,15 @@
+# xtask builds for the HOST, not the bare-metal kernel target.
+#
+# Why this file exists:
+#   kernel/.cargo/config.toml sets build.target = "x86_64-unknown-none" for the
+#   bare-metal kernel workspace.  Cargo walks up from each manifest's directory to
+#   collect config, so xtask/ would normally inherit that setting — causing
+#   "can't find crate for `std`" when compiling xtask.
+#
+#   Lower-level config overrides higher-level config, so this file's build.target
+#   wins over the parent, restoring the host triple for xtask.
+#
+# IMPORTANT: keep this in sync with `rustc -vV | grep host` if you move the build
+# to a different host architecture (e.g. x86_64-unknown-linux-gnu on CI).
+[build]
+target = "aarch64-apple-darwin"

@@ -1,0 +1,7 @@
+[toolchain]
+# SentinelOS is stable-only (no nightly). The built-in x86_64-unknown-none target
+# ships a prebuilt `core`, and `limine = 0.5` builds on stable — so nightly is not
+# needed. Do not bump to a limine version that requires nightly features.
+channel = "stable"
+components = ["rustfmt", "clippy", "llvm-tools"]
+targets = ["x86_64-unknown-none"]

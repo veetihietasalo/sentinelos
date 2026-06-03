@@ -1,0 +1,10 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2021"
+
+# Library crate: the safe kernel logic. The bootable binary is `crates/boot`,
+# which links this in and provides the `_start` entry shim + panic handler.
+
+[dependencies]
+hal = { path = "../hal" }

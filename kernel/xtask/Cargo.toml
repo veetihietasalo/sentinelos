@@ -1,0 +1,16 @@
+# xtask is a STANDALONE workspace (not a member of kernel/).
+# This keeps it insulated from kernel/.cargo/config.toml's bare-metal build.target.
+# Its own .cargo/config.toml further overrides build.target → host triple.
+[workspace]
+resolver = "2"
+
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
