@@ -14,12 +14,18 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod interrupts;
+
 /// Kernel entry point — called by `boot::_start` after serial initialisation.
 ///
 /// All privileged setup (serial port I/O, CPU control) is performed by `hal`
 /// before this runs. Never returns: it ends in [`hal::cpu::halt_loop`], enforced
 /// statically by the `-> !` return type.
 pub fn kmain() -> ! {
+    // ARM the GDT + TSS + IDT **first**, so any fault during the banner or beyond
+    // is caught and reported rather than causing a triple fault → silent reset.
+    interrupts::init();
+
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");
     // Use concat! to bake the version into a literal at compile time, avoiding
