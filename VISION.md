@@ -9,7 +9,7 @@ Privacy/security is the one goal that is both achievable now and uniquely ours, 
 - A **native security subsystem** reusing the `sentinel-core` crate (continuous integrity monitoring as a first-class kernel citizen).
 - Stable Rust + a CI verification gate (Miri + Kani + fuzz) over the TCB.
 
-The matte "security-ops" aesthetic established in the dashboard is the UI/UX design language.
+The OS UI design language is **"Cyber Dusk"** — Y2K Aero glass in a dark, privacy-forward palette (see `docs/specs/2026-06-03-ui-design-language.md`). The matte "security-ops" aesthetic is the **dev-tooling** theme (the agent dashboard), not the OS itself.
 
 ## Strategy: Path A — pure from-scratch  (decided 2026-06-03)
 SentinelOS is built **from scratch in Rust** (x86_64 first, Limine boot). This **maximizes privacy and control** at the cost of compatibility speed.
@@ -30,3 +30,13 @@ SentinelOS is built **from scratch in Rust** (x86_64 first, Limine boot). This *
 5. Display/compositor → GUI (the polished UI)
 6. Port the Sentinel security subsystem (`sentinel-core` native)
 … then the long road toward apps, games, and compatibility.
+
+## Hardware & compatibility (Path A reality — reaffirmed 2026-06-03)
+SentinelOS aims to run broadly, but pure-from-scratch demands an honest, staged scope:
+- **CPU — Intel + AMD:** ✅ covered now. Both are x86_64 (our target); SentinelOS boots on any Intel/AMD PC.
+- **GPU 2D — NVIDIA + AMD + Intel:** ✅ via the firmware linear framebuffer (UEFI GOP / Limine) — no vendor driver. The Cyber Dusk UI renders on all three brands.
+- **GPU *acceleration* (3D / compute / video) — NVIDIA + AMD + Intel:** ⏳ long-horizon. AMD (open `amdgpu`) and Intel are tractable but multi-year; **NVIDIA is proprietary/closed (Nouveau-class) — possibly never** without their cooperation.
+- **Apple Silicon (aarch64) Macs:** ⏳ far off — Asahi-class reverse-engineering of a proprietary boot chain; a future aarch64 HAL target.
+- **Linux / macOS apps:** ⏳ a future compatibility layer (deferred; this is what Path C would have made native — not chosen).
+
+The user reaffirmed Path A knowing this: we get **Intel/AMD CPU + 2D Cyber Dusk UI on all GPU brands now**; GPU acceleration, Apple Silicon, and app compatibility are accepted as long-horizon.
