@@ -14,7 +14,13 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+// The kernel can heap-allocate (`Box`, `Vec`, `String`) once `memory::init` has
+// installed the global allocator. Pulling in `alloc` here is what makes those
+// types available to the safe kernel logic.
+extern crate alloc;
+
 pub mod interrupts;
+pub mod memory;
 
 /// Kernel entry point — called by `boot::_start` after serial initialisation.
 ///
@@ -25,6 +31,11 @@ pub fn kmain() -> ! {
     // ARM the GDT + TSS + IDT **first**, so any fault during the banner or beyond
     // is caught and reported rather than causing a triple fault → silent reset.
     interrupts::init();
+
+    // Bring up memory management: physical frame allocator + paging + kernel heap
+    // + global allocator. After this the kernel can heap-allocate. Done before the
+    // banner/draw so the heap is ready for everything that follows.
+    memory::init_and_prove();
 
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");

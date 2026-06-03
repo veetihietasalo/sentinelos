@@ -252,6 +252,39 @@ pub fn _print(args: fmt::Arguments<'_>) {
     });
 }
 
+/// Write a string slice to the COM1 console (no trailing newline, no `fmt`).
+///
+/// A `fmt`-free console write: the `core::fmt` machinery that `println!("{}", …)`
+/// uses needs GOT/`.rela` relocations that this higher-half, statically-relocated
+/// kernel deliberately discards in its linker script, so any `{}` argument
+/// formatting **faults** at runtime. This helper (and [`write_dec`]) let early
+/// boot code emit dynamic values — numbers, slices — without touching `fmt`.
+/// Interrupts are masked for the write, exactly like the macros.
+pub fn write_str(s: &str) {
+    with_console(|serial| serial.write_bytes(s.as_bytes()));
+}
+
+/// Write a `u64` in decimal to the COM1 console (no newline, no `fmt`).
+///
+/// See [`write_str`] for why a `fmt`-free integer printer is needed on this
+/// target. Digits are generated into a fixed stack buffer (max 20 for `u64`)
+/// without any heap or `fmt` involvement, then emitted with interrupts masked.
+pub fn write_dec(mut value: u64) {
+    // A `u64` has at most 20 decimal digits; fill from the end.
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    if value == 0 {
+        write_str("0");
+        return;
+    }
+    while value != 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    with_console(|serial| serial.write_bytes(&buf[i..]));
+}
+
 /// Print formatted text to the COM1 serial console (no trailing newline).
 ///
 /// Mirrors the standard library `print!`. Available as `hal::print!`.
