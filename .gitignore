@@ -1,0 +1,35 @@
+# Rust
+/target
+**/target
+**/*.rs.bk
+*.pdb
+
+# Tauri
+src-tauri/target
+src-tauri/gen
+
+# Node / web UI
+node_modules
+dist
+.vite
+*.log
+
+# Env & secrets — never commit
+.env
+.env.*
+*.env
+zai.env
+*.key
+*.pem
+secrets/
+
+# OS / editor
+.DS_Store
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# Local audit artifacts — keep machine data out of the repo
+/audit
+*.audit
+erase-*.sh
