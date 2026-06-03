@@ -106,6 +106,66 @@ const GLYPH_ARROW: Glyph = [
     0b00000000,
 ];
 
+/// Greater-than `>` (the shell prompt, e.g. `> help`).
+const GLYPH_GT: Glyph = [
+    0b00110000,
+    0b00011000,
+    0b00001100,
+    0b00000110,
+    0b00001100,
+    0b00011000,
+    0b00110000,
+    0b00000000,
+];
+
+/// Less-than `<`.
+const GLYPH_LESS: Glyph = [
+    0b00000110,
+    0b00001100,
+    0b00011000,
+    0b00110000,
+    0b00011000,
+    0b00001100,
+    0b00000110,
+    0b00000000,
+];
+
+/// Underscore `_` (used for an underline-style cursor / paths).
+const GLYPH_UNDERSCORE: Glyph = [
+    0b00000000,
+    0b00000000,
+    0b00000000,
+    0b00000000,
+    0b00000000,
+    0b00000000,
+    0b00000000,
+    0b11111111,
+];
+
+/// Single quote `'` (used in console help text like `'help'`).
+const GLYPH_QUOTE: Glyph = [
+    0b00011000,
+    0b00011000,
+    0b00011000,
+    0b00000000,
+    0b00000000,
+    0b00000000,
+    0b00000000,
+    0b00000000,
+];
+
+/// Comma `,`.
+const GLYPH_COMMA: Glyph = [
+    0b00000000,
+    0b00000000,
+    0b00000000,
+    0b00000000,
+    0b00000000,
+    0b00011000,
+    0b00011000,
+    0b00110000,
+];
+
 // --- Digits 0-9 ---------------------------------------------------------------
 
 const GLYPH_0: Glyph = [
@@ -751,6 +811,11 @@ pub const fn glyph(c: char) -> Glyph {
         '/' => GLYPH_SLASH,
         '·' => GLYPH_MIDDOT,
         '→' => GLYPH_ARROW,
+        '>' => GLYPH_GT,
+        '<' => GLYPH_LESS,
+        '_' => GLYPH_UNDERSCORE,
+        '\'' => GLYPH_QUOTE,
+        ',' => GLYPH_COMMA,
         '0' => GLYPH_0,
         '1' => GLYPH_1,
         '2' => GLYPH_2,

@@ -20,8 +20,13 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod console;
 pub mod font;
 pub mod raster;
+
+pub use console::{
+    console_cols, console_geometry, console_rows, draw_console, ConsoleGeometry, CursorStyle,
+};
 
 use hal::framebuffer::Framebuffer;
 use raster::{Gradient, Rgb};
