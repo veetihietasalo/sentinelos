@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SentinelOS · Build Team</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #161819;
+    --panel:    #121415;
+    --line:     #2b2f31;
+    --text:     #bcc1c4;
+    --dim:      #7a8085;
+    --done:     #8aa978;
+    --working:  #c2a25e;
+    --blocked:  #bf6b6b;
+    --idle:     #6d93a8;
+    --mono:     'JetBrains Mono', monospace;
+    --sans:     'Inter', system-ui, sans-serif;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 1.5;
+    min-height: 100vh;
+    padding: 24px 20px 40px;
+  }
+
+  /* ── Header ── */
+  .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-bottom: 28px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .header-left h1 {
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--text);
+  }
+
+  .header-left .meta {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--dim);
+    font-family: var(--mono);
+  }
+
+  .legend {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: var(--dim);
+  }
+
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  /* ── Pipeline ── */
+  .pipeline-section {
+    margin-bottom: 28px;
+  }
+
+  .section-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin-bottom: 10px;
+  }
+
+  .pipeline {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 2px;
+    overflow-x: auto;
+    width: fit-content;
+    max-width: 100%;
+  }
+
+  .stage {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+    padding: 6px 14px;
+    border-radius: 4px;
+    color: var(--dim);
+    white-space: nowrap;
+    transition: background 0.15s;
+  }
+
+  .stage.active {
+    background: rgba(194, 162, 94, 0.15);
+    color: var(--working);
+    border: 1px solid rgba(194, 162, 94, 0.3);
+  }
+
+  .stage-arrow {
+    color: var(--line);
+    font-size: 11px;
+    padding: 0 2px;
+    user-select: none;
+  }
+
+  /* ── Agent grid ── */
+  .agents-section {
+    margin-bottom: 24px;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 12px;
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--idle);
+    border-radius: 6px;
+    padding: 14px 16px;
+    transition: border-color 0.15s;
+  }
+
+  .card[data-status="working"]  { border-left-color: var(--working); }
+  .card[data-status="done"]     { border-left-color: var(--done); }
+  .card[data-status="blocked"]  { border-left-color: var(--blocked); }
+  .card[data-status="idle"]     { border-left-color: var(--idle); }
+
+  .card-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+
+  .agent-name {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text);
+    font-family: var(--mono);
+    letter-spacing: 0.01em;
+  }
+
+  .model-badge {
+    font-family: var(--mono);
+    font-size: 9px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    padding: 2px 6px;
+    border-radius: 3px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .model-badge.opus {
+    background: rgba(138, 169, 120, 0.12);
+    color: var(--done);
+    border: 1px solid rgba(138, 169, 120, 0.25);
+  }
+
+  .model-badge.sonnet {
+    background: rgba(109, 147, 168, 0.12);
+    color: var(--idle);
+    border: 1px solid rgba(109, 147, 168, 0.25);
+  }
+
+  .agent-role {
+    font-size: 11px;
+    color: var(--dim);
+    margin-bottom: 10px;
+  }
+
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+
+  .status-label {
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  .status-label.working { color: var(--working); }
+  .status-label.done    { color: var(--done); }
+  .status-label.blocked { color: var(--blocked); }
+  .status-label.idle    { color: var(--idle); }
+
+  .dot.working { background: var(--working); }
+  .dot.done    { background: var(--done); }
+  .dot.blocked { background: var(--blocked); }
+  .dot.idle    { background: var(--idle); }
+
+  .task-line {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--dim);
+    border-top: 1px solid var(--line);
+    padding-top: 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .task-line.active-task {
+    color: var(--text);
+  }
+
+  /* ── Footer ── */
+  footer {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--dim);
+    font-family: var(--mono);
+    border-top: 1px solid var(--line);
+    padding-top: 14px;
+  }
+
+  /* ── Refresh indicator ── */
+  .refresh-tick {
+    display: inline-block;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--line);
+    margin-left: 8px;
+    vertical-align: middle;
+    transition: background 0.3s;
+  }
+
+  .refresh-tick.pulse {
+    background: var(--done);
+  }
+</style>
+</head>
+<body>
+
+<script>
+// Fallback inline data — exact copy of status.json
+const FALLBACK_DATA = {
+  "project": "SentinelOS",
+  "updated": "2026-06-03",
+  "pipeline": ["spec","architect","implement","verify","test","review"],
+  "activeStage": "architect",
+  "agents": [
+    {"name":"kernel-architect","role":"Subsystem design & framekernel decomposition","model":"opus","status":"working","task":"Designing boot bring-up (sub-project #1)"},
+    {"name":"hal-specialist","role":"The tiny unsafe HAL/arch TCB","model":"opus","status":"idle","task":"—"},
+    {"name":"kernel-engineer","role":"Safe-Rust kernel implementation","model":"sonnet","status":"idle","task":"—"},
+    {"name":"verification-engineer","role":"Miri + Kani + fuzz CI gate","model":"opus","status":"idle","task":"—"},
+    {"name":"test-engineer","role":"QEMU boot/integration tests","model":"sonnet","status":"idle","task":"—"},
+    {"name":"toolchain-engineer","role":"Limine, linker, target, xtask, CI","model":"sonnet","status":"idle","task":"—"},
+    {"name":"kernel-reviewer","role":"Adversarial review / human-gate","model":"opus","status":"idle","task":"—"}
+  ]
+};
+</script>
+
+<header class="header">
+  <div class="header-left">
+    <h1>SentinelOS &middot; Build Team</h1>
+    <div class="meta" id="meta-line">project: SentinelOS &nbsp;|&nbsp; updated: —</div>
+  </div>
+  <div class="legend">
+    <div class="legend-item"><div class="dot done"></div> done / ok</div>
+    <div class="legend-item"><div class="dot working"></div> working</div>
+    <div class="legend-item"><div class="dot blocked"></div> blocked</div>
+    <div class="legend-item"><div class="dot idle"></div> idle</div>
+  </div>
+</header>
+
+<div class="pipeline-section">
+  <div class="section-label">Pipeline</div>
+  <div class="pipeline" id="pipeline"></div>
+</div>
+
+<div class="agents-section">
+  <div class="section-label">Agents</div>
+  <div class="grid" id="grid"></div>
+</div>
+
+<footer>
+  fast proto &nbsp;&middot;&nbsp; reads status.json &nbsp;&middot;&nbsp; point the agents at status.json for live updates
+  <span class="refresh-tick" id="tick"></span>
+</footer>
+
+<script>
+function renderPipeline(stages, activeStage) {
+  const el = document.getElementById('pipeline');
+  el.innerHTML = '';
+  stages.forEach((s, i) => {
+    const stage = document.createElement('span');
+    stage.className = 'stage' + (s === activeStage ? ' active' : '');
+    stage.textContent = s;
+    el.appendChild(stage);
+    if (i < stages.length - 1) {
+      const arrow = document.createElement('span');
+      arrow.className = 'stage-arrow';
+      arrow.textContent = '›';
+      el.appendChild(arrow);
+    }
+  });
+}
+
+function renderAgents(agents) {
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  agents.forEach(a => {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.dataset.status = a.status;
+
+    const isActive = a.status === 'working';
+    const statusClass = a.status;
+
+    card.innerHTML = `
+      <div class="card-header">
+        <span class="agent-name">${escHtml(a.name)}</span>
+        <span class="model-badge ${a.model.toLowerCase()}">${a.model.toUpperCase()}</span>
+      </div>
+      <div class="agent-role">${escHtml(a.role)}</div>
+      <div class="status-row">
+        <div class="dot ${statusClass}"></div>
+        <span class="status-label ${statusClass}">${escHtml(a.status)}</span>
+      </div>
+      <div class="task-line${isActive ? ' active-task' : ''}">${escHtml(a.task)}</div>
+    `;
+    grid.appendChild(card);
+  });
+}
+
+function renderMeta(project, updated) {
+  document.getElementById('meta-line').textContent =
+    `project: ${project}  |  updated: ${updated}`;
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function render(data) {
+  renderMeta(data.project, data.updated);
+  renderPipeline(data.pipeline, data.activeStage);
+  renderAgents(data.agents);
+}
+
+function pulseTick() {
+  const t = document.getElementById('tick');
+  t.classList.add('pulse');
+  setTimeout(() => t.classList.remove('pulse'), 500);
+}
+
+async function load() {
+  try {
+    const r = await fetch('status.json?_=' + Date.now());
+    if (!r.ok) throw new Error('non-ok');
+    const data = await r.json();
+    render(data);
+    pulseTick();
+  } catch (_) {
+    // Fallback to inline data (file:// or fetch error)
+    render(FALLBACK_DATA);
+  }
+}
+
+// Initial load + poll every 5s
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

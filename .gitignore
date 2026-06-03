@@ -33,3 +33,6 @@ secrets/
 /audit
 *.audit
 erase-*.sh
+
+# graphify generated output (regenerable, machine-specific)
+graphify-out/

@@ -1,0 +1,15 @@
+{
+  "project": "SentinelOS",
+  "updated": "2026-06-03",
+  "pipeline": ["spec","architect","implement","verify","test","review"],
+  "activeStage": "architect",
+  "agents": [
+    {"name":"kernel-architect","role":"Subsystem design & framekernel decomposition","model":"opus","status":"working","task":"Designing boot bring-up (sub-project #1)"},
+    {"name":"hal-specialist","role":"The tiny unsafe HAL/arch TCB","model":"opus","status":"idle","task":"—"},
+    {"name":"kernel-engineer","role":"Safe-Rust kernel implementation","model":"sonnet","status":"idle","task":"—"},
+    {"name":"verification-engineer","role":"Miri + Kani + fuzz CI gate","model":"opus","status":"idle","task":"—"},
+    {"name":"test-engineer","role":"QEMU boot/integration tests","model":"sonnet","status":"idle","task":"—"},
+    {"name":"toolchain-engineer","role":"Limine, linker, target, xtask, CI","model":"sonnet","status":"idle","task":"—"},
+    {"name":"kernel-reviewer","role":"Adversarial review / human-gate","model":"opus","status":"idle","task":"—"}
+  ]
+}
