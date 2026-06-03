@@ -32,6 +32,9 @@
 //!   [`keyboard::on_irq`], [`keyboard::poll_scancode`]): the IRQ1 handler drains
 //!   the scancode byte from port `0x60` into a lock-free ring the safe kernel
 //!   polls and decodes (no decoding lives in the TCB).
+//! - [`mm`] — memory management: the physical frame allocator, virtual page
+//!   mapping over Limine's paging, and the kernel heap behind a
+//!   `#[global_allocator]` ([`mm::init`], [`mm::LockedHeap`]).
 //!
 //! # `unsafe` discipline
 //!
@@ -58,6 +61,10 @@
 //! - [`framebuffer::Framebuffer::get`] — acquire the boot framebuffer (or `None`).
 //! - [`framebuffer::Framebuffer`] — `width`/`height`/`pitch`/`bpp`, the channel
 //!   masks, `pack_rgb`, `put_pixel`, and `fill_rect` (all safe, bounds-checked).
+//! - [`mm::init`] — bring up the frame allocator + heap; install the global
+//!   allocator (call once at boot, after `interrupts::init`).
+//! - [`mm::LockedHeap`] — the `#[global_allocator]` type the `kernel` crate
+//!   declares as a `static` (declaring a static is not `unsafe`).
 
 #![no_std]
 // `unsafe` is permitted in this crate (and only this crate), but it must always
@@ -73,6 +80,7 @@ pub mod gdt;
 pub mod idt;
 pub mod interrupts;
 pub mod keyboard;
+pub mod mm;
 pub mod pic;
 pub mod pit;
 pub mod serial;

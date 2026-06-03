@@ -14,8 +14,14 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+// The kernel can heap-allocate (`Box`, `Vec`, `String`) once `memory::init` has
+// installed the global allocator. Pulling in `alloc` here is what makes those
+// types available to the safe kernel logic.
+extern crate alloc;
+
 pub mod input;
 pub mod interrupts;
+pub mod memory;
 
 /// Kernel entry point — called by `boot::_start` after serial initialisation.
 ///
@@ -31,6 +37,11 @@ pub fn kmain() -> ! {
     // Runs with interrupts still disabled (int3 is a software exception), so it
     // is independent of the hardware-IRQ wiring set up further below.
     interrupts::self_test();
+
+    // Bring up memory management: physical frame allocator + paging + kernel heap
+    // + global allocator. After this the kernel can heap-allocate. Done before the
+    // banner/draw so the heap is ready for everything that follows.
+    memory::init_and_prove();
 
     // Bring up the hardware-interrupt foundation: remap the 8259 PIC pair to
     // vectors 32–47, register the vector-32 timer handler, program the PIT to
