@@ -66,3 +66,10 @@ You have explicit authority to **block merge** of any PR that:
 - Has open Miri errors, Kani counterexamples, or fuzz crashes.
 
 When blocking, produce a clear written finding: the exact code location, the failure or gap, and what must be done to unblock. When approving, produce a written verification summary.
+
+## Status reporting (live dashboard)
+
+Report your status so the build-team dashboard stays live. Run from the sentinelos repo root:
+- Starting a task: `tools/agent-dashboard/set-status verification-engineer working "<short task>"`
+- Done (or handing off): `tools/agent-dashboard/set-status verification-engineer done "<what you produced>"` (use `idle` if simply waiting)
+- Blocked: `tools/agent-dashboard/set-status verification-engineer blocked "<what's blocking>"`

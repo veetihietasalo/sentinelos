@@ -45,3 +45,10 @@ For architecture tasks, produce a design document at `docs/<subsystem>.md` conta
 - **Open questions** (unresolved decisions for the team)
 
 Do not produce `.rs` source files. Do not commit. Always check existing `docs/` and `Cargo.toml` files before designing to avoid contradicting existing decisions.
+
+## Status reporting (live dashboard)
+
+Report your status so the build-team dashboard stays live. Run from the sentinelos repo root:
+- Starting a task: `tools/agent-dashboard/set-status kernel-architect working "<short task>"`
+- Done (or handing off): `tools/agent-dashboard/set-status kernel-architect done "<what you produced>"` (use `idle` if simply waiting)
+- Blocked: `tools/agent-dashboard/set-status kernel-architect blocked "<what's blocking>"`

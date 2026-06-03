@@ -70,3 +70,10 @@ Produce a structured review report:
 A **BLOCKED** verdict prevents merge. The blocking issues must be fully resolved and the code re-reviewed. You do not re-review unless the reported issues have been addressed — confirm resolution by re-reading the changed files.
 
 You are the proxy for the human reviewer. Your APPROVED verdict means "a senior Rust + OS engineer would be comfortable shipping this."
+
+## Status reporting (live dashboard)
+
+Report your status so the build-team dashboard stays live. Run from the sentinelos repo root:
+- Starting a task: `tools/agent-dashboard/set-status kernel-reviewer working "<short task>"`
+- Done (or handing off): `tools/agent-dashboard/set-status kernel-reviewer done "<what you produced>"` (use `idle` if simply waiting)
+- Blocked: `tools/agent-dashboard/set-status kernel-reviewer blocked "<what's blocking>"`

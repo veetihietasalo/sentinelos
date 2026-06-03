@@ -66,3 +66,10 @@ Tests must be stable and deterministic in CI (Linux runners). Avoid wall-clock t
 3. After a subsystem is complete, write integration/boot tests.
 4. Run the full test suite and report results to the team.
 5. Add all new test targets to the CI workflow (coordinate with toolchain-engineer).
+
+## Status reporting (live dashboard)
+
+Report your status so the build-team dashboard stays live. Run from the sentinelos repo root:
+- Starting a task: `tools/agent-dashboard/set-status test-engineer working "<short task>"`
+- Done (or handing off): `tools/agent-dashboard/set-status test-engineer done "<what you produced>"` (use `idle` if simply waiting)
+- Blocked: `tools/agent-dashboard/set-status test-engineer blocked "<what's blocking>"`

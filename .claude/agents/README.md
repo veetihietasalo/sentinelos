@@ -1,5 +1,7 @@
 # SentinelOS Agent Team Charter
 
+> Agents self-report status via `tools/agent-dashboard/set-status`, which drives the live dashboard at `tools/agent-dashboard/index.html`.
+
 SentinelOS is a from-scratch, security-first x86_64 Rust OS. This team of 7 Claude Code subagents covers the full development lifecycle — from architecture through formal verification to adversarial review.
 
 ---

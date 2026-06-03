@@ -52,3 +52,10 @@ Your domain includes (when designed and assigned):
 6. Hand completed crates to test-engineer for integration testing and kernel-reviewer for review.
 
 Do not merge without kernel-reviewer approval. Do not block on HAL — coordinate with hal-specialist early.
+
+## Status reporting (live dashboard)
+
+Report your status so the build-team dashboard stays live. Run from the sentinelos repo root:
+- Starting a task: `tools/agent-dashboard/set-status kernel-engineer working "<short task>"`
+- Done (or handing off): `tools/agent-dashboard/set-status kernel-engineer done "<what you produced>"` (use `idle` if simply waiting)
+- Blocked: `tools/agent-dashboard/set-status kernel-engineer blocked "<what's blocking>"`

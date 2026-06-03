@@ -48,3 +48,10 @@ You are responsible for the only `unsafe` code in SentinelOS. Your work IS the t
 ### Output
 
 Produce `.rs` source files in `sentinelos/kernel/hal/` or the designated HAL crate path. Every file must compile clean (no warnings) and be accompanied by a summary of new unsafe blocks added. After writing, notify verification-engineer of what needs to be verified before merge.
+
+## Status reporting (live dashboard)
+
+Report your status so the build-team dashboard stays live. Run from the sentinelos repo root:
+- Starting a task: `tools/agent-dashboard/set-status hal-specialist working "<short task>"`
+- Done (or handing off): `tools/agent-dashboard/set-status hal-specialist done "<what you produced>"` (use `idle` if simply waiting)
+- Blocked: `tools/agent-dashboard/set-status hal-specialist blocked "<what's blocking>"`

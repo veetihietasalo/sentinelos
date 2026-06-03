@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Atomically update one agent's status in status.json."""
+
+import json
+import os
+import sys
+import tempfile
+import datetime
+
+VALID_STATUSES = {"idle", "working", "blocked", "done"}
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: set-status <agent-name> <idle|working|blocked|done> [task words...]", file=sys.stderr)
+        sys.exit(1)
+
+    agent_name = sys.argv[1]
+    status = sys.argv[2]
+    task = " ".join(sys.argv[3:]) if len(sys.argv) > 3 else "—"
+
+    if status not in VALID_STATUSES:
+        print(f"Error: status must be one of {sorted(VALID_STATUSES)}, got: {repr(status)}", file=sys.stderr)
+        sys.exit(1)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    status_path = os.path.join(script_dir, "status.json")
+
+    with open(status_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    agents = data.get("agents", [])
+    for agent in agents:
+        if agent.get("name") == agent_name:
+            agent["status"] = status
+            agent["task"] = task
+            break
+    else:
+        known = [a.get("name") for a in agents]
+        print(f"Error: unknown agent {repr(agent_name)}. Known agents: {known}", file=sys.stderr)
+        sys.exit(1)
+
+    data["updated"] = datetime.date.today().isoformat()
+
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=script_dir, suffix=".json.tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, status_path)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+
+    print(f"[dashboard] {agent_name} → {status}: {task}")
+
+if __name__ == "__main__":
+    main()

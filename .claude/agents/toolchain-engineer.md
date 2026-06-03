@@ -61,3 +61,10 @@ You own everything between "the developer types `cargo xtask run`" and "the kern
 ### Output
 
 Produce files in: `xtask/src/`, `.cargo/config.toml`, `rust-toolchain.toml`, `kernel.ld`, `limine.conf`, `.github/workflows/`. Validate that `cargo xtask build` succeeds before handing off.
+
+## Status reporting (live dashboard)
+
+Report your status so the build-team dashboard stays live. Run from the sentinelos repo root:
+- Starting a task: `tools/agent-dashboard/set-status toolchain-engineer working "<short task>"`
+- Done (or handing off): `tools/agent-dashboard/set-status toolchain-engineer done "<what you produced>"` (use `idle` if simply waiting)
+- Blocked: `tools/agent-dashboard/set-status toolchain-engineer blocked "<what's blocking>"`
