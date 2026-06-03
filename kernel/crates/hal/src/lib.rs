@@ -16,6 +16,11 @@
 //! - [`serial`] — a 16550 UART driver on COM1 (`0x3F8`) with a global console
 //!   and the [`print!`] / [`println!`] macros.
 //! - [`cpu`] — safe wrappers over `hlt`, `cli`, and `sti`.
+//! - [`gdt`] — the 64-bit GDT + TSS with an IST double-fault stack (`lgdt`/`ltr`).
+//! - [`idt`] — the 256-entry IDT and the raw ISR entry stubs (`lidt`).
+//! - [`interrupts`] — the **safe** registration API ([`interrupts::init`],
+//!   [`interrupts::set_handler`], [`interrupts::InterruptFrame`]) the `kernel`
+//!   crate uses to hook exception handlers without a `hal → kernel` cycle.
 //!
 //! # `unsafe` discipline
 //!
@@ -30,6 +35,11 @@
 //! - [`serial::init`]
 //! - [`cpu::halt_loop`]
 //! - [`cpu::disable_interrupts`]
+//! - [`interrupts::init`] — load GDT+TSS+IDT (call once at boot).
+//! - [`interrupts::set_handler`] — register a `fn(&InterruptFrame)` for a vector.
+//! - [`interrupts::InterruptFrame`] — the `#[repr(C)]` fault view passed to a
+//!   handler (vector, error code, saved registers, `rip`/`cs`/`rflags`/…).
+//! - [`interrupts::Handler`] — the handler function-pointer type.
 
 #![no_std]
 // `unsafe` is permitted in this crate (and only this crate), but it must always
@@ -40,4 +50,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod cpu;
+pub mod gdt;
+pub mod idt;
+pub mod interrupts;
 pub mod serial;
