@@ -53,6 +53,18 @@ const GLASS_BORDER_ALPHA: u8 = 71; // 0.28 * 255 ≈ 71
 /// Pill fill alpha — a touch brighter so the control reads as actionable.
 const PILL_FILL_ALPHA: u8 = 46; // ~0.18
 
+/// Card drop-shadow vertical offset (token `box-shadow: 0 10px …`).
+const SHADOW_OFFSET_Y: usize = 10;
+/// Number of rounded rings used to fake the shadow blur (~34px spread).
+const SHADOW_RINGS: usize = 12;
+/// Innermost-ring shadow alpha (~0.18 black; fades outward to 0).
+const SHADOW_PEAK_ALPHA: u8 = 46; // 0.18 * 255 ≈ 46
+
+/// Inner top highlight thickness (token `inset 0 1px 0 …`, ~2px here).
+const HIGHLIGHT_THICKNESS: usize = 2;
+/// Inner top highlight alpha (~0.30 white).
+const HIGHLIGHT_ALPHA: u8 = 78; // 0.30 * 255 ≈ 78
+
 /// Compose the full Cyber Dusk boot/lock screen onto `fb`.
 ///
 /// Everything is centered to the live `fb.width()/height()`, so the layout
@@ -87,32 +99,83 @@ pub fn draw_boot_screen(fb: &Framebuffer) {
     draw_dock(fb, w, h);
 }
 
-/// A soft pink glow radiating from the top-right corner.
+/// Peak alpha of the top-right pink corner glow (~0.30 of `GLOW_PINK`).
+const GLOW_PEAK_ALPHA: u32 = 78; // 0.30 * 255 ≈ 78
+/// Pink used for the corner bloom — the mockup's `rgba(255,120,220,…)`.
+const GLOW_PINK: Rgb = Rgb::new(255, 120, 220);
+
+/// A soft pink bloom in the top-right, matching the mockup's
+/// `radial-gradient(80% 50% at 70% 8%, rgba(255,120,220,.25), transparent 60%)`.
+///
+/// The glow is an axis-aligned *elliptical* radial: centred at ~70 % width /
+/// ~8 % height, with radii ~80 % of width by ~50 % of height. We measure the
+/// normalised elliptical distance `d` from the centre, ramp the alpha from the
+/// peak at the centre down to 0 by `d == 0.6` (the `transparent 60%` stop), and
+/// composite the pink over the recomputed gradient backdrop. A smoothstep keeps
+/// the falloff soft (no banding, no hard edge).
 fn draw_corner_glow(fb: &Framebuffer, gradient: &Gradient, w: usize, h: usize) {
-    // Glow region: a box in the top-right quadrant. Within it, lift the backdrop
-    // toward pink with an alpha that falls off with distance from the corner.
-    let span = (w.min(h) * 2) / 3;
-    if span == 0 {
-        return;
-    }
-    let max_d2 = (span * span) as u64;
-    let corner_x = w.saturating_sub(1);
-    for py in 0..span.min(h) {
-        for px in w.saturating_sub(span)..w {
-            let dx = corner_x - px;
-            let dy = py;
-            let d2 = (dx * dx + dy * dy) as u64;
-            if d2 >= max_d2 {
+    // Ellipse centre and radii, in pixels.
+    let cx = (w * 70 / 100) as i64;
+    let cy = (h * 8 / 100) as i64;
+    let rx = ((w * 80 / 100).max(1)) as i64;
+    let ry = ((h * 50 / 100).max(1)) as i64;
+
+    // The glow vanishes at d == 0.6, so only scan the bounding box of that
+    // sub-ellipse (centre ± 0.6·r) — everything outside is fully transparent.
+    let edge_x = (rx * 6) / 10;
+    let edge_y = (ry * 6) / 10;
+    let x0 = (cx - edge_x).max(0) as usize;
+    let x1 = ((cx + edge_x + 1).max(0) as usize).min(w);
+    let y0 = (cy - edge_y).max(0) as usize;
+    let y1 = ((cy + edge_y + 1).max(0) as usize).min(h);
+
+    // Work in fixed-point: d2 is the squared normalised elliptical distance
+    // scaled by DEN² so we can compare against the 0.6 cutoff without floats.
+    const DEN: i64 = 1024;
+    let cutoff2 = (6 * DEN / 10) * (6 * DEN / 10); // (0.6)² in DEN² units
+
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let dx = px as i64 - cx;
+            let dy = py as i64 - cy;
+            // (dx/rx)² + (dy/ry)², each term scaled to DEN².
+            let nx = dx * DEN / rx;
+            let ny = dy * DEN / ry;
+            let d2 = nx * nx + ny * ny;
+            if d2 >= cutoff2 {
                 continue;
             }
-            // Quadratic falloff, capped so the glow stays subtle.
-            let strength = max_d2 - d2;
-            let alpha = (strength * 60 / max_d2) as u8; // up to ~24 %
+            // Linear falloff in *distance*: t = 1 - d/0.6, with a smoothstep
+            // (t²·(3-2t)) for a soft, edge-free bloom.
+            let d = isqrt_u64(d2 as u64) as i64; // d·DEN
+            let t = DEN - (d * DEN / (6 * DEN / 10)); // 0..DEN over [0.6 → 0]
+            let t = t.clamp(0, DEN);
+            let s = (t * t / DEN) * (3 * DEN - 2 * t) / DEN; // smoothstep, 0..DEN
+            let alpha = ((s as u32) * GLOW_PEAK_ALPHA / DEN as u32) as u8;
+            if alpha == 0 {
+                continue;
+            }
             let backdrop = gradient.color_at(px, py);
-            let out = raster::blend(backdrop, ACCENT_PINK, alpha);
+            let out = raster::blend(backdrop, GLOW_PINK, alpha);
             fb.put_pixel(px, py, out.pack(fb));
         }
     }
+}
+
+/// Integer square root (Newton's method) — `no_std`, no float, for the glow's
+/// distance ramp.
+#[inline]
+fn isqrt_u64(n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = x.div_ceil(2);
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
 /// Centered date line and a large clock, placed in the upper third.
@@ -145,6 +208,23 @@ fn draw_glass_card(fb: &Framebuffer, gradient: &Gradient, w: usize, h: usize) {
     let card_x = (w.saturating_sub(card_w)) / 2;
     let card_y = (h.saturating_sub(card_h)) / 2;
     let radius = 18usize;
+    let border_w = 1usize;
+
+    // Soft drop shadow (token: `box-shadow: 0 10px 34px rgba(0,0,0,.4)`) —
+    // drawn FIRST, behind the card, as stacked low-alpha black rounded rings
+    // offset downward and grown outward to fake the blur.
+    raster::drop_shadow_rounded_rect(
+        fb,
+        gradient,
+        card_x,
+        card_y,
+        card_w,
+        card_h,
+        radius,
+        SHADOW_OFFSET_Y,
+        SHADOW_RINGS,
+        SHADOW_PEAK_ALPHA,
+    );
 
     // Glass fill (~12 % white over the gradient) + brighter ~1px border.
     raster::fill_rounded_rect_alpha(
@@ -152,6 +232,21 @@ fn draw_glass_card(fb: &Framebuffer, gradient: &Gradient, w: usize, h: usize) {
     );
     raster::stroke_rounded_rect_alpha(
         fb, gradient, card_x, card_y, card_w, card_h, radius, GLASS_WHITE, GLASS_BORDER_ALPHA,
+    );
+
+    // Inner top highlight (token: `inset 0 1px 0 rgba(255,255,255,.3)`) — a
+    // bright ~2px white span just inside the top border, between the corners.
+    raster::inner_top_highlight(
+        fb,
+        gradient,
+        card_x,
+        card_y,
+        card_w,
+        radius,
+        border_w,
+        HIGHLIGHT_THICKNESS,
+        GLASS_WHITE,
+        HIGHLIGHT_ALPHA,
     );
 
     let cx = card_x + card_w / 2;

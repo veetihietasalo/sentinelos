@@ -301,6 +301,128 @@ pub fn stroke_rounded_rect_alpha(
     }
 }
 
+/// Draw a soft drop shadow for a rounded rectangle, composited over the
+/// gradient backdrop — an approximation of CSS `box-shadow: 0 dy blur black`.
+///
+/// With no real blur available we fake it with concentric rounded-rect rings:
+/// the card's shape is drawn `rings` times, each offset downward by `offset_y`
+/// and grown outward by an increasing inset, every ring a low-alpha black. The
+/// outer rings are larger and fainter, so the stacked result is a soft dark
+/// halo hugging the bottom and sides of the card. Each pixel is written at most
+/// once (the outermost — faintest — ring that covers it), so the alpha never
+/// compounds into a hard edge.
+///
+/// `(x, y, w, h, radius)` is the *card* geometry; the shadow is drawn behind it.
+#[allow(clippy::too_many_arguments)]
+pub fn drop_shadow_rounded_rect(
+    fb: &Framebuffer,
+    gradient: &Gradient,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    radius: usize,
+    offset_y: usize,
+    rings: usize,
+    peak_alpha: u8,
+) {
+    if rings == 0 || w == 0 || h == 0 {
+        return;
+    }
+    let black = Rgb::new(0, 0, 0);
+    // Outermost ring grows the rect by `rings` px on each side; the bounding box
+    // we scan is that outermost shape, shifted down by `offset_y`.
+    let grow = rings;
+    let sx = x.saturating_sub(grow);
+    let sy = y.saturating_sub(grow) + offset_y;
+    let sw = w + grow * 2;
+    let sh = h + grow * 2;
+    for py in sy..sy.saturating_add(sh) {
+        for px in sx..sx.saturating_add(sw) {
+            // Find the outermost ring index `k` (0 = tightest, rings-1 =
+            // widest) whose shape still contains this pixel. The widest
+            // containing ring is the faintest, giving a smooth outward fade.
+            let mut covered: Option<usize> = None;
+            for k in (0..rings).rev() {
+                let g = k + 1;
+                let rx = x.saturating_sub(g);
+                let ry = y.saturating_sub(g) + offset_y;
+                let rw = w + g * 2;
+                let rh = h + g * 2;
+                let rr = radius + g;
+                if in_rounded_rect(px, py, rx, ry, rw, rh, rr) {
+                    covered = Some(k);
+                    break;
+                }
+            }
+            if let Some(k) = covered {
+                // Alpha fades from `peak_alpha` (innermost) toward 0 (outermost).
+                let alpha =
+                    (peak_alpha as usize * (rings - k) / rings) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                let backdrop = gradient.color_at(px, py);
+                let out = blend(backdrop, black, alpha);
+                fb.put_pixel(px, py, out.pack(fb));
+            }
+        }
+    }
+}
+
+/// Draw a bright inner top highlight line inside a rounded rect — the
+/// `inset 0 1px 0 rgba(255,255,255,.3)` token. A `thickness`-px white span runs
+/// across the top, inset by `inset` px (the border width) and stopping short of
+/// the rounded corners, alpha-blended over the gradient. The ends taper to zero
+/// alpha over a few pixels so the highlight blends cleanly into the corners.
+#[allow(clippy::too_many_arguments)]
+pub fn inner_top_highlight(
+    fb: &Framebuffer,
+    gradient: &Gradient,
+    x: usize,
+    y: usize,
+    w: usize,
+    radius: usize,
+    inset: usize,
+    thickness: usize,
+    color: Rgb,
+    alpha: u8,
+) {
+    if w == 0 || thickness == 0 {
+        return;
+    }
+    // The straight span lives between the two top corner radii, pulled in by the
+    // border inset.
+    let r = radius.min(w / 2);
+    let span_x0 = x + r;
+    let span_x1 = (x + w).saturating_sub(r);
+    if span_x1 <= span_x0 {
+        return;
+    }
+    let span_w = span_x1 - span_x0;
+    let taper = (span_w / 8).clamp(1, 16); // soft fade at each end
+    let top = y + inset;
+    for py in top..top.saturating_add(thickness) {
+        for px in span_x0..span_x1 {
+            // Taper the alpha near both ends.
+            let from_start = px - span_x0;
+            let from_end = span_x1 - 1 - px;
+            let edge = from_start.min(from_end);
+            let a = if edge < taper {
+                (alpha as usize * edge / taper) as u8
+            } else {
+                alpha
+            };
+            if a == 0 {
+                continue;
+            }
+            let backdrop = gradient.color_at(px, py);
+            let out = blend(backdrop, color, a);
+            fb.put_pixel(px, py, out.pack(fb));
+        }
+    }
+}
+
 /// A glossy gradient rounded-square tile (a dock/app icon).
 ///
 /// Fills the rounded square with a vertical `top → bottom` gradient and adds a
