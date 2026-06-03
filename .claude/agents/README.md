@@ -2,11 +2,13 @@
 
 > Agents self-report status via `tools/agent-dashboard/set-status`, which drives the live dashboard at `tools/agent-dashboard/index.html`.
 
-SentinelOS is a from-scratch, security-first x86_64 Rust OS. This team of 7 Claude Code subagents covers the full development lifecycle — from architecture through formal verification to adversarial review.
+SentinelOS is a from-scratch, security-first x86_64 Rust OS. This team of 14 Claude Code subagents covers the full development lifecycle — from architecture through formal verification to adversarial review.
 
 ---
 
 ## The Team
+
+### Original 7 — Core Build Pipeline
 
 | Agent | Model | Role |
 |-------|-------|------|
@@ -18,6 +20,20 @@ SentinelOS is a from-scratch, security-first x86_64 Rust OS. This team of 7 Clau
 | **toolchain-engineer** | Sonnet | Owns Limine setup, linker scripts, `x86_64-unknown-none` target config, xtask/cargo runner, QEMU invocation, and CI workflows |
 | **kernel-reviewer** | Opus | Adversarial read-only reviewer; final merge gate for soundness, UB, idiomatic Rust, and framekernel discipline; approves or blocks |
 
+### Extended 7 — Subsystem Specialists
+
+These agents extend the original team with focused ownership of each major kernel subsystem and the documentation layer.
+
+| Agent | Model | Role |
+|-------|-------|------|
+| **memory-engineer** | Opus | Physical frame allocator, paging/VMM policy, kernel heap/global allocator — all safe Rust over HAL's page-table primitives (sub-projects #2b–#2d) |
+| **driver-engineer** | Sonnet | Device drivers (timer PIT/APIC, keyboard, storage, framebuffer, network) as safe Rust over HAL's MMIO/port APIs; one crate per driver |
+| **scheduler-engineer** | Opus | Run queue, context-switch policy, synchronization primitives, eventual SMP; the unsafe context-switch core is HAL's |
+| **security-engineer** | Opus | Sentinel security subsystem — `sentinel-core` kernel integration, capability model, sandboxing/isolation, privacy architecture |
+| **userland-engineer** | Sonnet | Syscall ABI and userland boundary: safe dispatch, process/ELF loading, user/kernel memory copy; the unsafe entry trampoline is HAL's |
+| **ui-engineer** | Sonnet | Display/compositor/GUI in the matte security-ops aesthetic; framebuffer rendering, compositor, widgets — all safe Rust over driver's framebuffer API |
+| **docs-writer** | Sonnet | Keeps `docs/`, specs, ADRs, and dev-setup docs coherent and current; read-mostly, writes docs NOT kernel code |
+
 ---
 
 ## Workflow
@@ -28,13 +44,19 @@ Requirement / spec
        v
 kernel-architect  ──→  docs/<subsystem>.md + implementation plan
        |
-       ├──→  hal-specialist    (unsafe HAL code, safe API surface)
-       |
-       └──→  kernel-engineer   (safe Rust kernel crates)
+       ├──→  hal-specialist        (unsafe HAL code, safe API surface)
+       │
+       ├──→  memory-engineer       (frame allocator, VMM, heap)
+       ├──→  driver-engineer       (device drivers over HAL APIs)
+       ├──→  scheduler-engineer    (run queue, sync primitives)
+       ├──→  security-engineer     (sentinel-core, capabilities, sandbox)
+       ├──→  userland-engineer     (syscall dispatch, ELF loader, process lifecycle)
+       └──→  ui-engineer           (compositor, widgets, display)
                     |
                     v
        verification-engineer   (Miri + Kani + fuzz gate on unsafe code)
        test-engineer           (unit tests + QEMU integration tests)
+       docs-writer             (design docs, ADRs, API refs, dev-setup)
                     |
                     v
        kernel-reviewer         (adversarial review → APPROVED / BLOCKED)
@@ -54,11 +76,18 @@ Verification and testing run in parallel after implementation. kernel-reviewer i
 - `hal-specialist` — every `unsafe` block is a potential CVE; Opus's deeper reasoning catches subtle aliasing and provenance issues.
 - `verification-engineer` — writing sound Kani harnesses and interpreting Miri output requires careful formal reasoning.
 - `kernel-reviewer` — adversarial review benefits from Opus's ability to construct failure scenarios.
+- `memory-engineer` — memory-management bugs (use-after-free, double-free, fragmentation) are subtle and security-critical; judgment over speed.
+- `scheduler-engineer` — concurrency correctness (deadlocks, races, priority inversion) requires careful invariant reasoning.
+- `security-engineer` — security architecture is the hardest-to-reverse category of decisions; Opus's depth is essential.
 
 **Sonnet** handles work that is well-defined, volume-heavy, and benefits from speed:
 - `kernel-engineer` — implementing safe Rust from a clear design doc is execution-heavy, not judgment-heavy.
 - `test-engineer` — test writing is structured and iterative; speed matters for CI feedback cycles.
 - `toolchain-engineer` — build tooling is largely mechanical; correctness is verified by "does it build and run."
+- `driver-engineer` — driver code follows hardware specs closely; volume and iteration speed matter.
+- `userland-engineer` — syscall dispatch and ELF loading are well-specified; fast, correct execution over deep deliberation.
+- `ui-engineer` — widget and compositor work is structured and iterative; visual feedback confirms correctness quickly.
+- `docs-writer` — documentation is volume work with a clear quality bar; speed and clarity over deep deliberation.
 
 ---
 
@@ -69,3 +98,5 @@ Verification and testing run in parallel after implementation. kernel-reviewer i
 3. **Design before code.** kernel-architect produces a `docs/<subsystem>.md` before any implementation begins.
 4. **Stable toolchain only.** No `#![feature(...)]` without a documented, justified exception reviewed by kernel-architect and toolchain-engineer.
 5. **kernel-reviewer is read-only.** The reviewer reports findings; authors fix them. This separation prevents reviewers from introducing new bugs while "helping."
+6. **Security escalation.** Any decision affecting the TCB boundary, capability model, or sandbox isolation must be reviewed by kernel-reviewer before implementation — security-engineer initiates this escalation.
+7. **Docs stay current.** docs-writer updates `docs/<subsystem>.md` whenever an agent ships or changes a subsystem's public API.

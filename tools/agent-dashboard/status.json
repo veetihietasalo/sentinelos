@@ -15,50 +15,99 @@
       "name": "kernel-architect",
       "role": "Subsystem design & framekernel decomposition",
       "model": "opus",
-      "status": "working",
-      "task": "Writing boot bring-up spec (sub-project #1)"
+      "status": "done",
+      "task": "Sub-project #2 decomposed; #2a interrupts spec written"
     },
     {
       "name": "hal-specialist",
       "role": "The tiny unsafe HAL/arch TCB",
       "model": "opus",
-      "status": "idle",
-      "task": "\u2014"
+      "status": "done",
+      "task": "GDT/TSS/IST + IDT + ISR stubs built (stable); registration API exposed"
     },
     {
       "name": "kernel-engineer",
       "role": "Safe-Rust kernel implementation",
       "model": "sonnet",
-      "status": "idle",
-      "task": "\u2014"
+      "status": "done",
+      "task": "Exception handlers (#BP/#PF/#DF/#GP) registered; init wired into kmain"
     },
     {
       "name": "verification-engineer",
       "role": "Miri + Kani + fuzz CI gate",
       "model": "opus",
       "status": "idle",
-      "task": "\u2014"
+      "task": "—"
     },
     {
       "name": "test-engineer",
       "role": "QEMU boot/integration tests",
       "model": "sonnet",
-      "status": "idle",
-      "task": "\u2014"
+      "status": "done",
+      "task": "Deterministic boot test; full banner (fixed a real triple-fault)"
     },
     {
       "name": "toolchain-engineer",
       "role": "Limine, linker, target, xtask, CI",
       "model": "sonnet",
-      "status": "idle",
-      "task": "\u2014"
+      "status": "done",
+      "task": "kernel CI workflow (build+clippy+fmt+boot-test)"
     },
     {
       "name": "kernel-reviewer",
       "role": "Adversarial review / human-gate",
       "model": "opus",
+      "status": "done",
+      "task": "Sub-project #1: APPROVED"
+    },
+    {
+      "name": "memory-engineer",
+      "role": "Frame allocator, VMM policy, kernel heap",
+      "model": "opus",
       "status": "idle",
-      "task": "\u2014"
+      "task": "—"
+    },
+    {
+      "name": "driver-engineer",
+      "role": "Device drivers over HAL MMIO/port APIs",
+      "model": "sonnet",
+      "status": "idle",
+      "task": "—"
+    },
+    {
+      "name": "scheduler-engineer",
+      "role": "Run queue, sync primitives, SMP",
+      "model": "opus",
+      "status": "idle",
+      "task": "—"
+    },
+    {
+      "name": "security-engineer",
+      "role": "sentinel-core integration, capabilities, sandbox",
+      "model": "opus",
+      "status": "idle",
+      "task": "—"
+    },
+    {
+      "name": "userland-engineer",
+      "role": "Syscall ABI, ELF loader, process lifecycle",
+      "model": "sonnet",
+      "status": "idle",
+      "task": "—"
+    },
+    {
+      "name": "ui-engineer",
+      "role": "Compositor, widgets, display — security-ops aesthetic",
+      "model": "sonnet",
+      "status": "idle",
+      "task": "—"
+    },
+    {
+      "name": "docs-writer",
+      "role": "Design docs, ADRs, API refs, dev-setup",
+      "model": "sonnet",
+      "status": "idle",
+      "task": "—"
     }
   ]
 }
