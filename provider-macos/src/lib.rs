@@ -47,6 +47,7 @@ pub fn parse_kexts(output: &str) -> VectorReport {
 /// Parse `lsof -nP -iTCP -sTCP:LISTEN`. Flags remote-access ports and non-loopback listeners.
 pub fn parse_listeners(output: &str) -> VectorReport {
     let mut findings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for line in output.lines().skip(1) {
         if !line.contains("(LISTEN)") {
             continue;
@@ -55,7 +56,7 @@ pub fn parse_listeners(output: &str) -> VectorReport {
         let command = line.split_whitespace().next().unwrap_or("?");
         let sensitive = SENSITIVE_PORTS.iter().any(|p| name.contains(p));
         let non_loopback = !name.starts_with("127.0.0.1") && !name.starts_with("[::1]");
-        if sensitive || non_loopback {
+        if (sensitive || non_loopback) && seen.insert(format!("{command} {name}")) {
             findings.push(Finding {
                 id: format!("{V_NET}:{name}"),
                 vector_id: V_NET.to_string(),
@@ -99,26 +100,53 @@ pub fn assess_launchd(entries: &[(String, String)]) -> VectorReport {
     VectorReport { vector_id: V_LAUNCHD.to_string(), status, findings }
 }
 
-/// Parse `sqlite3` rows of "service|client" (allowed grants).
-/// Accessibility / ScreenCapture / ListenEvent are powerful → Review; others → Info.
+/// Strip the `kTCCService` prefix for readable titles.
+fn short_service(s: &str) -> &str {
+    s.strip_prefix("kTCCService").unwrap_or(s)
+}
+
+/// Map a TCC service to a severity, or `None` to drop it as security-irrelevant
+/// noise (e.g. iMessage/continuity `Liverpool`, AddressBook). The powerful grants
+/// — control, screen capture, keystroke monitoring, full-disk — are Review.
+fn tcc_severity(service: &str) -> Option<Severity> {
+    if service.contains("Accessibility")
+        || service.contains("ScreenCapture")
+        || service.contains("ListenEvent")
+        || service.contains("SystemPolicyAllFiles")
+        || service.contains("PostEvent")
+    {
+        Some(Severity::Review)
+    } else if service.contains("Microphone") || service.contains("Camera") {
+        Some(Severity::Info)
+    } else {
+        None
+    }
+}
+
+/// Parse `sqlite3` rows of "service|client" (allowed grants), keeping only the
+/// security-relevant ones and de-duping (the system + user databases overlap).
 pub fn parse_tcc(rows: &str) -> VectorReport {
     let mut findings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for line in rows.lines() {
         let mut parts = line.splitn(2, '|');
         let (service, client) = match (parts.next(), parts.next()) {
             (Some(s), Some(c)) if !s.is_empty() => (s, c),
             _ => continue,
         };
-        let powerful = service.contains("Accessibility")
-            || service.contains("ScreenCapture")
-            || service.contains("ListenEvent");
-        findings.push(Finding {
-            id: format!("{V_TCC}:{service}:{client}"),
-            vector_id: V_TCC.to_string(),
-            severity: if powerful { Severity::Review } else { Severity::Info },
-            title: format!("{service} granted"),
-            detail: client.to_string(),
-        });
+        if let Some(severity) = tcc_severity(service) {
+            let id = format!("{V_TCC}:{service}:{client}");
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            findings.push(Finding {
+                id,
+                vector_id: V_TCC.to_string(),
+                severity,
+                title: format!("{} granted", short_service(service)),
+                detail: client.to_string(),
+            });
+        }
     }
     let status = if findings.iter().any(|f| f.severity == Severity::Review) {
         VectorStatus::Review
@@ -208,16 +236,30 @@ impl SecurityProvider for MacosProvider {
                 assess_launchd(&entries)
             }
             V_TCC => {
+                // Accessibility / ScreenCapture / FDA live in the SYSTEM database;
+                // Microphone / Camera in the USER one. Read both and merge.
                 let home = std::env::var("HOME").unwrap_or_default();
-                let db = format!("{home}/Library/Application Support/com.apple.TCC/TCC.db");
-                let uri = format!("file:{db}?mode=ro&immutable=1");
-                let sql = "SELECT service||'|'||client FROM access WHERE auth_value=2;";
-                match run("sqlite3", &[&uri, sql]) {
-                    Ok(o) => parse_tcc(&o),
-                    Err(_) => VectorReport::unavailable(
+                let dbs = [
+                    "/Library/Application Support/com.apple.TCC/TCC.db".to_string(),
+                    format!("{home}/Library/Application Support/com.apple.TCC/TCC.db"),
+                ];
+                let sql = "SELECT service||'|'||client FROM access WHERE auth_value IN (2,3);";
+                let mut rows = String::new();
+                let mut any_ok = false;
+                for db in &dbs {
+                    let uri = format!("file:{db}?mode=ro&immutable=1");
+                    if let Ok(o) = run("sqlite3", &[&uri, sql]) {
+                        any_ok = true;
+                        rows.push_str(&o);
+                    }
+                }
+                if any_ok {
+                    parse_tcc(&rows)
+                } else {
+                    VectorReport::unavailable(
                         V_TCC,
-                        "TCC database unreadable — grant Full Disk Access to Sentinel in System Settings → Privacy & Security.",
-                    ),
+                        "TCC databases unreadable — grant Full Disk Access to Sentinel in System Settings → Privacy & Security.",
+                    )
                 }
             }
             other => VectorReport::unavailable(other, "unknown vector"),
@@ -286,5 +328,32 @@ mod tests {
     #[test]
     fn empty_tcc_rows_are_clear() {
         assert_eq!(parse_tcc("").status, VectorStatus::Clear);
+    }
+
+    #[test]
+    fn apple_internal_tcc_grants_are_dropped() {
+        let rows = "kTCCServiceLiverpool|com.apple.imagent\nkTCCServiceAddressBook|com.example.app\n";
+        let r = parse_tcc(rows);
+        assert_eq!(r.status, VectorStatus::Clear);
+        assert!(r.findings.is_empty(), "noise should be dropped: {:?}", r.findings);
+    }
+
+    #[test]
+    fn full_disk_access_grant_is_review() {
+        let r = parse_tcc("kTCCServiceSystemPolicyAllFiles|com.example.tool\n");
+        assert_eq!(r.status, VectorStatus::Review);
+        assert_eq!(r.findings.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_tcc_grants_dedupe() {
+        let rows = "kTCCServiceAccessibility|com.example.app\nkTCCServiceAccessibility|com.example.app\n";
+        assert_eq!(parse_tcc(rows).findings.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_listeners_dedupe() {
+        let out = "H\nrapportd 1 u 1u IPv4 0x 0t0 TCP *:61714 (LISTEN)\nrapportd 1 u 1u IPv6 0x 0t0 TCP *:61714 (LISTEN)\n";
+        assert_eq!(parse_listeners(out).findings.len(), 1);
     }
 }
