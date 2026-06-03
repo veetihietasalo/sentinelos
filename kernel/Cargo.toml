@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/hal", "crates/kernel", "crates/boot"]
+members = ["crates/hal", "crates/kernel", "crates/boot", "crates/ui"]
 # xtask is intentionally NOT a member of this workspace.
 # It lives in kernel/xtask/ as its own standalone workspace so it builds for the
 # HOST triple (aarch64-apple-darwin / x86_64-…) rather than inheriting the

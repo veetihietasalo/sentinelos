@@ -40,5 +40,14 @@ pub fn kmain() -> ! {
     hal::println!("└─────────────────────────────────────┘");
     hal::println!("[sentinelos] boot-bringup-ok; entering idle");
 
+    // First *real* pixels: paint the "Cyber Dusk" boot screen onto the Limine
+    // framebuffer. This runs AFTER the serial banner + end-marker above, so the
+    // boot test sees `boot-bringup-ok` immediately and is never delayed by the
+    // (slow, per-pixel) software rendering. If no framebuffer was provided, we
+    // simply skip it and stay headless.
+    if let Some(fb) = hal::framebuffer::get() {
+        ui::draw_boot_screen(&fb);
+    }
+
     hal::cpu::halt_loop()
 }

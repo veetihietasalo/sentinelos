@@ -16,6 +16,8 @@
 //! - [`serial`] — a 16550 UART driver on COM1 (`0x3F8`) with a global console
 //!   and the [`print!`] / [`println!`] macros.
 //! - [`cpu`] — safe wrappers over `hlt`, `cli`, and `sti`.
+//! - [`framebuffer`] — the Limine linear framebuffer wrapped as a safe,
+//!   bounds-checked drawing surface ([`framebuffer::Framebuffer`]).
 //! - [`gdt`] — the 64-bit GDT + TSS with an IST double-fault stack (`lgdt`/`ltr`).
 //! - [`idt`] — the 256-entry IDT and the raw ISR entry stubs (`lidt`).
 //! - [`interrupts`] — the **safe** registration API ([`interrupts::init`],
@@ -40,6 +42,9 @@
 //! - [`interrupts::InterruptFrame`] — the `#[repr(C)]` fault view passed to a
 //!   handler (vector, error code, saved registers, `rip`/`cs`/`rflags`/…).
 //! - [`interrupts::Handler`] — the handler function-pointer type.
+//! - [`framebuffer::Framebuffer::get`] — acquire the boot framebuffer (or `None`).
+//! - [`framebuffer::Framebuffer`] — `width`/`height`/`pitch`/`bpp`, the channel
+//!   masks, `pack_rgb`, `put_pixel`, and `fill_rect` (all safe, bounds-checked).
 
 #![no_std]
 // `unsafe` is permitted in this crate (and only this crate), but it must always
@@ -50,6 +55,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod cpu;
+pub mod framebuffer;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;

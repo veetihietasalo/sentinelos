@@ -8,7 +8,8 @@ sound, and its formal-verification status.
 
 - **Owner:** hal-specialist
 - **Scope:** sub-project #1 (boot bring-up) — serial console + CPU primitives;
-  sub-project #2a (interrupts) — GDT/TSS/IST, IDT, and the raw ISR stubs
+  sub-project #2a (interrupts) — GDT/TSS/IST, IDT, and the raw ISR stubs;
+  sub-project #5 (UI, first slice) — the Limine framebuffer surface (`hal::framebuffer`)
 - **Crate lints:** `#![deny(unsafe_op_in_unsafe_fn)]`,
   `#![warn(clippy::undocumented_unsafe_blocks)]` — every `unsafe` block is
   forced to carry a `// SAFETY:` comment.
@@ -109,6 +110,31 @@ cycle. It contains exactly **one** `unsafe` op:
 > `set_handler` itself uses only a `fn → *mut ()` cast (safe) and an atomic
 > store; `init()` just calls `gdt::init()` then `idt::init()`. No other `unsafe`.
 
+## 2d. `hal::framebuffer` — Limine linear framebuffer surface (sub-project #5)
+
+Owns the `#[used] static FRAMEBUFFER_REQUEST: limine::request::FramebufferRequest`
+so the bootloader provides a linear RGB framebuffer, and wraps the first
+framebuffer's geometry + channel masks in a safe `Framebuffer` handle. The public
+surface — `get`, `width`/`height`/`pitch`/`bpp`/`bytes_per_pixel`, the
+`red_mask`/`green_mask`/`blue_mask` accessors, `pack_rgb`, `put_pixel`, and
+`fill_rect` — is **entirely safe** and **bounds-checked** (out-of-range
+coordinates are no-ops; `fill_rect` clips to the visible surface). The packed
+pixel format is derived from the firmware-reported per-channel shift+size, so
+`pack_rgb` is correct for any layout (not just `0x00RRGGBB`). All `unsafe` is
+confined to the two ops below.
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| F1 | `framebuffer.rs` · `Framebuffer::get()` | deref the Limine framebuffer **response** (`get_response()` → `framebuffers().next()` → read `addr`/`width`/`height`/`pitch`/`bpp`/masks) | Only way to learn the bootloader-mapped framebuffer base + geometry | `get_response()` yields `Some(&FramebufferResponse)` only after Limine atomically populated our `#[used]` request before `_start`; the response/framebuffer pointers it walks were filled by the bootloader and are valid + initialised. We never mutate the request, the shared borrow is dropped before returning (only plain scalars are copied out), and a null base is rejected → `None`. | Reasoned + QEMU (Miri/Kani **pending**) |
+| F2 | `framebuffer.rs` · `Framebuffer::write_pixel_at()` (called by `put_pixel`/`fill_rect`) | `ptr::write_volatile` byte stores to the framebuffer MMIO at `base + offset` | Plot a pixel; volatile so MMIO stores are never elided/coalesced | `unsafe fn` whose `# Safety` requires `offset + bytes_per_pixel <= height*pitch`; both callers reach it only via bounds-checked `byte_offset`/clipped `fill_rect`, so every byte write lands inside the mapped `height*pitch` region (`pitch >= width*bytes_per_pixel`). `base` is non-null (checked in `get`); `u8` writes are alignment-1; single-core boot path ⇒ unaliased. Byte-by-byte handles 16/24/32-bpp without an over-wide store. | Reasoned + QEMU (Miri/Kani **pending**) |
+
+> `Framebuffer` carries `unsafe impl Send + Sync`: the base is an MMIO pointer
+> valid for the program's life and the handle exposes no interior mutability; the
+> geometry/mask fields are immutable. Concurrent **writes** are the caller's
+> responsibility (documented on the drawing methods) — single-core at bring-up.
+> `pack_rgb`, the dimension/mask getters, and the bounds/clip arithmetic are pure
+> safe logic (Kani candidates).
+
 ---
 
 ## 3. Verification roadmap (sub-project #2+)
@@ -116,10 +142,10 @@ cycle. It contains exactly **one** `unsafe` op:
 | Tool | Applicable to | Status |
 |------|---------------|--------|
 | Manual review + adversarial review (kernel-reviewer) | all entries | scheduled (build sequence step 6) |
-| QEMU boot evidence | S1–S5, C3–C4 (serial output + clean halt) | via `cargo xtask test` (test-engineer) |
+| QEMU boot evidence | S1–S5, C3–C4 (serial output + clean halt); F1–F2 (framebuffer plotted in QEMU once the boot screen renders) | via `cargo xtask test` (test-engineer) |
 | QEMU **fault tests** (the #2a evidence) | G1–G5, I1–I5, X1 — `int3` → `EXCEPTION: BREAKPOINT`, deliberate #PF → `EXCEPTION: PAGE FAULT` + no reset loop, forced #DF on the IST stack → `EXCEPTION: DOUBLE FAULT` | via `cargo xtask test-faults` (test-engineer, build sequence step 4) — **this is the primary correctness check for the ISR/asm + descriptor-table loads** |
 | Miri | pure logic helpers only (cannot model port I/O / `hlt`/`cli`/`sti` / descriptor loads / ISR stubs) | **pending** |
-| Kani (bounded model checking) | bit-level helpers (e.g. IF/LSR masks, newline translation, gate/TSS descriptor bit-packing, RFLAGS/error-code decoders) | **pending** |
+| Kani (bounded model checking) | bit-level helpers (e.g. IF/LSR masks, newline translation, gate/TSS descriptor bit-packing, RFLAGS/error-code decoders, **framebuffer `pack_rgb` channel packing + `byte_offset`/`fill_rect` bounds/clip arithmetic**) | **pending** |
 | Fuzzing | `Serial::write_bytes` newline translation over arbitrary inputs | **pending** |
 
 > **#2a note:** the GDT/TSS/IDT loads and the raw ISR stubs are not Miri- or
@@ -146,3 +172,10 @@ cycle. It contains exactly **one** `unsafe` op:
    and halts); the trampoline calls the registered handler, or `hal`'s built-in
    `default_handler` (report + `halt_loop`) when none is registered — so an
    unhandled exception still produces a serial report instead of a triple fault.
+7. `framebuffer::Framebuffer::get()` is the **only** place the Limine framebuffer
+   response is dereferenced; it returns `None` (never UB) when no framebuffer was
+   provided. All drawing through the returned handle is safe and bounds-checked
+   — an off-screen coordinate is a no-op and `fill_rect` clips — so the `ui`
+   crate (and `kernel`) can draw without writing `unsafe`. Write coordination is
+   the caller's responsibility (single-core at bring-up); the handle exposes no
+   interior mutability.

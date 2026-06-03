@@ -20,12 +20,16 @@ dependencies = [
 [[package]]
 name = "hal"
 version = "0.1.0"
+dependencies = [
+ "limine",
+]
 
 [[package]]
 name = "kernel"
 version = "0.1.0"
 dependencies = [
  "hal",
+ "ui",
 ]
 
 [[package]]
@@ -35,4 +39,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af6d2ee42712e7bd2c787365cd1dab06ef59a61becbf87bec7b32b970bd2594b"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "ui"
+version = "0.1.0"
+dependencies = [
+ "hal",
 ]
