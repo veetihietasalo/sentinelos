@@ -7,51 +7,30 @@
 //! # Usage (run from kernel/)
 //!
 //! ```sh
-//! cargo xtask build   # cross-compile kernel for x86_64-unknown-none
-//! cargo xtask run     # TODO: needs qemu-system-x86_64 + limine (see below)
-//! cargo xtask test    # TODO: needs qemu-system-x86_64 + limine (see below)
+//! cargo xtask build   # cross-compile the boot binary for x86_64-unknown-none
+//! cargo xtask run     # build ISO, launch QEMU with serial output on stdout
+//! cargo xtask test    # build ISO, run QEMU ~8s, assert banner in serial.log
 //! ```
 //!
-//! # QEMU / Limine — pending deps
+//! # Dependencies
 //!
-//! `cargo xtask run` and `cargo xtask test` are stubbed until the following
-//! tools are available on the build host.  Install them with:
-//!
-//! ```sh
-//! brew install qemu xorriso
-//! ```
-//!
-//! Then fetch a pinned Limine release (e.g. 8.x binary-only):
-//!
-//! ```sh
-//! LIMINE_VER=8.0.4
-//! curl -Lo /usr/local/bin/limine \
-//!   "https://github.com/limine-bootloader/limine/releases/download/v${LIMINE_VER}/limine-$(uname -m)-unknown-linux"
-//! chmod +x /usr/local/bin/limine
-//! ```
-//!
-//! Once both `qemu-system-x86_64` and `limine` are on `$PATH`, replace the
-//! TODO stubs in `run()` and `test_kernel()` below.
-//!
-//! # QEMU invocation (template for when deps land)
-//!
-//! ```sh
-//! qemu-system-x86_64 \
-//!   -serial stdio \
-//!   -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-//!   -display none \
-//!   -no-reboot \
-//!   -cdrom target/sentinelos.iso
-//! ```
+//! * `qemu-system-x86_64` — `brew install qemu`
+//! * `xorriso`            — `brew install xorriso`
+//! * `kernel/limine/`     — clone v11.x-binary and `make -C kernel/limine`
 
-use std::process::{Command, ExitCode};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, ExitCode},
+    time::Duration,
+};
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("build") => build(),
-        Some("run") => run(),
-        Some("test") => test_kernel(),
+        Some("build") => do_build(),
+        Some("run") => do_run(),
+        Some("test") => do_test(),
         other => {
             eprintln!(
                 "Usage: cargo xtask <build|run|test>\nUnknown subcommand: {:?}",
@@ -62,77 +41,235 @@ fn main() -> ExitCode {
     }
 }
 
-/// Cross-compile the kernel crate for `x86_64-unknown-none`.
-fn build() -> ExitCode {
-    // kernel/ workspace root is one directory up from xtask/.
-    let kernel_root = {
-        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop(); // strip xtask/
-        p
-    };
+// ── helpers ───────────────────────────────────────────────────────────────────
 
-    println!("Building kernel for x86_64-unknown-none …");
+/// Path to the `kernel/` workspace root (one level up from `xtask/`).
+fn kernel_root() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop(); // strip xtask/
+    p
+}
 
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--package",
-            "kernel",
-            "--target",
-            "x86_64-unknown-none",
-        ])
-        .current_dir(&kernel_root)
-        .status()
-        .expect("failed to spawn cargo");
+/// Resolve a path relative to the kernel root.
+fn kr(rel: &str) -> PathBuf {
+    kernel_root().join(rel)
+}
 
-    if status.success() {
-        println!("Build succeeded.");
-        ExitCode::SUCCESS
-    } else {
-        eprintln!("Build failed (exit {})", status);
-        ExitCode::FAILURE
+/// Run a command, inherit stdio, and return whether it succeeded.
+fn run_cmd(cmd: &mut Command) -> bool {
+    match cmd.status() {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("command failed with exit code: {}", s);
+            false
+        }
+        Err(e) => {
+            eprintln!("failed to spawn command: {}", e);
+            false
+        }
     }
 }
 
-/// TODO: assemble a Limine bootable ISO and launch QEMU.
-///
-/// Requires:
-///   - `qemu-system-x86_64` on $PATH  (`brew install qemu`)
-///   - `xorriso` on $PATH             (`brew install xorriso`)
-///   - `limine` on $PATH              (see module-level doc for pinned release URL)
-///
-/// Until those deps are present this subcommand exits with a clear message.
-fn run() -> ExitCode {
-    // TODO: once qemu-system-x86_64 + limine are confirmed installed:
-    //   1. Call build() to produce the kernel ELF.
-    //   2. Use xorriso + limine to assemble target/sentinelos.iso.
-    //   3. Exec:
-    //        qemu-system-x86_64 \
-    //          -serial stdio \
-    //          -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-    //          -display none \
-    //          -no-reboot \
-    //          -cdrom target/sentinelos.iso
-    eprintln!(
-        "cargo xtask run: pending deps — install qemu + xorriso (brew install qemu xorriso) \
-         and fetch a pinned limine binary.  See xtask/src/main.rs for exact instructions."
+/// Build the boot ELF for x86_64-unknown-none. Returns path to the ELF.
+fn build_kernel() -> Option<PathBuf> {
+    let root = kernel_root();
+    println!("Building kernel for x86_64-unknown-none ...");
+    let ok = run_cmd(
+        Command::new("cargo")
+            .args(["build", "--package", "boot", "--target", "x86_64-unknown-none"])
+            .current_dir(&root),
     );
-    ExitCode::FAILURE
+    if !ok {
+        return None;
+    }
+    let elf = root.join("target/x86_64-unknown-none/debug/sentinelos");
+    if elf.exists() {
+        println!("Kernel ELF: {}", elf.display());
+        Some(elf)
+    } else {
+        eprintln!("ELF not found at expected path: {}", elf.display());
+        None
+    }
 }
 
-/// TODO: run kernel under QEMU with the isa-debug-exit device for test reporting.
+/// Assemble a bootable ISO image using Limine v11 + xorriso.
 ///
-/// Same deps as `run()`.  See module-level doc.
-fn test_kernel() -> ExitCode {
-    // TODO: once qemu-system-x86_64 + limine are confirmed installed:
-    //   1. Call build() with a test feature flag.
-    //   2. Assemble ISO.
-    //   3. Exec QEMU; interpret exit-code from isa-debug-exit:
-    //        exit 33 (0x21) → tests passed  (value 0x10 << 1 | 1)
-    //        anything else  → tests failed
-    eprintln!(
-        "cargo xtask test: pending deps — install qemu + xorriso (brew install qemu xorriso) \
-         and fetch a pinned limine binary.  See xtask/src/main.rs for exact instructions."
+/// Layout of iso_root/:
+///   sentinelos.elf
+///   limine.conf
+///   limine-bios.sys
+///   limine-bios-cd.bin
+///   limine-uefi-cd.bin
+///   EFI/BOOT/BOOTX64.EFI
+fn build_iso(kernel_elf: &Path) -> Option<PathBuf> {
+    let limine_dir = kr("limine");
+    let limine_bin = limine_dir.join("limine");
+    let limine_conf = kr("limine.conf");
+    let iso_root = kr("target/iso_root");
+    let iso_path = kr("target/sentinelos.iso");
+
+    // Verify limine host tool exists.
+    if !limine_bin.exists() {
+        eprintln!(
+            "Limine host tool not found at {}. Run:\n  make -C kernel/limine",
+            limine_bin.display()
+        );
+        return None;
+    }
+
+    // Create iso_root directory tree.
+    let efi_boot = iso_root.join("EFI/BOOT");
+    fs::create_dir_all(&efi_boot).expect("create iso_root/EFI/BOOT");
+
+    // Copy kernel ELF.
+    fs::copy(kernel_elf, iso_root.join("sentinelos.elf"))
+        .expect("copy kernel ELF into iso_root");
+
+    // Copy limine config.
+    fs::copy(&limine_conf, iso_root.join("limine.conf"))
+        .expect("copy limine.conf into iso_root");
+
+    // Copy Limine BIOS artifacts.
+    for name in &["limine-bios.sys", "limine-bios-cd.bin", "limine-uefi-cd.bin"] {
+        let src = limine_dir.join(name);
+        if !src.exists() {
+            eprintln!("Missing Limine artifact: {}", src.display());
+            return None;
+        }
+        fs::copy(&src, iso_root.join(name)).expect("copy Limine artifact");
+    }
+
+    // Copy UEFI bootloader.
+    let bootx64_src = limine_dir.join("BOOTX64.EFI");
+    if !bootx64_src.exists() {
+        eprintln!("Missing BOOTX64.EFI in {}", limine_dir.display());
+        return None;
+    }
+    fs::copy(&bootx64_src, efi_boot.join("BOOTX64.EFI"))
+        .expect("copy BOOTX64.EFI");
+
+    // Build the ISO with xorriso (standard Limine El-Torito BIOS+UEFI incantation).
+    // Flags match the official Limine USAGE.md recipe exactly.
+    println!("Building ISO with xorriso ...");
+    let ok = run_cmd(Command::new("xorriso").args([
+        "-as", "mkisofs",
+        "-R", "-r", "-J",
+        "-b", "limine-bios-cd.bin",
+        "-no-emul-boot",
+        "-boot-load-size", "4",
+        "-boot-info-table",
+        "-hfsplus",
+        "-apm-block-size", "2048",
+        "--efi-boot", "limine-uefi-cd.bin",
+        "-efi-boot-part",
+        "--efi-boot-image",
+        "--protective-msdos-label",
+        iso_root.to_str().unwrap(),
+        "-o", iso_path.to_str().unwrap(),
+    ]));
+    if !ok {
+        return None;
+    }
+
+    // Install Limine BIOS boot sectors into the ISO.
+    println!("Installing Limine BIOS sectors ...");
+    let ok = run_cmd(Command::new(&limine_bin).args([
+        "bios-install",
+        iso_path.to_str().unwrap(),
+    ]));
+    if !ok {
+        return None;
+    }
+
+    println!("ISO ready: {}", iso_path.display());
+    Some(iso_path)
+}
+
+// ── subcommands ───────────────────────────────────────────────────────────────
+
+fn do_build() -> ExitCode {
+    match build_kernel() {
+        Some(_) => {
+            println!("Build succeeded.");
+            ExitCode::SUCCESS
+        }
+        None => {
+            eprintln!("Build failed.");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn do_run() -> ExitCode {
+    let Some(elf) = build_kernel() else {
+        return ExitCode::FAILURE;
+    };
+    let Some(iso) = build_iso(&elf) else {
+        return ExitCode::FAILURE;
+    };
+
+    println!("Launching QEMU (serial → stdout, Ctrl-C to quit) ...");
+    let ok = run_cmd(
+        Command::new("qemu-system-x86_64")
+            .args([
+                "-M", "q35",
+                "-m", "256M",
+                "-cdrom", iso.to_str().unwrap(),
+                "-serial", "stdio",
+                "-display", "none",
+                "-no-reboot",
+            ]),
     );
-    ExitCode::FAILURE
+
+    if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+fn do_test() -> ExitCode {
+    let Some(elf) = build_kernel() else {
+        return ExitCode::FAILURE;
+    };
+    let Some(iso) = build_iso(&elf) else {
+        return ExitCode::FAILURE;
+    };
+
+    let serial_log = kr("target/serial.log");
+
+    // Remove stale log if present.
+    let _ = fs::remove_file(&serial_log);
+
+    println!("Running QEMU for serial capture (8 s) ...");
+
+    // Launch QEMU in the background; write serial to file.
+    // macOS has no `timeout`, so we background QEMU manually, sleep, kill it.
+    let mut child = Command::new("qemu-system-x86_64")
+        .args([
+            "-M", "q35",
+            "-m", "256M",
+            "-cdrom", iso.to_str().unwrap(),
+            "-serial", &format!("file:{}", serial_log.display()),
+            "-display", "none",
+            "-no-reboot",
+        ])
+        .spawn()
+        .expect("failed to spawn qemu-system-x86_64");
+
+    std::thread::sleep(Duration::from_secs(8));
+
+    // Kill QEMU (it halts forever — no self-exit yet; isa-debug-exit is later).
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Read serial log.
+    let log = fs::read_to_string(&serial_log).unwrap_or_default();
+    println!("--- serial.log ---");
+    println!("{}", log);
+    println!("--- end serial.log ---");
+
+    if log.contains("SentinelOS") {
+        println!("TEST PASSED: banner found in serial output.");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("TEST FAILED: 'SentinelOS' not found in serial output.");
+        ExitCode::FAILURE
+    }
 }

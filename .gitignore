@@ -36,3 +36,6 @@ erase-*.sh
 
 # graphify generated output (regenerable, machine-specific)
 graphify-out/
+
+# Limine bootloader (fetched at build time, not tracked)
+kernel/limine/
