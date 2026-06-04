@@ -19,6 +19,7 @@
 // types available to the safe kernel logic.
 extern crate alloc;
 
+pub mod fs;
 pub mod input;
 pub mod interrupts;
 pub mod memory;
@@ -100,9 +101,9 @@ pub fn kmain() -> ! {
 ///      shell, and enter `Desktop`.
 ///    - `Desktop`: keep the top-bar clock ticking once per second, and drain
 ///      keyboard events into the [`shell::Shell`] — printable keys echo into the
-///      console, Enter runs the command. The console is redrawn only when its
-///      content changed or the cursor-blink phase flipped, so idle ticks stay
-///      cheap.
+///      console, Enter runs the command, and the Up/Down arrows recall command
+///      history. The console is redrawn only when its content changed or the
+///      cursor-blink phase flipped, so idle ticks stay cheap.
 ///
 /// Diverging (`-> !`): the kernel never returns.
 fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
@@ -151,7 +152,8 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
                     }
                 } else if let (LockState::Desktop, Some(sh)) = (state, shell.as_mut()) {
                     // On the desktop: type into the shell. Printable keys echo,
-                    // Enter runs the command; the redraw below paints the result.
+                    // Enter runs the command, and Up/Down recall history; the
+                    // redraw below paints the result.
                     sh.on_key(event);
                 }
             }

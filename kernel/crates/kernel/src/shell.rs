@@ -33,6 +33,7 @@ use alloc::vec::Vec;
 
 use ui::CursorStyle;
 
+use crate::fs::FileSystem;
 use crate::input::KeyEvent;
 
 /// The prompt drawn before the input line (Cyber Dusk pink in the console).
@@ -42,6 +43,10 @@ const PROMPT: &str = "> ";
 /// once this is exceeded — generous enough to scroll back through a session, but
 /// bounded so a long-running console can never grow without limit.
 const SCROLLBACK_CAP: usize = 256;
+
+/// Maximum number of submitted command lines remembered for Up/Down recall.
+/// Like [`SCROLLBACK_CAP`], oldest entries are dropped once this is exceeded.
+const HISTORY_CAP: usize = 128;
 
 /// Append the base-10 ASCII digits of `value` to `out`, with no `core::fmt`
 /// (which faults on this target). Zero renders as `"0"`.
@@ -69,9 +74,16 @@ fn push_dec(out: &mut String, value: u64) {
 
 /// The interactive shell: terminal content plus the command interpreter.
 ///
-/// Constructed with [`Shell::new`] (which seeds a friendly banner), fed decoded
-/// key events with [`Shell::on_key`], and rendered with [`Shell::render`]. All
-/// state lives on the kernel heap; the struct itself is just three owned fields.
+/// Constructed with [`Shell::new`] (which seeds a friendly banner and an
+/// in-memory filesystem), fed decoded key events with [`Shell::on_key`], and
+/// rendered with [`Shell::render`]. All state lives on the kernel heap.
+///
+/// # Command history
+///
+/// Each submitted (non-empty) line is appended to `history`. The Up/Down arrows
+/// walk a cursor (`history_pos`) through it the classic way: Up moves toward
+/// older entries, Down toward newer ones, and stepping past the newest restores
+/// an empty input line. The recalled text replaces the current input.
 pub struct Shell {
     /// Committed history lines, oldest first, capped to [`SCROLLBACK_CAP`].
     scrollback: Vec<String>,
@@ -80,10 +92,20 @@ pub struct Shell {
     /// `true` when the visible content changed since the last render — lets the
     /// idle loop skip redraws when nothing happened.
     dirty: bool,
+    /// Submitted command lines, oldest first, capped to [`HISTORY_CAP`]. Drives
+    /// Up/Down recall.
+    history: Vec<String>,
+    /// Cursor into `history` for Up/Down recall. `Some(i)` means the input line
+    /// is currently showing `history[i]`; `None` means "at the live, un-recalled
+    /// input" (so the next Up recalls the newest entry).
+    history_pos: Option<usize>,
+    /// The in-memory filesystem the `ls`/`cat`/`mkdir`/… commands operate on.
+    fs: FileSystem,
 }
 
 impl Shell {
-    /// Create a fresh shell, seeded with a short welcome banner.
+    /// Create a fresh shell, seeded with a short welcome banner and a starter
+    /// in-memory filesystem (`/readme.txt`, `/home`).
     ///
     /// Allocates on the kernel heap, so it must be called after `memory::init`
     /// has installed the global allocator.
@@ -93,6 +115,9 @@ impl Shell {
             scrollback: Vec::new(),
             input: String::new(),
             dirty: true,
+            history: Vec::new(),
+            history_pos: None,
+            fs: FileSystem::seeded(),
         };
         shell.push_line(String::from("SentinelOS shell - type 'help'"));
         shell.push_line(String::from("private · secure · yours"));
@@ -126,24 +151,33 @@ impl Shell {
     /// * [`KeyEvent::Backspace`] pops the last input character (no-op when empty).
     /// * [`KeyEvent::EnterPressed`] commits `prompt + input` to history, executes
     ///   the line, appends any output, and clears the input.
-    /// * Other events ([`KeyEvent::Tab`], [`KeyEvent::Escape`], the arrow events)
+    /// * [`KeyEvent::UpArrowPressed`] / [`KeyEvent::DownArrowPressed`] walk the
+    ///   command history into the input line (classic shell recall).
+    /// * Other events ([`KeyEvent::Tab`], [`KeyEvent::Escape`], the right-arrow)
     ///   are ignored by the shell for now.
+    ///
+    /// Typing or editing the line abandons any active history recall, so the next
+    /// Up starts again from the newest entry.
     ///
     /// Any event that changes the visible content sets the dirty flag.
     pub fn on_key(&mut self, event: KeyEvent) {
         match event {
             KeyEvent::Char(c) => {
                 self.input.push(c);
+                self.history_pos = None;
                 self.dirty = true;
             }
             KeyEvent::Backspace => {
                 if self.input.pop().is_some() {
+                    self.history_pos = None;
                     self.dirty = true;
                 }
             }
             KeyEvent::EnterPressed => {
                 self.submit();
             }
+            KeyEvent::UpArrowPressed => self.history_prev(),
+            KeyEvent::DownArrowPressed => self.history_next(),
             // Not yet bound in the shell — ignored.
             KeyEvent::Tab
             | KeyEvent::Escape
@@ -152,20 +186,82 @@ impl Shell {
         }
     }
 
-    /// Commit the current input line: echo it as history (`prompt + input`),
-    /// execute it, append the command's output line(s), and clear the input.
+    /// Up arrow: recall the previous (older) command into the input line.
+    ///
+    /// From the live input the first Up jumps to the newest history entry; each
+    /// further Up steps toward older entries and stops at the oldest. A no-op when
+    /// the history is empty.
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match self.history_pos {
+            // At the live input → newest entry.
+            None => self.history.len() - 1,
+            // Already at the oldest → stay put.
+            Some(0) => 0,
+            // Step one older.
+            Some(i) => i - 1,
+        };
+        self.history_pos = Some(next);
+        self.input = self.history[next].clone();
+        self.dirty = true;
+    }
+
+    /// Down arrow: recall the next (newer) command into the input line.
+    ///
+    /// Stepping past the newest entry restores an empty input line (back to the
+    /// live, un-recalled state). A no-op when no recall is active.
+    fn history_next(&mut self) {
+        let Some(i) = self.history_pos else {
+            return;
+        };
+        if i + 1 < self.history.len() {
+            self.history_pos = Some(i + 1);
+            self.input = self.history[i + 1].clone();
+        } else {
+            // Past the newest entry → back to a fresh, empty input line.
+            self.history_pos = None;
+            self.input.clear();
+        }
+        self.dirty = true;
+    }
+
+    /// Commit the current input line: echo it as scrollback (`prompt + input`),
+    /// remember it for Up/Down recall, execute it, append the command's output
+    /// line(s), and clear the input.
     fn submit(&mut self) {
-        // Echo the typed line into history, prompt included.
+        // Echo the typed line into the scrollback, prompt included.
         let mut echo = String::from(PROMPT);
         echo.push_str(&self.input);
         self.push_line(echo);
 
         // Take the input out so we can borrow `self` mutably while executing.
         let line = core::mem::take(&mut self.input);
+        self.record_history(&line);
         self.execute(&line);
 
+        // Any recall is finished; the next Up starts from the newest entry again.
+        self.history_pos = None;
         // Input was cleared by `take`; ensure the cursor/input redraws.
         self.dirty = true;
+    }
+
+    /// Append a submitted line to the command history (oldest first), capped to
+    /// [`HISTORY_CAP`]. Blank lines and an exact repeat of the most recent entry
+    /// are skipped, matching common shell behaviour.
+    fn record_history(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.history.last().map(String::as_str) == Some(trimmed) {
+            return;
+        }
+        if self.history.len() >= HISTORY_CAP {
+            self.history.remove(0);
+        }
+        self.history.push(String::from(trimmed));
     }
 
     /// Parse and run one command line, pushing its output into the scrollback.
@@ -192,6 +288,13 @@ impl Shell {
             "mem" => self.cmd_mem(),
             "echo" => self.push_line(String::from(rest)),
             "uptime" => self.cmd_uptime(),
+            "ls" => self.cmd_ls(rest),
+            "cat" => self.cmd_cat(rest),
+            "mkdir" => self.cmd_mkdir(rest),
+            "write" => self.cmd_write(rest),
+            "rm" => self.cmd_rm(rest),
+            "cd" => self.cmd_cd(rest),
+            "pwd" => self.cmd_pwd(),
             other => {
                 let mut msg = String::from("command not found: ");
                 msg.push_str(other);
@@ -200,15 +303,33 @@ impl Shell {
         }
     }
 
+    /// Push an `<command>: <path> - <message>` error line for a failed fs op.
+    fn push_fs_error(&mut self, cmd: &str, path: &str, err: crate::fs::FsError) {
+        let mut msg = String::from(cmd);
+        msg.push_str(": ");
+        msg.push_str(path);
+        msg.push_str(" - ");
+        msg.push_str(err.message());
+        self.push_line(msg);
+    }
+
     /// `help` — list the built-in commands.
     fn cmd_help(&mut self) {
         self.push_line(String::from("commands:"));
-        self.push_line(String::from("  help    - show this list"));
-        self.push_line(String::from("  clear   - clear the screen"));
-        self.push_line(String::from("  about   - about SentinelOS"));
-        self.push_line(String::from("  mem     - heap + frame stats"));
-        self.push_line(String::from("  echo X  - print X"));
-        self.push_line(String::from("  uptime  - seconds since boot"));
+        self.push_line(String::from("  help          - show this list"));
+        self.push_line(String::from("  clear         - clear the screen"));
+        self.push_line(String::from("  about         - about SentinelOS"));
+        self.push_line(String::from("  mem           - heap + frame stats"));
+        self.push_line(String::from("  echo X        - print X"));
+        self.push_line(String::from("  uptime        - seconds since boot"));
+        self.push_line(String::from("  ls [path]     - list a directory"));
+        self.push_line(String::from("  cat <file>    - print a file"));
+        self.push_line(String::from("  mkdir <dir>   - create a directory"));
+        self.push_line(String::from("  write <f> X   - write X to file f"));
+        self.push_line(String::from("  rm <path>     - remove a file/dir"));
+        self.push_line(String::from("  cd <dir>      - change directory"));
+        self.push_line(String::from("  pwd           - print working dir"));
+        self.push_line(String::from("history: Up/Down arrows recall commands"));
     }
 
     /// `clear` — wipe the scrollback to an empty screen.
@@ -265,6 +386,110 @@ impl Shell {
         push_dec(&mut line, secs);
         line.push_str(" s");
         self.push_line(line);
+    }
+
+    /// `ls [path]` — list a directory (the CWD when no path is given). Directories
+    /// are suffixed with `/`. Output is one entry per line, or `(empty)` for an
+    /// empty directory.
+    fn cmd_ls(&mut self, arg: &str) {
+        let path = if arg.is_empty() { "." } else { arg };
+        match self.fs.list(path) {
+            Ok(entries) => {
+                if entries.is_empty() {
+                    self.push_line(String::from("(empty)"));
+                    return;
+                }
+                for entry in entries {
+                    let mut line = entry.name;
+                    if entry.is_dir {
+                        line.push('/');
+                    }
+                    self.push_line(line);
+                }
+            }
+            Err(err) => self.push_fs_error("ls", path, err),
+        }
+    }
+
+    /// `cat <file>` — print a file's contents, line by line. Non-UTF-8 bytes are
+    /// rendered with the Unicode replacement character so the renderer never sees
+    /// invalid text.
+    fn cmd_cat(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.push_line(String::from("cat: missing file"));
+            return;
+        }
+        match self.fs.read_file(arg) {
+            // Clone the bytes into an owned buffer so we drop the borrow on
+            // `self.fs` before pushing into `self.scrollback`.
+            Ok(bytes) => {
+                let owned = bytes.to_vec();
+                let text: String = String::from_utf8_lossy(&owned).into_owned();
+                // Drop a single trailing newline so a file ending in '\n' doesn't
+                // print an extra blank line (matches a normal `cat`), then print
+                // each remaining line on its own scrollback row.
+                let body = text.strip_suffix('\n').unwrap_or(&text);
+                for line in body.split('\n') {
+                    self.push_line(String::from(line));
+                }
+            }
+            Err(err) => self.push_fs_error("cat", arg, err),
+        }
+    }
+
+    /// `mkdir <dir>` — create a directory. Reports the typed error on failure.
+    fn cmd_mkdir(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.push_line(String::from("mkdir: missing directory name"));
+            return;
+        }
+        if let Err(err) = self.fs.mkdir(arg) {
+            self.push_fs_error("mkdir", arg, err);
+        }
+    }
+
+    /// `write <file> <text...>` — create/overwrite `<file>` with the rest of the
+    /// line as its (newline-terminated) content.
+    fn cmd_write(&mut self, arg: &str) {
+        let (path, text) = match arg.split_once(char::is_whitespace) {
+            Some((p, t)) => (p, t),
+            None => (arg, ""),
+        };
+        if path.is_empty() {
+            self.push_line(String::from("write: usage: write <file> <text>"));
+            return;
+        }
+        // Store the text with a trailing newline so `cat` round-trips cleanly.
+        let mut content = String::from(text);
+        content.push('\n');
+        if let Err(err) = self.fs.write_file(path, content.as_bytes()) {
+            self.push_fs_error("write", path, err);
+        }
+    }
+
+    /// `rm <path>` — remove a file or directory (recursively).
+    fn cmd_rm(&mut self, arg: &str) {
+        if arg.is_empty() {
+            self.push_line(String::from("rm: missing path"));
+            return;
+        }
+        if let Err(err) = self.fs.remove(arg) {
+            self.push_fs_error("rm", arg, err);
+        }
+    }
+
+    /// `cd <dir>` — change the working directory (the root `/` with no argument).
+    fn cmd_cd(&mut self, arg: &str) {
+        let path = if arg.is_empty() { "/" } else { arg };
+        if let Err(err) = self.fs.change_dir(path) {
+            self.push_fs_error("cd", path, err);
+        }
+    }
+
+    /// `pwd` — print the current working directory.
+    fn cmd_pwd(&mut self) {
+        let cwd = self.fs.cwd();
+        self.push_line(cwd);
     }
 
     /// Render the console to `fb`, with a solid (always-visible) block caret.
@@ -402,7 +627,10 @@ mod tests {
         let mut shell = Shell::new();
         shell.execute("help");
         let body = shell.scrollback.join("\n");
-        for name in ["help", "clear", "about", "mem", "echo", "uptime"] {
+        for name in [
+            "help", "clear", "about", "mem", "echo", "uptime", "ls", "cat", "mkdir", "write", "rm",
+            "cd", "pwd",
+        ] {
             assert!(body.contains(name), "help should mention `{name}`");
         }
     }
@@ -448,5 +676,185 @@ mod tests {
         push_dec(&mut s, 1);
         push_dec(&mut s, 4096);
         assert_eq!(s, "014096");
+    }
+
+    // --- Command history ------------------------------------------------------
+
+    /// Submitting a command records it for Up/Down recall; Up recalls it.
+    #[test]
+    fn up_arrow_recalls_last_command() {
+        let mut shell = Shell::new();
+        type_line(&mut shell, "echo one");
+        // Input is clear after submit; Up brings back the last command.
+        assert_eq!(shell.input, "");
+        shell.on_key(KeyEvent::UpArrowPressed);
+        assert_eq!(shell.input, "echo one");
+    }
+
+    /// Up walks toward older entries; Down walks back toward newer ones, and
+    /// stepping past the newest restores an empty line.
+    #[test]
+    fn up_down_walk_history_both_ways() {
+        let mut shell = Shell::new();
+        type_line(&mut shell, "first");
+        type_line(&mut shell, "second");
+        type_line(&mut shell, "third");
+
+        // Up: newest → oldest.
+        shell.on_key(KeyEvent::UpArrowPressed);
+        assert_eq!(shell.input, "third");
+        shell.on_key(KeyEvent::UpArrowPressed);
+        assert_eq!(shell.input, "second");
+        shell.on_key(KeyEvent::UpArrowPressed);
+        assert_eq!(shell.input, "first");
+        // Stops at the oldest entry.
+        shell.on_key(KeyEvent::UpArrowPressed);
+        assert_eq!(shell.input, "first");
+
+        // Down: oldest → newest, then past the newest → empty.
+        shell.on_key(KeyEvent::DownArrowPressed);
+        assert_eq!(shell.input, "second");
+        shell.on_key(KeyEvent::DownArrowPressed);
+        assert_eq!(shell.input, "third");
+        shell.on_key(KeyEvent::DownArrowPressed);
+        assert_eq!(shell.input, "");
+    }
+
+    /// Down with no active recall is a no-op (stays at the live, empty input).
+    #[test]
+    fn down_arrow_without_recall_is_noop() {
+        let mut shell = Shell::new();
+        type_line(&mut shell, "x");
+        shell.on_key(KeyEvent::DownArrowPressed);
+        assert_eq!(shell.input, "");
+    }
+
+    /// Up arrow on an empty history does nothing.
+    #[test]
+    fn up_arrow_with_empty_history_is_noop() {
+        let mut shell = Shell::new();
+        shell.on_key(KeyEvent::UpArrowPressed);
+        assert_eq!(shell.input, "");
+    }
+
+    /// Typing after a recall abandons it: the next Up restarts from the newest.
+    #[test]
+    fn typing_abandons_active_recall() {
+        let mut shell = Shell::new();
+        type_line(&mut shell, "alpha");
+        type_line(&mut shell, "beta");
+        shell.on_key(KeyEvent::UpArrowPressed); // "beta"
+        shell.on_key(KeyEvent::Char('!')); // now "beta!", recall cleared
+        assert_eq!(shell.input, "beta!");
+        shell.on_key(KeyEvent::UpArrowPressed); // restarts from newest
+        assert_eq!(shell.input, "beta");
+    }
+
+    /// Consecutive duplicate commands are stored once.
+    #[test]
+    fn duplicate_consecutive_commands_collapse() {
+        let mut shell = Shell::new();
+        type_line(&mut shell, "same");
+        type_line(&mut shell, "same");
+        assert_eq!(shell.history.len(), 1);
+    }
+
+    /// History never grows past its cap.
+    #[test]
+    fn history_is_capped() {
+        let mut shell = Shell::new();
+        for i in 0..(HISTORY_CAP + 20) {
+            let mut s = String::from("cmd");
+            push_dec(&mut s, i as u64);
+            shell.record_history(&s);
+        }
+        assert_eq!(shell.history.len(), HISTORY_CAP);
+        // The oldest entry was evicted.
+        assert_eq!(shell.history[0], "cmd20");
+    }
+
+    // --- Filesystem commands --------------------------------------------------
+
+    /// `ls` on the seeded root shows the welcome file and the home directory
+    /// (directories suffixed with `/`).
+    #[test]
+    fn ls_shows_seeded_tree() {
+        let mut shell = Shell::new();
+        shell.execute("ls");
+        let body = shell.scrollback.join("\n");
+        assert!(body.contains("readme.txt"));
+        assert!(body.contains("home/"));
+    }
+
+    /// `cat readme.txt` prints the seeded welcome message.
+    #[test]
+    fn cat_prints_readme() {
+        let mut shell = Shell::new();
+        shell.execute("cat /readme.txt");
+        let body = shell.scrollback.join("\n");
+        assert!(body.contains("Welcome to SentinelOS"));
+    }
+
+    /// `cat` of a missing file reports a typed error.
+    #[test]
+    fn cat_missing_file_errors() {
+        let mut shell = Shell::new();
+        shell.execute("cat nope.txt");
+        let last = shell.scrollback.last().unwrap();
+        assert!(last.contains("cat: nope.txt"));
+        assert!(last.contains("no such file"));
+    }
+
+    /// `mkdir` then `ls` shows the new directory.
+    #[test]
+    fn mkdir_then_ls_shows_dir() {
+        let mut shell = Shell::new();
+        shell.execute("mkdir foo");
+        shell.execute("ls");
+        assert!(shell.scrollback.join("\n").contains("foo/"));
+    }
+
+    /// `write` then `cat` round-trips the text (one trailing newline, no extra
+    /// blank line printed).
+    #[test]
+    fn write_then_cat_roundtrips() {
+        let mut shell = Shell::new();
+        shell.execute("write note.txt hello world");
+        let before = shell.scrollback.len();
+        shell.execute("cat note.txt");
+        // Exactly one new scrollback line: "hello world".
+        assert_eq!(shell.scrollback.len(), before + 1);
+        assert_eq!(shell.scrollback.last().unwrap(), "hello world");
+    }
+
+    /// `cd` + `pwd` track the working directory; relative `ls` resolves against it.
+    #[test]
+    fn cd_pwd_and_relative_ls() {
+        let mut shell = Shell::new();
+        shell.execute("cd home");
+        shell.execute("pwd");
+        assert_eq!(shell.scrollback.last().unwrap(), "/home");
+        // The seeded /home holds notes.txt; a bare `ls` lists it.
+        shell.execute("ls");
+        assert!(shell.scrollback.join("\n").contains("notes.txt"));
+    }
+
+    /// `rm` removes a file so a later `cat` fails.
+    #[test]
+    fn rm_removes_file() {
+        let mut shell = Shell::new();
+        shell.execute("write doomed.txt bye");
+        shell.execute("rm doomed.txt");
+        shell.execute("cat doomed.txt");
+        assert!(shell.scrollback.last().unwrap().contains("no such file"));
+    }
+
+    /// Drive a full command line through `on_key` (typing + Enter), like the real
+    /// idle loop, so history is recorded the same way it is at runtime.
+    fn type_line(shell: &mut Shell, line: &str) {
+        for c in line.chars() {
+            shell.on_key(KeyEvent::Char(c));
+        }
+        shell.on_key(KeyEvent::EnterPressed);
     }
 }

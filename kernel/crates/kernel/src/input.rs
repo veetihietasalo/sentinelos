@@ -15,6 +15,8 @@
 //!
 //! - Right arrow **pressed**:  `0xE0` then `0x4D`.
 //! - Right arrow **released**: `0xE0` then `0xCD` (`0x4D | 0x80`).
+//! - Up arrow **pressed**:     `0xE0` then `0x48`.
+//! - Down arrow **pressed**:   `0xE0` then `0x50`.
 //!
 //! We therefore track whether the previous byte was the `0xE0` prefix, so the
 //! pair `0xE0,0x4D` is recognised as a single "right arrow pressed" event.
@@ -37,6 +39,12 @@ pub enum KeyEvent {
     RightArrowPressed,
     /// The right-arrow key was released (`0xE0 0xCD`).
     RightArrowReleased,
+    /// The up-arrow key was pressed (`0xE0 0x48`) — recall the previous command
+    /// from the shell's history.
+    UpArrowPressed,
+    /// The down-arrow key was pressed (`0xE0 0x50`) — recall the next command
+    /// from the shell's history.
+    DownArrowPressed,
     /// Enter / Return was pressed (`0x1C`) — also accepted as an unlock, and
     /// the shell's "submit line" key.
     EnterPressed,
@@ -57,6 +65,10 @@ const EXT_PREFIX: u8 = 0xE0;
 const RIGHT_ARROW_MAKE: u8 = 0x4D;
 /// Break code for the right arrow (after the `0xE0` prefix): make `| 0x80`.
 const RIGHT_ARROW_BREAK: u8 = 0xCD;
+/// Make code for the up arrow (after the `0xE0` prefix).
+const UP_ARROW_MAKE: u8 = 0x48;
+/// Make code for the down arrow (after the `0xE0` prefix).
+const DOWN_ARROW_MAKE: u8 = 0x50;
 /// Make code for Enter / Return (a non-extended key).
 const ENTER_MAKE: u8 = 0x1C;
 /// Make code for Backspace.
@@ -228,6 +240,8 @@ impl ScancodeDecoder {
             return match byte {
                 RIGHT_ARROW_MAKE => Some(KeyEvent::RightArrowPressed),
                 RIGHT_ARROW_BREAK => Some(KeyEvent::RightArrowReleased),
+                UP_ARROW_MAKE => Some(KeyEvent::UpArrowPressed),
+                DOWN_ARROW_MAKE => Some(KeyEvent::DownArrowPressed),
                 _ => None, // other extended keys: ignored at this slice
             };
         }
@@ -321,6 +335,32 @@ mod tests {
         let mut d = ScancodeDecoder::new();
         assert_eq!(d.feed(0xE0), None);
         assert_eq!(d.feed(0xCD), Some(KeyEvent::RightArrowReleased));
+    }
+
+    #[test]
+    fn up_arrow_press_is_two_byte_sequence() {
+        let mut d = ScancodeDecoder::new();
+        // The 0xE0 prefix alone yields nothing...
+        assert_eq!(d.feed(0xE0), None);
+        // ...and the 0x48 completes an "up arrow pressed" (history back).
+        assert_eq!(d.feed(0x48), Some(KeyEvent::UpArrowPressed));
+    }
+
+    #[test]
+    fn down_arrow_press_is_two_byte_sequence() {
+        let mut d = ScancodeDecoder::new();
+        assert_eq!(d.feed(0xE0), None);
+        // 0x50 completes a "down arrow pressed" (history forward).
+        assert_eq!(d.feed(0x50), Some(KeyEvent::DownArrowPressed));
+    }
+
+    #[test]
+    fn bare_up_down_codes_without_prefix_are_not_arrows() {
+        // 0x48 / 0x50 without the 0xE0 prefix are numpad '8' / '2' makes, which
+        // have no printable mapping in our table — so they decode to nothing.
+        let mut d = ScancodeDecoder::new();
+        assert_eq!(d.feed(0x48), None);
+        assert_eq!(d.feed(0x50), None);
     }
 
     #[test]
