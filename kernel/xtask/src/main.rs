@@ -70,6 +70,59 @@ fn e1000_args(pcap_path: &str) -> Vec<String> {
     ]
 }
 
+/// Size of the persistent filesystem disk image (16 MiB) created on first run.
+const DISK_IMG_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Default path of the persistent disk image (under `target/`, gitignored).
+fn disk_img_path() -> PathBuf {
+    kr("target/sentinelos-disk.img")
+}
+
+/// Ensure a raw disk image exists, then return the QEMU args that attach it as a
+/// **persistent legacy ATA (ISA IDE) disk** the `hal::ata` driver can read/write.
+///
+/// On the **q35** machine the onboard `if=ide` storage is an AHCI/SATA controller
+/// that does **not** answer the legacy command-block ports (`0x1F0..=0x1F7`) the
+/// PIO driver pokes. So we explicitly create the legacy ISA IDE controller and
+/// hang the disk on its primary channel:
+///
+/// - `-drive if=none,id=sosdisk,file=<img>,format=raw` — the raw backing image,
+///   not auto-attached to any bus (`format=raw` ⇒ guest writes persist verbatim).
+/// - `-device isa-ide,id=soside` — the legacy ISA IDE controller at iobase
+///   `0x1F0` / control `0x3F6` (exactly the ports `hal::ata` drives).
+/// - `-device ide-hd,drive=sosdisk,bus=soside.0` — attach the disk as the
+///   **primary master** (`bus=…​.0`, unit 0), which `hal::ata::identify` probes.
+///
+/// The image is created (sparse, zero-filled to [`DISK_IMG_BYTES`]) only if it
+/// does not already exist, so data written by a previous boot survives.
+fn disk_args() -> Vec<String> {
+    let img = disk_img_path();
+    if !img.exists() {
+        // Create the parent (target/) if needed, then a zero-filled sparse image.
+        if let Some(parent) = img.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::File::create(&img).and_then(|f| f.set_len(DISK_IMG_BYTES)) {
+            Ok(()) => println!(
+                "Created persistent disk image: {} ({} MiB)",
+                img.display(),
+                DISK_IMG_BYTES / (1024 * 1024)
+            ),
+            Err(e) => eprintln!("WARNING: could not create disk image {}: {e}", img.display()),
+        }
+    } else {
+        println!("Using existing disk image: {}", img.display());
+    }
+    vec![
+        "-drive".into(),
+        format!("if=none,id=sosdisk,file={},format=raw", img.display()),
+        "-device".into(),
+        "isa-ide,id=soside".into(),
+        "-device".into(),
+        "ide-hd,drive=sosdisk,bus=soside.0".into(),
+    ]
+}
+
 /// Path to the `kernel/` workspace root (one level up from `xtask/`).
 fn kernel_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -247,7 +300,9 @@ fn do_run() -> ExitCode {
         "-display", "none",
         "-no-reboot",
     ])
-    .args(e1000_args(pcap.to_str().unwrap()));
+    .args(e1000_args(pcap.to_str().unwrap()))
+    .args(disk_args());
+    println!("Disk: persistent IDE image attached (filesystem survives reboot).");
     let ok = run_cmd(&mut cmd);
 
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
@@ -289,6 +344,7 @@ fn do_test() -> ExitCode {
             "-no-reboot",
         ])
         .args(e1000_args(pcap.to_str().unwrap()))
+        .args(disk_args())
         .spawn()
         .expect("failed to spawn qemu-system-x86_64");
 
@@ -416,8 +472,13 @@ fn do_screenshot() -> ExitCode {
     };
 
     let serial_log = kr("target/serial.log");
-    let qmp_sock   = kr("target/sos-qmp.sock");
-    let png_path   = kr("target/sentinelos-boot.png");
+    // The QMP control socket lives in the system temp dir, NOT under target/:
+    // a UNIX socket path must fit in `sockaddr_un.sun_path` (104 bytes on macOS),
+    // and a deep checkout/worktree path under target/ blows that limit (QEMU then
+    // refuses to start). A short, process-unique temp path keeps screenshots
+    // working regardless of how deeply the repo is nested.
+    let qmp_sock = std::env::temp_dir().join(format!("sos-qmp-{}.sock", std::process::id()));
+    let png_path = kr("target/sentinelos-boot.png");
 
     // Remove stale artefacts from a previous run.
     let _ = fs::remove_file(&serial_log);
@@ -443,6 +504,7 @@ fn do_screenshot() -> ExitCode {
             "-qmp", &format!("unix:{},server,nowait", qmp_sock.display()),
         ])
         .args(e1000_args(pcap.to_str().unwrap()))
+        .args(disk_args())
         .spawn()
         .expect("failed to spawn qemu-system-x86_64");
 

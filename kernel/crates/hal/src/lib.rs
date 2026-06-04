@@ -35,6 +35,10 @@
 //! - [`mm`] — memory management: the physical frame allocator, virtual page
 //!   mapping over Limine's paging, and the kernel heap behind a
 //!   `#[global_allocator]` ([`mm::init`], [`mm::LockedHeap`]).
+//! - [`ata`] — a legacy ATA (IDE) PIO disk driver on the primary channel
+//!   (`0x1F0..=0x1F7` + control `0x3F6`) with [`ata::identify`],
+//!   [`ata::read_sectors`], [`ata::write_sectors`] (512-byte sectors, LBA28,
+//!   no DMA/IRQ): the backing store for `kernel::fs` reboot persistence.
 //!
 //! # `unsafe` discipline
 //!
@@ -65,6 +69,9 @@
 //!   allocator (call once at boot, after `interrupts::init`).
 //! - [`mm::LockedHeap`] — the `#[global_allocator]` type the `kernel` crate
 //!   declares as a `static` (declaring a static is not `unsafe`).
+//! - [`ata::identify`] / [`ata::read_sectors`] / [`ata::write_sectors`] /
+//!   [`ata::DiskInfo`] / [`ata::AtaError`] — block-level disk access for the
+//!   filesystem persistence layer.
 
 #![no_std]
 // `unsafe` is permitted in this crate (and only this crate), but it must always
@@ -74,6 +81,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod ata;
 pub mod cpu;
 pub mod e1000;
 pub mod framebuffer;

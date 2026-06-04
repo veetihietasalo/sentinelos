@@ -64,6 +64,13 @@ pub fn kmain() -> ! {
     // no-op if no NIC came up). Must run before `sti`, after `net::init`.
     interrupts::init_nic_irq();
 
+    // Bring up STORAGE: probe the legacy ATA disk and prove the on-disk
+    // filesystem persists across reboots. This loads the filesystem image from
+    // disk (or seeds + saves a fresh one), then writes a marker file so a second
+    // boot on the same image can demonstrate the file survived. Degrades
+    // gracefully — with no disk it logs and uses the in-memory seeded tree.
+    fs::prove_persistence();
+
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");
     // Use concat! to bake the version into a literal at compile time, avoiding
