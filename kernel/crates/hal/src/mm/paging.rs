@@ -27,6 +27,10 @@ use super::frame::FrameAllocator;
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
+/// Page Write-Through (PWT): bit 3 — with PCD selects an uncached MMIO mapping.
+const WRITE_THROUGH: u64 = 1 << 3;
+/// Page Cache Disable (PCD): bit 4 — disables caching for the page (MMIO).
+const CACHE_DISABLE: u64 = 1 << 4;
 const NO_EXECUTE: u64 = 1 << 63;
 
 /// Mask selecting the physical frame address out of a page-table entry.
@@ -45,6 +49,7 @@ pub struct PageFlags {
     writable: bool,
     user_accessible: bool,
     no_execute: bool,
+    cache_disable: bool,
 }
 
 impl PageFlags {
@@ -55,6 +60,7 @@ impl PageFlags {
             writable: false,
             user_accessible: false,
             no_execute: true,
+            cache_disable: false,
         }
     }
 
@@ -65,6 +71,24 @@ impl PageFlags {
             writable: true,
             user_accessible: false,
             no_execute: true,
+            cache_disable: false,
+        }
+    }
+
+    /// Kernel read-write **uncached** mapping for device MMIO (sets PCD+PWT).
+    ///
+    /// Memory-mapped device registers (e.g. a NIC's BAR window) must never be
+    /// cached: a cached read could return a stale value and a cached write might
+    /// not reach the device until evicted. Setting Page-Cache-Disable (and
+    /// Page-Write-Through, the conservative strong-uncacheable pairing) makes
+    /// every access go straight to the device. Non-executable, writable.
+    #[must_use]
+    pub const fn mmio() -> Self {
+        Self {
+            writable: true,
+            user_accessible: false,
+            no_execute: true,
+            cache_disable: true,
         }
     }
 
@@ -83,6 +107,9 @@ impl PageFlags {
         }
         if self.user_accessible {
             bits |= USER;
+        }
+        if self.cache_disable {
+            bits |= CACHE_DISABLE | WRITE_THROUGH;
         }
         if self.no_execute {
             bits |= NO_EXECUTE;
