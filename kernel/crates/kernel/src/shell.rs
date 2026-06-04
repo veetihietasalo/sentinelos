@@ -72,6 +72,35 @@ fn push_dec(out: &mut String, value: u64) {
     }
 }
 
+/// Append `value` as exactly `width` lowercase hex digits (zero-padded), with no
+/// `core::fmt` (which faults on this target — see [`push_dec`]). Used for PCI
+/// `vendor:device` ids and class bytes in the `devices` command.
+///
+/// `width` is clamped to 16 (a `u64` is at most 16 hex digits); a `width` of 0
+/// still emits at least the significant digits of a non-zero value.
+fn push_hex(out: &mut String, value: u64, width: usize) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let width = width.min(16);
+    let mut buf = [0u8; 16];
+    // Fill least-significant-first.
+    let mut n = value;
+    let mut produced = 0;
+    while produced < buf.len() && (n > 0 || produced < width) {
+        buf[produced] = DIGITS[(n & 0xF) as usize];
+        n >>= 4;
+        produced += 1;
+    }
+    if produced == 0 {
+        // value == 0 and width == 0: still emit a single '0'.
+        out.push('0');
+        return;
+    }
+    // Emit most-significant-first; every byte is an ASCII hex digit ⇒ valid UTF-8.
+    for i in (0..produced).rev() {
+        out.push(buf[i] as char);
+    }
+}
+
 /// The interactive shell: terminal content plus the command interpreter.
 ///
 /// Constructed with [`Shell::new`] (which seeds a friendly banner and an
@@ -286,6 +315,8 @@ impl Shell {
             "clear" => self.cmd_clear(),
             "about" => self.cmd_about(),
             "mem" => self.cmd_mem(),
+            "cpuinfo" => self.cmd_cpuinfo(),
+            "devices" => self.cmd_devices(),
             "echo" => self.push_line(String::from(rest)),
             "uptime" => self.cmd_uptime(),
             "ls" => self.cmd_ls(rest),
@@ -320,6 +351,8 @@ impl Shell {
         self.push_line(String::from("  clear         - clear the screen"));
         self.push_line(String::from("  about         - about SentinelOS"));
         self.push_line(String::from("  mem           - heap + frame stats"));
+        self.push_line(String::from("  cpuinfo       - CPU vendor + features"));
+        self.push_line(String::from("  devices       - fb, RAM, PCI list"));
         self.push_line(String::from("  echo X        - print X"));
         self.push_line(String::from("  uptime        - seconds since boot"));
         self.push_line(String::from("  ls [path]     - list a directory"));
@@ -377,6 +410,136 @@ impl Shell {
         push_dec(&mut ram, total_mib);
         ram.push_str(" MiB free");
         self.push_line(ram);
+    }
+
+    /// `cpuinfo` — what the CPU reports about itself via `cpuid`.
+    ///
+    /// Prints the vendor id, the processor brand string (when the CPU exposes
+    /// it), the decoded family/model/stepping, and the detected feature flags —
+    /// all read live from the hardware through [`hal::cpuid::info`].
+    fn cmd_cpuinfo(&mut self) {
+        let info = hal::cpuid::info();
+
+        // "vendor: GenuineIntel"
+        let mut vendor = String::from("vendor: ");
+        vendor.push_str(info.vendor.as_str());
+        self.push_line(vendor);
+
+        // "brand: <48-byte brand string>" — only if the CPU provided one.
+        let brand = info.brand.as_str().trim();
+        if !brand.is_empty() {
+            let mut line = String::from("brand: ");
+            line.push_str(brand);
+            self.push_line(line);
+        }
+
+        // "family: NN  model: NN  stepping: NN" (decimal, like /proc/cpuinfo).
+        let mut fms = String::from("family: ");
+        push_dec(&mut fms, info.fms.family as u64);
+        fms.push_str("  model: ");
+        push_dec(&mut fms, info.fms.model as u64);
+        fms.push_str("  stepping: ");
+        push_dec(&mut fms, info.fms.stepping as u64);
+        self.push_line(fms);
+
+        // "features: sse sse2 ... avx2" — only the flags the CPU advertises,
+        // space-separated, wrapped to a handful per line so a wide feature set
+        // stays readable in the console.
+        self.push_line(String::from("features:"));
+        let mut line = String::from("  ");
+        let mut on_line = 0;
+        for feat in info.features() {
+            if !feat.present {
+                continue;
+            }
+            if on_line == 8 {
+                self.push_line(core::mem::take(&mut line));
+                line.push_str("  ");
+                on_line = 0;
+            }
+            line.push_str(feat.name);
+            line.push(' ');
+            on_line += 1;
+        }
+        if on_line == 0 {
+            // No flags at all (a very minimal CPU) — say so rather than a blank.
+            line.push_str("(none reported)");
+        }
+        self.push_line(line);
+    }
+
+    /// `devices` — the hardware the OS actually detected.
+    ///
+    /// Reports the framebuffer resolution (via [`hal::framebuffer`]), the detected
+    /// RAM and the fixed kernel heap (via [`hal::mm::stats`]), and the enumerated
+    /// PCI device list (via [`hal::pci::list_devices`]). Together this answers
+    /// "does the kernel know the machine's specs" for the non-CPU hardware.
+    fn cmd_devices(&mut self) {
+        // Framebuffer resolution + colour depth.
+        match hal::framebuffer::get() {
+            Some(fb) => {
+                // "framebuffer: WIDTHxHEIGHT @ BPP bpp"
+                let mut line = String::from("framebuffer: ");
+                push_dec(&mut line, fb.width() as u64);
+                line.push('x');
+                push_dec(&mut line, fb.height() as u64);
+                line.push_str(" @ ");
+                push_dec(&mut line, fb.bpp() as u64);
+                line.push_str(" bpp");
+                self.push_line(line);
+            }
+            None => self.push_line(String::from("framebuffer: none")),
+        }
+
+        // Detected RAM (from the frame allocator) vs the fixed heap window.
+        let stats = hal::mm::stats();
+        let total_mib = (stats.total_frames as u64) * 4 / 1024;
+        let free_mib = (stats.free_frames as u64) * 4 / 1024;
+        let mut ram = String::from("ram detected: ");
+        push_dec(&mut ram, total_mib);
+        ram.push_str(" MiB (");
+        push_dec(&mut ram, free_mib);
+        ram.push_str(" MiB free)");
+        self.push_line(ram);
+
+        let mut heap = String::from("heap (fixed): ");
+        push_dec(&mut heap, (stats.heap_bytes / 1024) as u64);
+        heap.push_str(" KiB");
+        self.push_line(heap);
+
+        // PCI device inventory. q35/QEMU keeps everything on bus 0–1.
+        let list = hal::pci::list_devices(1);
+        let mut header = String::from("pci devices: ");
+        push_dec(&mut header, list.len() as u64);
+        self.push_line(header);
+        if list.is_empty() {
+            self.push_line(String::from("  (none found)"));
+            return;
+        }
+        for dev in list.as_slice() {
+            // "  00:03.0 8086:100e  Intel e1000 (82540EM) NIC"
+            let mut line = String::from("  ");
+            push_hex(&mut line, dev.bus as u64, 2);
+            line.push(':');
+            push_hex(&mut line, dev.device as u64, 2);
+            line.push('.');
+            push_dec(&mut line, dev.function as u64);
+            line.push(' ');
+            push_hex(&mut line, dev.vendor as u64, 4);
+            line.push(':');
+            push_hex(&mut line, dev.dev_id as u64, 4);
+            line.push_str("  ");
+            if dev.name.is_empty() {
+                // No friendly name: fall back to the raw class/subclass bytes.
+                line.push_str("class ");
+                push_hex(&mut line, dev.class as u64, 2);
+                line.push('.');
+                push_hex(&mut line, dev.subclass as u64, 2);
+            } else {
+                line.push_str(dev.name);
+            }
+            self.push_line(line);
+        }
     }
 
     /// `uptime` — whole seconds since boot, derived from the PIT tick counter.
@@ -661,8 +824,8 @@ mod tests {
         shell.execute("help");
         let body = shell.scrollback.join("\n");
         for name in [
-            "help", "clear", "about", "mem", "echo", "uptime", "ls", "cat", "mkdir", "write", "rm",
-            "cd", "pwd",
+            "help", "clear", "about", "mem", "cpuinfo", "devices", "echo", "uptime", "ls", "cat",
+            "mkdir", "write", "rm", "cd", "pwd",
         ] {
             assert!(body.contains(name), "help should mention `{name}`");
         }

@@ -16,6 +16,9 @@
 //! - [`serial`] — a 16550 UART driver on COM1 (`0x3F8`) with a global console
 //!   and the [`print!`] / [`println!`] macros.
 //! - [`cpu`] — safe wrappers over `hlt`, `cli`, `sti`, and the `CR2` read.
+//! - [`cpuid`] — a safe wrapper over the `cpuid` instruction returning the CPU
+//!   vendor/brand strings, family/model/stepping, and feature flags
+//!   ([`cpuid::info`]) for the shell's `cpuinfo` command.
 //! - [`framebuffer`] — the Limine linear framebuffer wrapped as a safe,
 //!   bounds-checked drawing surface ([`framebuffer::Framebuffer`]).
 //! - [`gdt`] — the 64-bit GDT + TSS with an IST double-fault stack (`lgdt`/`ltr`).
@@ -75,6 +78,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod cpu;
+pub mod cpuid;
 pub mod e1000;
 pub mod framebuffer;
 pub mod gdt;

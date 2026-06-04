@@ -17,7 +17,9 @@ sound, and its formal-verification status.
   sub-project #3 (input) — the PS/2 (i8042) keyboard on IRQ1 (`hal::keyboard`);
   sub-project #5 (UI, first slice) — the Limine framebuffer surface (`hal::framebuffer`);
   sub-project #6 (networking) — PCI config-space enumeration (`hal::pci`, §6a) and
-  the Intel e1000 NIC driver (`hal::e1000`, §6b)
+  the Intel e1000 NIC driver (`hal::e1000`, §6b);
+  hardware report — the `cpuid` CPU-identification wrapper (`hal::cpuid`, §7)
+  behind the shell's `cpuinfo`/`devices` commands
 - **Crate lints:** `#![deny(unsafe_op_in_unsafe_fn)]`,
   `#![warn(clippy::undocumented_unsafe_blocks)]` — every `unsafe` block is
   forced to carry a `// SAFETY:` comment.
@@ -408,6 +410,38 @@ disabled; `send_frame`/`poll_frame`/`on_irq` take the lock briefly.
 > unit tests. The TCB's job is only to move bytes to/from the wire (N3–N7) and
 > ack the RX interrupt (`on_irq` reads ICR + EOIs via `pic`, P5). The kernel's
 > registered NIC-vector handler is a one-line safe `fn(&InterruptFrame)`.
+
+## 7. `hal::cpuid` — CPU identification (hardware report)
+
+Wraps the `cpuid` instruction so the shell's `cpuinfo` command can report what the
+processor actually is (vendor + brand strings, family/model/stepping) and what it
+can do (feature flags from leaf 1 ECX/EDX + leaf 7 EBX). `cpuid` takes its *leaf*
+in `eax` (and a *sub-leaf* in `ecx`) and returns the selected information word in
+`eax`/`ebx`/`ecx`/`edx`. It is the **only** privileged op in the module; everything
+else — vendor/brand string assembly, the family/model/stepping decode, and the
+feature-bit checks — is pure, safe bit arithmetic (with co-located unit tests). The
+public surface (`cpuid::info`, `cpuid::raw`, `max_standard_leaf`,
+`max_extended_leaf`, and the `CpuInfo`/`Feature`/`FamilyModelStepping`/`CpuidString`
+types) is **entirely safe**, so the `kernel` crate formats the report without any
+`unsafe`.
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| Q1 | `cpuid.rs` · `raw()` | `cpuid` (via `asm!`, with a `rbx`↔scratch `mov`/`xchg` because LLVM reserves `rbx`) | The only way to query the CPU's vendor/brand/feature identification leaves | `cpuid` reads `eax`/`ecx`, writes `eax`/`ebx`/`ecx`/`edx`, touches no memory (`nomem`), uses no stack (`nostack`), and does not affect RFLAGS (`preserves_flags`). It is legal at CPL 3+, so the kernel (CPL 0) may always issue it. We hand `ebx` through a scratch GP register and swap it around the instruction (`mov tmp, rbx; cpuid; xchg tmp, rbx`) because LLVM forbids naming the reserved `rbx` in `out`/`inout`; the swap leaves `rbx` restored and recovers cpuid's `ebx` into `tmp`. Reading CPU identification cannot create UB or alter memory validity/aliasing — it only observes the processor's own description. Unsupported leaves return implementation-defined data, never UB (callers gate on `max_standard_leaf`/`max_extended_leaf`). | Reasoned + QEMU (`cpuinfo` prints the live vendor/brand/features) |
+
+> The string assembly (`CpuidString` — collect register bytes, truncate at the
+> first NUL/non-ASCII, trim trailing padding, return a `&str`), the
+> `FamilyModelStepping::from_eax` extended-field combining, and the feature-bit
+> masks are pure safe logic and are covered by `cpuid.rs`'s `#[cfg(test)]` unit
+> tests (Kani candidates — all bit arithmetic, no I/O).
+
+> **`devices` / PCI device list (no new `unsafe`).** The shell's `devices`
+> command and `hal::pci::list_devices` (the whole-bus enumeration behind it) add
+> **no** new privileged op: they compose the already-documented config-port reads
+> (N1/N2) into a fixed-capacity inventory and tag each function with a human name
+> by pure table lookup. The framebuffer resolution and RAM/heap figures the
+> command also prints come from the existing safe `hal::framebuffer::get` (F1) and
+> `hal::mm::stats` accessors.
 
 ## 3. Verification roadmap (sub-project #2+)
 
