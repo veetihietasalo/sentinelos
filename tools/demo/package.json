@@ -1,0 +1,26 @@
+{
+  "name": "sentinelos-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Shareable demo video of SentinelOS — composed in Remotion from REAL frames captured off the running OS in QEMU. The video only adds title cards, pacing, and captions; it does NOT re-create the UI.",
+  "license": "MIT",
+  "scripts": {
+    "capture": "./capture/capture_frames.sh",
+    "sync-frames": "mkdir -p public/frames && rm -f public/frames/*.png && cp frames/frame_*.png public/frames/ && ls public/frames | wc -l",
+    "preview": "npm run sync-frames && remotion studio src/index.ts",
+    "render": "npm run render:mp4 && npm run render:gif",
+    "render:mp4": "npm run sync-frames && remotion render src/index.ts SentinelDemo out/sentinelos-demo.mp4 --codec=h264",
+    "render:gif": "npm run sync-frames && remotion render src/index.ts SentinelDemo out/sentinelos-demo.gif --codec=gif --every-nth-frame=3 --width=480",
+    "still": "npm run sync-frames && remotion still src/index.ts SentinelDemo out/poster.png --frame=90"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.471",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "remotion": "4.0.471"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "typescript": "^5.4.5"
+  }
+}

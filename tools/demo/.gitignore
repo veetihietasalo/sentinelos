@@ -1,0 +1,23 @@
+# Node / Remotion
+node_modules/
+.remotion/
+
+# Rendered video output — regenerable, can be large. Keep the repo lean.
+# (A small hero GIF MAY be force-added below if we want it in the README.)
+out/
+
+# Captured PNG frame sequence — regenerable via capture/capture_frames.sh.
+# These are the real OS screendumps; large and reproducible, so not tracked.
+frames/
+
+# Frames are copied here for Remotion's staticFile(); never track the copy.
+public/frames/
+
+# A small, shareable hero GIF MAY be kept in the repo for the README despite the
+# out/ rule above. Uncomment to force-track it (keep it under ~3 MB):
+# !out/
+# !out/sentinelos-demo.gif
+
+# OS / editor cruft
+.DS_Store
+*.log
