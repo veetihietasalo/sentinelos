@@ -14,7 +14,8 @@ sound, and its formal-verification status.
   sub-project #2 part 1 (memory) — frame allocator, paging, kernel heap +
   `#[global_allocator]` (`hal::mm`, §5); plus the device-MMIO mapping +
   DMA-frame helpers `mm::map_mmio` / `mm::DmaFrame` (§5f) added for the NIC;
-  sub-project #3 (input) — the PS/2 (i8042) keyboard on IRQ1 (`hal::keyboard`);
+  sub-project #3 (input) — the PS/2 (i8042) keyboard on IRQ1 (`hal::keyboard`)
+  and the PS/2 mouse on IRQ12 (`hal::mouse`, §2h);
   sub-project #5 (UI, first slice) — the Limine framebuffer surface (`hal::framebuffer`);
   sub-project #6 (networking) — PCI config-space enumeration (`hal::pci`, §6a) and
   the Intel e1000 NIC driver (`hal::e1000`, §6b)
@@ -226,6 +227,47 @@ with interrupts disabled; `on_irq` runs inside the IRQ1 interrupt gate
 > `AtomicU8`/`AtomicUsize` (no `unsafe`); `poll_scancode` is safe API. The
 > *decoding* state machine and the lock-screen logic live in `kernel::input`
 > under `#![forbid(unsafe_code)]`, so the privileged surface stays tiny.
+
+## 2h. `hal::mouse` — PS/2 (i8042 aux device) mouse on IRQ12 (sub-project #3, pointer)
+
+Captures pointer movement + button packets from the legacy PS/2 mouse (the i8042
+**auxiliary** device). The mouse shares the keyboard's data port (`0x60`) but is
+wired to **IRQ12**, which lives on the **slave** PIC (line 4 → vector `0x2C`).
+The i8042 raises one IRQ12 per *byte*, so the IRQ handler (`on_irq`, called from
+the kernel's registered vector-`0x2C` handler) reads one byte from `0x60` on
+**every** interrupt (mandatory — the i8042 will not raise another IRQ12 until its
+output buffer is drained), reassembles the 3-byte movement packet across three
+interrupts, decodes `{ dx, dy, buttons }` (sign + overflow bits) and pushes a
+`MouseEvent` into a lock-free SPSC ring of plain atomics (no `unsafe`), then EOIs
+**both** PICs via `hal::pic` (a slave-PIC line must EOI the slave *and* the
+master — see P5). `init` enables the aux device (`0xA8`), sets the config byte's
+port-2 interrupt-enable bit, tells the mouse to use defaults (`0xF6`) and stream
+(`0xF4`) via the `0xD4` write-to-aux prefix, then unmasks **IRQ12 and the IRQ2
+cascade** (without the cascade unmasked the slave PIC reaches the CPU for no
+line). **All pointer policy** (cursor position, screen clamping, hit-test
+click-to-focus, cursor damage) lives in the safe `kernel::wm` module, *not* the
+TCB. All hardware access goes through two private primitives, `inb`/`outb`, each
+with a `# Safety` section. The public surface (`init`, `on_irq`, `poll_event`) is
+**safe**. `init` runs once on the boot core with interrupts disabled; `on_irq`
+runs inside the IRQ12 interrupt gate (interrupts already masked) — single-core, no
+SMP lock. Packet decoding (`decode_delta`/`decode_packet`) is pure logic with
+co-located host unit tests.
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| MS1 | `mouse.rs` · `inb()` | `in al, dx` (port read) | Only way to read the i8042 data (`0x60`) and status (`0x64`) registers | `unsafe fn` whose `# Safety` requires a read-safe PS/2 port; all callers pass `0x60`/`0x64`. Pure device read (draining a packet byte / reading status / a mouse ack), `nomem`/`nostack`. | Reasoned + QEMU (cursor moves; click changes focus) |
+| MS2 | `mouse.rs` · `outb()` | `out dx, al` (port write) | Only way to send i8042 commands (`0x64`) and config/mouse data bytes (`0x60`) | `unsafe fn` whose `# Safety` requires a write-safe PS/2 port; all callers pass `0x60`/`0x64` with documented i8042/mouse command/config values (`0xA8`/`0x20`/`0x60`/`0xD4` + `0xF6`/`0xF4` + the config byte). Device-only effect, `nomem`/`nostack`. | Reasoned + QEMU |
+| MS3 | `mouse.rs` · `wait_input_empty()` / `wait_output_full()` | `inb(0x64)` status poll | Gate command/data writes + the config/ack reads on the controller's buffer state | Reads the read-only status register in a **bounded** loop (so a wedged controller cannot hang boot); no memory-safety-relevant side effect. `inb`'s contract holds. | Reasoned + QEMU |
+| MS4 | `mouse.rs` · `write_to_mouse()` | `outb(0x64,0xD4)` → `outb(0x60,cmd)` → `inb(0x60)` ack | Forward a command to the mouse (the `0xD4` prefix routes the next data byte to the aux device) and drain its `0xFA` ack | Each step targets a constant PS/2 port with a documented value after gating on buffer state; the ack read clears the output buffer so a stray ack cannot masquerade as the first packet byte. Device-only; cannot alias Rust memory. Runs in `init`, boot core, interrupts off. | Reasoned + QEMU |
+| MS5 | `mouse.rs` · `init()` | enable-aux (`0xA8`) + config-byte read-modify-write (set port-2 IRQ, clear port-2 clock-disable) + stale-byte drain | Enable IRQ12 generation; firmware may leave the aux port/IRQ12 disabled, in which case the mouse never raises an interrupt | Standard i8042 aux/config programming; each `inb`/`outb` targets a constant PS/2 port with a defined value; only toggles which interrupts the controller raises / which ports are clocked — device-only, cannot alias Rust memory. Runs once, boot core, interrupts off; then unmasks IRQ12 + the IRQ2 cascade on the PIC. | Reasoned + QEMU (IRQ12 fires on pointer motion) |
+| MS6 | `mouse.rs` · `on_irq()` | `inb(0x60)` packet-byte read | Drain the next packet byte (mandatory — i8042 stops raising IRQ12 until read) | Reached only from the IRQ12 interrupt gate; a single pure device read of the data port, then plain-atomic packet reassembly + a `pic::end_of_interrupt` (both PICs). Cannot corrupt memory. | Reasoned + QEMU (sustained packets delivered) |
+
+> The mouse's decoded-event ring (`RING_DX`/`RING_DY`/`RING_BTN` + `HEAD`/`TAIL`)
+> and the 3-byte reassembly state (`PHASE`/`PKT0`/`PKT1`) are plain
+> `AtomicI16`/`AtomicU8`/`AtomicUsize` (no `unsafe`); `poll_event` is safe API. The
+> cursor model, screen clamping, and hit-test click-to-focus live in `kernel::wm`
+> under `#![forbid(unsafe_code)]`, so the privileged surface stays tiny (read a
+> byte, reassemble, EOI). The dual-PIC EOI itself is `hal::pic` (P5).
 
 ---
 

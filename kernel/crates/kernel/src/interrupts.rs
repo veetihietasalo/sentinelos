@@ -17,6 +17,7 @@
 //! | 14     | #PF Page Fault     | Decode error-code bits + CR2 faulting address, print, [`hal::cpu::halt_loop`]. |
 //! | 32     | IRQ0 PIT timer     | Bump the tick counter + EOI, then **return** (resumes). |
 //! | 33     | IRQ1 PS/2 keyboard | Drain the scancode byte into the ring + EOI, then **return** (resumes). |
+//! | 44     | IRQ12 PS/2 mouse   | Drain a packet byte, reassemble the 3-byte packet into the ring + dual EOI, then **return** (resumes). |
 //!
 //! Vectors without a registered handler fall through to `hal`'s `default_handler`,
 //! which already reports and halts — no action needed here.
@@ -39,6 +40,8 @@ const VECTOR_TIMER: u8 = hal::pic::PIC1_OFFSET;
 const IRQ_TIMER: u8 = 0;
 /// Vector 33 (`0x21`): IRQ1 — the PS/2 keyboard, after the PIC remap.
 const VECTOR_KEYBOARD: u8 = hal::keyboard::VECTOR_KEYBOARD;
+/// Vector 44 (`0x2C`): IRQ12 — the PS/2 mouse (slave PIC), after the PIC remap.
+const VECTOR_MOUSE: u8 = hal::mouse::VECTOR_MOUSE;
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -183,6 +186,20 @@ fn handle_keyboard(_frame: &InterruptFrame) {
     hal::keyboard::on_irq();
 }
 
+/// Vector 44 (IRQ12) — the PS/2 mouse (i8042 auxiliary device).
+///
+/// Delegates to [`hal::mouse::on_irq`], which **must** read the next packet byte
+/// from port `0x60` on every interrupt (the i8042 will not raise another IRQ12
+/// until its output buffer is drained), reassembles the 3-byte movement packet,
+/// pushes a decoded `MouseEvent` into a lock-free ring for the kernel to consume,
+/// and signals End-Of-Interrupt to **both** PICs (IRQ12 is a slave-PIC line).
+/// Returns normally so the interrupted code resumes. All the privileged work (the
+/// port read + dual PIC EOI) stays inside `hal`; cursor/window policy happens in
+/// safe code (`crate::wm`) from the idle loop.
+fn handle_mouse(_frame: &InterruptFrame) {
+    hal::mouse::on_irq();
+}
+
 /// The NIC receive interrupt (vector = `PIC1_OFFSET + NIC IRQ line`).
 ///
 /// Delegates to [`hal::e1000::on_irq`], which acks the device's interrupt-cause
@@ -241,9 +258,10 @@ pub fn self_test() {
     hal::println!("[selftest] int3 -> #BP handler ran; IDT live");
 }
 
-/// Bring up the hardware-IRQ foundation: register the vector-32 (PIT) and
-/// vector-33 (PS/2 keyboard) handlers, remap the PIC pair, program the PIT to
-/// ~100 Hz, and unmask IRQ0 + IRQ1.
+/// Bring up the hardware-IRQ foundation: register the vector-32 (PIT),
+/// vector-33 (PS/2 keyboard), and vector-44 (PS/2 mouse) handlers, remap the PIC
+/// pair, program the PIT to ~100 Hz, and unmask IRQ0 + IRQ1 + IRQ12 (and the IRQ2
+/// cascade the mouse's slave-PIC line needs).
 ///
 /// Does **not** enable interrupts — the caller (`kmain`) must `sti` only after
 /// every handler is registered. Order matters: remap the PIC (so the IRQs land on
@@ -251,9 +269,11 @@ pub fn self_test() {
 /// register each handler **before** unmasking its line so no interrupt can arrive
 /// before its handler exists.
 pub fn init_timer() {
-    // Register the vector-32 (timer) and vector-33 (keyboard) handlers first.
+    // Register the vector-32 (timer), vector-33 (keyboard), and vector-44 (mouse)
+    // handlers first, before any line is unmasked.
     hal::interrupts::set_handler(VECTOR_TIMER, handle_timer as Handler);
     hal::interrupts::set_handler(VECTOR_KEYBOARD, handle_keyboard as Handler);
+    hal::interrupts::set_handler(VECTOR_MOUSE, handle_mouse as Handler);
 
     // Remap the 8259A pair to vectors 32–47 (every line masked), then program
     // PIT channel 0 to ~100 Hz, then open IRQ0 (timer) and IRQ1 (keyboard).
@@ -261,6 +281,9 @@ pub fn init_timer() {
     hal::pit::init();
     hal::pic::unmask_irq(IRQ_TIMER);
     hal::keyboard::init();
+    // Bring up the PS/2 mouse: enable the i8042 aux device, start streaming, and
+    // unmask IRQ12 + the IRQ2 cascade (so the slave PIC's lines reach the CPU).
+    hal::mouse::init();
 }
 
 /// Register the NIC receive-interrupt handler and unmask its PIC line.

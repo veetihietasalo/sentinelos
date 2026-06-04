@@ -32,6 +32,10 @@
 //!   [`keyboard::on_irq`], [`keyboard::poll_scancode`]): the IRQ1 handler drains
 //!   the scancode byte from port `0x60` into a lock-free ring the safe kernel
 //!   polls and decodes (no decoding lives in the TCB).
+//! - [`mouse`] — the PS/2 mouse (i8042 aux device) on IRQ12 ([`mouse::init`],
+//!   [`mouse::on_irq`], [`mouse::poll_event`]): the IRQ12 handler reassembles the
+//!   3-byte packet from port `0x60` and pushes a decoded `MouseEvent` into a
+//!   lock-free ring the safe kernel polls (cursor/window policy lives in `kernel`).
 //! - [`mm`] — memory management: the physical frame allocator, virtual page
 //!   mapping over Limine's paging, and the kernel heap behind a
 //!   `#[global_allocator]` ([`mm::init`], [`mm::LockedHeap`]).
@@ -82,6 +86,7 @@ pub mod idt;
 pub mod interrupts;
 pub mod keyboard;
 pub mod mm;
+pub mod mouse;
 pub mod pci;
 pub mod pic;
 pub mod pit;
