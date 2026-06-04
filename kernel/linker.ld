@@ -32,6 +32,21 @@ SECTIONS
         *(.rodata .rodata.*)
     } :rodata
 
+    /* ── GOT ──────────────────────────────────────────────────────────────
+     * Some library paths (notably `<[T]>::to_vec`, used by `String::from`)
+     * reference `memcpy` through the Global Offset Table. We build a fully
+     * static, non-PIE kernel, so lld resolves every GOT slot to an absolute
+     * address at LINK time — there are no runtime relocations to apply. We must
+     * therefore KEEP `.got`/`.got.plt` (not discard them): discarding them left
+     * the GOT at virtual address 0, so a GOT-indirect load read near-null and
+     * #PF'd (CR2≈0x18). Placed in the read-only segment since the resolved GOT
+     * never changes after link. */
+    .got ALIGN(4K) :
+    {
+        *(.got)
+        *(.got.plt)
+    } :rodata
+
     /* ── initialised data ─────────────────────────────────────────────── */
     .data ALIGN(4K) :
     {
@@ -65,7 +80,6 @@ SECTIONS
         *(.dynsym)
         *(.dynstr)
         *(.rela.*)
-        *(.got .got.*)
         *(.plt .plt.*)
         *(.interp)
     }

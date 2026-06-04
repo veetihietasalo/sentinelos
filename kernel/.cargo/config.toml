@@ -7,6 +7,16 @@ rustflags = [
     "-C", "link-arg=-Tlinker.ld",
     "-C", "link-arg=-no-pie",
     "-C", "relocation-model=static",
+    # The kernel is linked into the top 2 GiB (0xFFFFFFFF80000000); the "kernel"
+    # code model is the semantically-correct model for a higher-half kernel
+    # (direct sign-extended 32-bit symbol references). Some library paths still
+    # emit a GOT-indirect `memcpy` call (e.g. `<[T]>::to_vec`, used by
+    # `String::from`); those GOT slots are resolved to absolute addresses at LINK
+    # time by our non-PIE static link and are KEPT by `linker.ld` (see its `.got`
+    # section). Earlier the script discarded `.got`, leaving the GOT at address 0,
+    # so a GOT-indirect load read near-null and #PF'd (CR2≈0x18) the first time the
+    # shell allocated a `String`.
+    "-C", "code-model=kernel",
 ]
 
 [alias]

@@ -262,6 +262,14 @@ reached through the HHDM. Safe API: `alloc_frame()` / `dealloc_frame()` /
 `free_frames()`. Frame 0 and unaligned addresses are rejected, so a null-like
 physical address can never be returned. State lives behind a `SpinMutex` (§5e).
 
+**Live stats accessor (`mm::stats() -> MemStats`).** A purely-safe addition for
+the shell's `mem` command: it reads the boot-time frame total from a
+`static AtomicUsize` (`TOTAL_FRAMES`, stored once by `init` right after the free
+list is seeded), the live free count from `FRAME_ALLOCATOR.free_frames()`, and
+the heap size from the `HEAP_SIZE` constant. Reading an atomic and a spin-locked
+count is not an `unsafe` operation, so it adds **no** new `unsafe` op to the TCB
+(no new row below) — it only *reports* state the allocator already owns.
+
 | # | Location | Unsafe op | Why needed | Soundness argument | Verification |
 |---|----------|-----------|------------|--------------------|--------------|
 | M3 | `mm/frame.rs` · `FrameAllocator::init()` | `ptr::write((frame + hhdm) as *mut u64, next)` — store the next-pointer into each free frame | Build the intrusive free list without side metadata | `frame` is a 4 KiB-aligned address inside a USABLE region (so real, unowned RAM); Limine HHDM-maps all RAM, so `frame + hhdm` is a valid, writable, 8-byte-aligned virtual address; the frame is being placed on the list for the first time ⇒ unaliased. Frame 0 is skipped. Single-call, interrupts-armed, single-core. | Reasoned + QEMU |

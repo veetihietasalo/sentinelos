@@ -22,6 +22,7 @@ extern crate alloc;
 pub mod input;
 pub mod interrupts;
 pub mod memory;
+pub mod shell;
 
 /// Kernel entry point — called by `boot::_start` after serial initialisation.
 ///
@@ -95,12 +96,18 @@ pub fn kmain() -> ! {
 ///    - `Locked`: redraw the per-second clock and re-draw the gently pulsing
 ///      "press → to unlock" hint (driven by the tick counter).
 ///    - `Unlocking`: step the unlock animation by the elapsed ticks; when it
-///      completes, paint the desktop and enter `Desktop`.
-///    - `Desktop`: keep the top-bar clock ticking once per second.
+///      completes, paint the desktop **with the console panel**, initialise the
+///      shell, and enter `Desktop`.
+///    - `Desktop`: keep the top-bar clock ticking once per second, and drain
+///      keyboard events into the [`shell::Shell`] — printable keys echo into the
+///      console, Enter runs the command. The console is redrawn only when its
+///      content changed or the cursor-blink phase flipped, so idle ticks stay
+///      cheap.
 ///
 /// Diverging (`-> !`): the kernel never returns.
 fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
     use input::{KeyEvent, LockState, ScancodeDecoder};
+    use shell::Shell;
 
     let tick_hz = hal::pit::TICK_HZ;
     // Seconds elapsed at the previous clock redraw; "none drawn yet" so the first
@@ -115,24 +122,37 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
     let mut decoder = ScancodeDecoder::new();
     let mut state = LockState::Locked;
 
+    // The interactive shell — created (on the heap) the moment we reach the
+    // desktop, so its banner appears under the freshly-drawn console panel. While
+    // locked / unlocking it stays `None` and costs nothing.
+    let mut shell: Option<Shell> = None;
+
     loop {
         // Sleep until the next interrupt (a PIT tick or a keystroke).
         hal::cpu::halt();
 
-        // 1) Service all pending keyboard bytes through the safe decoder.
+        // 1) Service all pending keyboard bytes through the safe decoder. While
+        //    locked, the right-arrow (or Enter) starts the unlock; on the desktop
+        //    every decoded event is fed to the shell.
         while let Some(scancode) = hal::keyboard::poll_scancode() {
             if let Some(event) = decoder.feed(scancode) {
-                let is_unlock =
-                    matches!(event, KeyEvent::RightArrowPressed | KeyEvent::EnterPressed);
-                if is_unlock && state.accepts_unlock() {
-                    // Log via the fmt-arg-free helper (core::fmt int args fault on
-                    // this target — see hal::serial::print_labeled_*).
-                    hal::serial::print_line("[input] right-arrow -> unlocking");
-                    state = LockState::Unlocking {
-                        start_tick: hal::pit::ticks(),
-                    };
-                    // Force the first animation frame to draw on this pass.
-                    last_anim_p = -1;
+                if state.accepts_unlock() {
+                    let is_unlock =
+                        matches!(event, KeyEvent::RightArrowPressed | KeyEvent::EnterPressed);
+                    if is_unlock {
+                        // Log via the fmt-arg-free helper (core::fmt int args fault
+                        // on this target — see hal::serial::print_labeled_*).
+                        hal::serial::print_line("[input] right-arrow -> unlocking");
+                        state = LockState::Unlocking {
+                            start_tick: hal::pit::ticks(),
+                        };
+                        // Force the first animation frame to draw on this pass.
+                        last_anim_p = -1;
+                    }
+                } else if let (LockState::Desktop, Some(sh)) = (state, shell.as_mut()) {
+                    // On the desktop: type into the shell. Printable keys echo,
+                    // Enter runs the command; the redraw below paints the result.
+                    sh.on_key(event);
                 }
             }
         }
@@ -166,11 +186,18 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
             LockState::Unlocking { start_tick } => {
                 let elapsed = now.saturating_sub(start_tick);
                 if elapsed >= ui::UNLOCK_ANIM_TICKS {
-                    // Animation done → arrive at the desktop.
+                    // Animation done → arrive at the desktop. Paint the desktop
+                    // chrome, then bring up the shell and draw its console panel
+                    // on top, so unlock lands on a usable terminal.
+                    let mut sh = Shell::new();
                     if let Some(fb) = fb {
                         ui::draw_desktop(fb);
+                        // First console paint, with the caret shown.
+                        sh.render(fb);
                     }
+                    shell = Some(sh);
                     hal::serial::print_line("[input] unlock complete -> desktop");
+                    hal::serial::print_line("[shell] ready");
                     state = LockState::Desktop;
                     last_secs = u64::MAX; // force the desktop clock to redraw
                 } else {
@@ -194,6 +221,19 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
                     if let Some(fb) = fb {
                         let (h, m, s) = wall_clock(secs);
                         ui::draw_desktop_clock(fb, h, m, s);
+                    }
+                }
+
+                // Redraw the console only when its content actually changed (a
+                // keystroke or command output). `draw_console` repaints the whole
+                // glass panel — an expensive per-pixel pass under software
+                // rendering — so triggering it on a timer (e.g. a blinking caret)
+                // would repaint several times a second and visibly flicker. The
+                // caret is therefore drawn solid, and a redraw happens only on a
+                // content change.
+                if let (Some(fb), Some(sh)) = (fb, shell.as_mut()) {
+                    if sh.is_dirty() {
+                        sh.render(fb);
                     }
                 }
             }

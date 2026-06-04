@@ -25,6 +25,8 @@
 //! `kernel` crate stays `#![forbid(unsafe_code)]` — it only *declares* the
 //! global-allocator static (declaring a static is not `unsafe`).
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 mod addr;
 mod bootinfo;
 mod frame;
@@ -43,6 +45,43 @@ pub use paging::{ActivePageTable, MapError, PageFlags};
 /// Public so callers (and tests) can query [`FrameAllocator::free_frames`]; the
 /// heap maps its pages from this instance.
 pub static FRAME_ALLOCATOR: FrameAllocator = FrameAllocator::new();
+
+/// Total physical frames seeded onto the free list at boot, recorded by [`init`]
+/// before the heap mapping consumes any. Read live via [`stats`]; `0` until
+/// `init` has run. A plain `AtomicUsize` so it is read/written without `unsafe`
+/// and never tears.
+static TOTAL_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// A live snapshot of kernel memory usage, for the shell's `mem` command.
+///
+/// All three fields are read with no `unsafe`: `total_frames`/`free_frames`
+/// from the frame allocator (the latter behind its `SpinMutex`), and
+/// `heap_bytes` from the compile-time [`HEAP_SIZE`] constant. Returned by
+/// [`stats`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemStats {
+    /// Total 4 KiB frames the allocator was seeded with at boot.
+    pub total_frames: usize,
+    /// Frames currently on the free list (i.e. not yet handed out).
+    pub free_frames: usize,
+    /// Size of the kernel heap window, in bytes.
+    pub heap_bytes: usize,
+}
+
+/// A live snapshot of physical-frame and heap usage.
+///
+/// Safe to call any time after [`init`] has run (before that, `total_frames` and
+/// `free_frames` read as `0`). Cheap: one atomic load plus one short spin-lock to
+/// read the frame allocator's free count. Used by the kernel shell's `mem`
+/// command to print heap size and frames free/total.
+#[must_use]
+pub fn stats() -> MemStats {
+    MemStats {
+        total_frames: TOTAL_FRAMES.load(Ordering::Relaxed),
+        free_frames: FRAME_ALLOCATOR.free_frames(),
+        heap_bytes: HEAP_SIZE as usize,
+    }
+}
 
 /// Why [`init`] could not bring memory management up.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -97,6 +136,10 @@ pub fn init(allocator: &LockedHeap) -> Result<MemoryInfo, InitError> {
     if total_frames == 0 {
         return Err(InitError::NoUsableMemory);
     }
+    // Record the boot-time frame total so the shell's `mem` command can report
+    // "free / total" live (the free count drops as the heap mapping below and
+    // later allocations consume frames). Recorded before any heap mapping runs.
+    TOTAL_FRAMES.store(total_frames, Ordering::Relaxed);
 
     // 2. Map the heap window to fresh physical frames.
     let table = ActivePageTable::new(hhdm);
