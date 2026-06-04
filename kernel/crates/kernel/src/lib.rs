@@ -19,12 +19,14 @@
 // types available to the safe kernel logic.
 extern crate alloc;
 
+pub mod app;
 pub mod fs;
 pub mod input;
 pub mod interrupts;
 pub mod memory;
 pub mod net;
 pub mod shell;
+pub mod wm;
 
 /// Kernel entry point — called by `boot::_start` after serial initialisation.
 ///
@@ -119,7 +121,7 @@ pub fn kmain() -> ! {
 /// Diverging (`-> !`): the kernel never returns.
 fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
     use input::{KeyEvent, LockState, ScancodeDecoder};
-    use shell::Shell;
+    use wm::{WindowManager, WmAction};
 
     let tick_hz = hal::pit::TICK_HZ;
     // Seconds elapsed at the previous clock redraw; "none drawn yet" so the first
@@ -134,10 +136,10 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
     let mut decoder = ScancodeDecoder::new();
     let mut state = LockState::Locked;
 
-    // The interactive shell — created (on the heap) the moment we reach the
-    // desktop, so its banner appears under the freshly-drawn console panel. While
-    // locked / unlocking it stays `None` and costs nothing.
-    let mut shell: Option<Shell> = None;
+    // The window manager — created (on the heap) the moment we reach the desktop,
+    // seeded with one Terminal window so unlock still lands on a usable terminal.
+    // While locked / unlocking it stays `None` and costs nothing.
+    let mut wm: Option<WindowManager> = None;
 
     loop {
         // Sleep until the next interrupt (a PIT tick or a keystroke).
@@ -161,11 +163,16 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
                         // Force the first animation frame to draw on this pass.
                         last_anim_p = -1;
                     }
-                } else if let (LockState::Desktop, Some(sh)) = (state, shell.as_mut()) {
-                    // On the desktop: type into the shell. Printable keys echo,
-                    // Enter runs the command, and Up/Down recall history; the
-                    // redraw below paints the result.
-                    sh.on_key(event);
+                } else if let (LockState::Desktop, Some(manager)) = (state, wm.as_mut()) {
+                    // On the desktop: route the event through the window manager.
+                    // Tab cycles focus, Escape toggles the launcher, and any other
+                    // key goes to the launcher (if open) or the focused app. Paint
+                    // the result immediately so typing/cycling feels responsive.
+                    if manager.on_key(event) == WmAction::Redraw {
+                        if let Some(fb) = fb {
+                            manager.composite(fb);
+                        }
+                    }
                 }
             }
         }
@@ -200,17 +207,20 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
                 let elapsed = now.saturating_sub(start_tick);
                 if elapsed >= ui::UNLOCK_ANIM_TICKS {
                     // Animation done → arrive at the desktop. Paint the desktop
-                    // chrome, then bring up the shell and draw its console panel
-                    // on top, so unlock lands on a usable terminal.
-                    let mut sh = Shell::new();
+                    // chrome, then bring up the window manager seeded with one
+                    // Terminal window and composite it on top, so unlock lands on
+                    // a usable terminal (preserving today's UX).
+                    let (sw, sh_px) = fb.map_or((0, 0), |f| (f.width(), f.height()));
+                    let mut manager = WindowManager::new(sw, sh_px);
+                    manager.spawn(app::AppKind::Terminal);
                     if let Some(fb) = fb {
                         ui::draw_desktop(fb);
-                        // First console paint, with the caret shown.
-                        sh.render(fb);
+                        // First composite: paints the seeded Terminal window.
+                        manager.composite(fb);
                     }
-                    shell = Some(sh);
+                    wm = Some(manager);
                     hal::serial::print_line("[input] unlock complete -> desktop");
-                    hal::serial::print_line("[shell] ready");
+                    hal::serial::print_line("[wm] desktop ready");
                     state = LockState::Desktop;
                     last_secs = u64::MAX; // force the desktop clock to redraw
                 } else {
@@ -237,16 +247,16 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
                     }
                 }
 
-                // Redraw the console only when its content actually changed (a
-                // keystroke or command output). `draw_console` repaints the whole
-                // glass panel — an expensive per-pixel pass under software
-                // rendering — so triggering it on a timer (e.g. a blinking caret)
-                // would repaint several times a second and visibly flicker. The
-                // caret is therefore drawn solid, and a redraw happens only on a
-                // content change.
-                if let (Some(fb), Some(sh)) = (fb, shell.as_mut()) {
-                    if sh.is_dirty() {
-                        sh.render(fb);
+                // Drive the apps' periodic ticks (the System panel self-refreshes
+                // once a second; the Terminal blinks its caret), then composite —
+                // but only the damaged windows, and only when something is dirty,
+                // so idle ticks stay cheap (no full-screen repaint per frame).
+                if let Some(manager) = wm.as_mut() {
+                    let ticked = manager.tick(now) == WmAction::Redraw;
+                    if let Some(fb) = fb {
+                        if ticked || !manager.is_clean() {
+                            manager.composite(fb);
+                        }
                     }
                 }
             }

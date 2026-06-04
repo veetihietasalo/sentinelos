@@ -31,7 +31,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use ui::CursorStyle;
+use ui::{CursorStyle, Rect};
 
 use crate::fs::FileSystem;
 use crate::input::KeyEvent;
@@ -506,6 +506,39 @@ impl Shell {
     /// (capped) buffer and lets the panel show the newest lines.
     pub fn render(&mut self, fb: &hal::framebuffer::Framebuffer) {
         self.draw(fb, true);
+        self.dirty = false;
+    }
+
+    /// Render the console text grid into an arbitrary window content rectangle
+    /// `area`, with an explicit cursor visibility (so the WM can blink the caret
+    /// off the PIT). This is the **windowed** render path used by the `Terminal`
+    /// app: it draws *only* the console text (scrollback + input + cursor) into
+    /// `area` through [`ui::draw_console_in`] — the surrounding glass chrome is
+    /// drawn by the window manager via `ui::draw_window_chrome`, not here.
+    ///
+    /// Takes `&self` (it builds a small temporary borrowed `&[&str]` slice and
+    /// draws from it) so it can be called from `App::render`. It does **not**
+    /// touch the dirty flag; the WM owns damage bookkeeping and clears the flag
+    /// via [`Shell::clear_dirty`] once the frame is composited.
+    pub fn render_in(&self, fb: &hal::framebuffer::Framebuffer, area: Rect, cursor_visible: bool) {
+        let lines: Vec<&str> = self.scrollback.iter().map(String::as_str).collect();
+        ui::draw_console_in(
+            fb,
+            area,
+            &lines,
+            PROMPT,
+            &self.input,
+            cursor_visible,
+            CursorStyle::Block,
+        );
+    }
+
+    /// Clear the dirty flag after the WM has composited this shell's content.
+    ///
+    /// The windowed render path ([`render_in`](Self::render_in)) is `&self` and
+    /// therefore cannot clear `dirty` itself; the WM calls this once it has
+    /// repainted the window so the next idle tick won't redundantly re-composite.
+    pub fn clear_dirty(&mut self) {
         self.dirty = false;
     }
 
