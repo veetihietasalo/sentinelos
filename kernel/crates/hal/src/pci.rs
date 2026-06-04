@@ -17,6 +17,9 @@
 //!   matching a `(vendor, device)` id, returning a [`PciDevice`] handle.
 //! - [`PciDevice`] — a located device: its address, plus safe readers for the
 //!   BARs, the interrupt line, and command-register bits (bus-master enable).
+//! - [`list_devices`] — enumerate **all** functions on the bus into a
+//!   fixed-capacity [`PciDeviceList`] of [`PciDeviceInfo`] (location, id,
+//!   class/subclass, and a human name) for the shell's `devices` command.
 //!
 //! # Concurrency model
 //!
@@ -283,4 +286,254 @@ pub fn scan_for(target_vendor: u16, target_device: u16, max_bus: u8) -> Option<P
 #[must_use]
 pub fn class_code(dev: &PciDevice) -> u8 {
     ((read_config(dev.bus, dev.device, dev.function, OFF_CLASS) >> 24) & 0xFF) as u8
+}
+
+// ── Device enumeration (for the shell's `devices` command) ──────────────────
+//
+// `scan_for` answers "is *this* device present?". The `devices` command needs
+// the *whole* list, so the accessors below walk every bus/slot/function once and
+// collect a small fixed-capacity inventory. `hal` does not depend on `alloc`, so
+// the list is returned in a stack array ([`PciDeviceList`]) the kernel formats —
+// no heap, no `unsafe` beyond the already-documented config-read ports.
+
+/// Maximum number of PCI functions [`list_devices`] records. q35/QEMU exposes a
+/// handful; 32 is comfortably more than any board we boot and bounds the scan's
+/// memory. Devices past the limit are dropped (the count is still capped here).
+pub const MAX_DEVICES: usize = 32;
+
+/// A summary of one enumerated PCI function, for diagnostics / the `devices`
+/// command. Carries the location, the `(vendor, device)` id pair, the
+/// class/subclass/prog-IF bytes, and a best-effort human name for recognised
+/// devices (otherwise an empty name — the kernel falls back to the class).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciDeviceInfo {
+    /// Bus number the function sits on.
+    pub bus: u8,
+    /// Device (slot) number within the bus.
+    pub device: u8,
+    /// Function number within the device.
+    pub function: u8,
+    /// PCI vendor id (e.g. `0x8086` for Intel, `0x1234` for QEMU's stdvga).
+    pub vendor: u16,
+    /// PCI device id.
+    pub dev_id: u16,
+    /// Class code (high byte of the class word) — broad device category.
+    pub class: u8,
+    /// Subclass code (second byte) — finer category within the class.
+    pub subclass: u8,
+    /// Programming-interface byte (third byte) — register-level interface.
+    pub prog_if: u8,
+    /// Best-effort human name for a recognised `(vendor, device)`/class, or `""`.
+    pub name: &'static str,
+}
+
+/// A fixed-capacity list of enumerated PCI functions (no heap).
+///
+/// Returned by [`list_devices`]. Iterate the populated prefix with
+/// [`as_slice`](PciDeviceList::as_slice); [`len`](PciDeviceList::len) reports how
+/// many functions were found (capped at [`MAX_DEVICES`]).
+#[derive(Clone, Copy, Debug)]
+pub struct PciDeviceList {
+    devices: [PciDeviceInfo; MAX_DEVICES],
+    len: usize,
+}
+
+impl PciDeviceList {
+    /// Number of devices recorded (`<= MAX_DEVICES`).
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no PCI device was found at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The populated prefix of the device array.
+    #[must_use]
+    pub fn as_slice(&self) -> &[PciDeviceInfo] {
+        &self.devices[..self.len]
+    }
+}
+
+/// A best-effort human name for a `(vendor, device)` pair, or for a device class
+/// when the exact id is unknown.
+///
+/// Covers the handful of devices QEMU's q35 machine exposes (so the `devices`
+/// command reads meaningfully on our boot target); anything else falls back to a
+/// broad class name, and finally to `""` (the kernel then prints the raw class).
+fn human_name(vendor: u16, dev_id: u16, class: u8, subclass: u8) -> &'static str {
+    match (vendor, dev_id) {
+        (0x8086, 0x100E) => "Intel e1000 (82540EM) NIC",
+        (0x8086, 0x1237) => "Intel 440FX host bridge",
+        (0x8086, 0x7000) => "Intel PIIX3 ISA bridge",
+        (0x8086, 0x7010) => "Intel PIIX3 IDE",
+        (0x8086, 0x7113) => "Intel PIIX4 ACPI",
+        (0x8086, 0x2918) => "Intel ICH9 LPC bridge",
+        (0x8086, 0x2922) => "Intel ICH9 SATA (AHCI)",
+        (0x8086, 0x2930) => "Intel ICH9 SMBus",
+        (0x8086, 0x29C0) => "Intel Q35 MCH host bridge",
+        (0x1234, 0x1111) => "QEMU stdvga / bochs-display",
+        (0x1B36, 0x000D) => "QEMU XHCI USB controller",
+        (0x1AF4, _) => "VirtIO device",
+        _ => class_name(class, subclass),
+    }
+}
+
+/// A broad human name for a PCI device *class* (used when the exact id is not in
+/// the table above), or `""` for an unrecognised class.
+fn class_name(class: u8, subclass: u8) -> &'static str {
+    match (class, subclass) {
+        (0x00, _) => "legacy device",
+        (0x01, 0x01) => "IDE controller",
+        (0x01, 0x06) => "SATA controller",
+        (0x01, _) => "mass-storage controller",
+        (0x02, _) => "network controller",
+        (0x03, _) => "display controller",
+        (0x04, _) => "multimedia controller",
+        (0x06, 0x00) => "host bridge",
+        (0x06, 0x01) => "ISA bridge",
+        (0x06, 0x04) => "PCI-to-PCI bridge",
+        (0x06, _) => "bridge",
+        (0x0C, 0x03) => "USB controller",
+        (0x0C, 0x05) => "SMBus controller",
+        (0x0C, _) => "serial-bus controller",
+        _ => "",
+    }
+}
+
+/// Read the full class word (class/subclass/prog-IF) of a located function.
+///
+/// Returns `(class, subclass, prog_if)`. The class word at offset `0x08` is
+/// `[revision][prog-if][subclass][class]` low→high, so the three category bytes
+/// are bits 8..32.
+fn class_triplet(bus: u8, device: u8, function: u8) -> (u8, u8, u8) {
+    let word = read_config(bus, device, function, OFF_CLASS);
+    let class = ((word >> 24) & 0xFF) as u8;
+    let subclass = ((word >> 16) & 0xFF) as u8;
+    let prog_if = ((word >> 8) & 0xFF) as u8;
+    (class, subclass, prog_if)
+}
+
+/// Build the [`PciDeviceInfo`] for a function already known to be present.
+fn describe(bus: u8, device: u8, function: u8, vendor: u16, dev_id: u16) -> PciDeviceInfo {
+    let (class, subclass, prog_if) = class_triplet(bus, device, function);
+    PciDeviceInfo {
+        bus,
+        device,
+        function,
+        vendor,
+        dev_id,
+        class,
+        subclass,
+        prog_if,
+        name: human_name(vendor, dev_id, class, subclass),
+    }
+}
+
+/// Enumerate every PCI function on buses `0..=max_bus` into a fixed-capacity list.
+///
+/// This is the **safe** general accessor behind the shell's `devices` command: it
+/// probes each device slot's function 0, descends into the remaining functions of
+/// multi-function devices, and records up to [`MAX_DEVICES`] entries (location,
+/// id, class/subclass/prog-IF, and a human name). The scan is identical in spirit
+/// to [`scan_for`] but collects the whole inventory instead of stopping at the
+/// first match. On QEMU's q35 a small `max_bus` (0 or 1) covers everything.
+#[must_use]
+pub fn list_devices(max_bus: u8) -> PciDeviceList {
+    let empty = PciDeviceInfo {
+        bus: 0,
+        device: 0,
+        function: 0,
+        vendor: 0,
+        dev_id: 0,
+        class: 0,
+        subclass: 0,
+        prog_if: 0,
+        name: "",
+    };
+    let mut list = PciDeviceList {
+        devices: [empty; MAX_DEVICES],
+        len: 0,
+    };
+
+    'scan: for bus in 0..=max_bus {
+        for device in 0u8..32 {
+            // Probe function 0 first; if absent, the whole device slot is empty.
+            let Some((vendor, dev_id)) = probe(bus, device, 0) else {
+                continue;
+            };
+            if list.len >= MAX_DEVICES {
+                break 'scan;
+            }
+            list.devices[list.len] = describe(bus, device, 0, vendor, dev_id);
+            list.len += 1;
+
+            // If multi-function, record the remaining present functions too.
+            if is_multifunction(bus, device) {
+                for function in 1u8..8 {
+                    if let Some((vendor, dev_id)) = probe(bus, device, function) {
+                        if list.len >= MAX_DEVICES {
+                            break 'scan;
+                        }
+                        list.devices[list.len] = describe(bus, device, function, vendor, dev_id);
+                        list.len += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_address_sets_enable_and_packs_fields() {
+        // bus 1, device 3, function 2, offset 0x10 (BAR0).
+        let addr = config_address(1, 3, 2, 0x10);
+        assert_eq!(addr & CONFIG_ENABLE, CONFIG_ENABLE);
+        assert_eq!((addr >> 16) & 0xFF, 1); // bus
+        assert_eq!((addr >> 11) & 0x1F, 3); // device
+        assert_eq!((addr >> 8) & 0x07, 2); // function
+        assert_eq!(addr & 0xFC, 0x10); // dword-aligned offset
+    }
+
+    #[test]
+    fn known_device_names_resolve() {
+        assert_eq!(
+            human_name(0x8086, 0x100E, 0x02, 0x00),
+            "Intel e1000 (82540EM) NIC"
+        );
+        // Unknown id but known class → class fallback.
+        assert_eq!(human_name(0xDEAD, 0xBEEF, 0x03, 0x00), "display controller");
+        // Unknown id and unknown class → empty.
+        assert_eq!(human_name(0xDEAD, 0xBEEF, 0xFF, 0xFF), "");
+    }
+
+    #[test]
+    fn empty_device_list_reports_empty() {
+        let list = PciDeviceList {
+            devices: [PciDeviceInfo {
+                bus: 0,
+                device: 0,
+                function: 0,
+                vendor: 0,
+                dev_id: 0,
+                class: 0,
+                subclass: 0,
+                prog_if: 0,
+                name: "",
+            }; MAX_DEVICES],
+            len: 0,
+        };
+        assert!(list.is_empty());
+        assert_eq!(list.len(), 0);
+        assert!(list.as_slice().is_empty());
+    }
 }
