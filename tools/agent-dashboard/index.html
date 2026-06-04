@@ -95,6 +95,14 @@
     margin-bottom: 10px;
   }
 
+  .section-label .hint {
+    font-weight: 400;
+    letter-spacing: 0.02em;
+    text-transform: none;
+    color: var(--line);
+    margin-left: 8px;
+  }
+
   .pipeline {
     display: flex;
     align-items: center;
@@ -141,6 +149,7 @@
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
     gap: 12px;
+    align-items: start;
   }
 
   .card {
@@ -156,6 +165,12 @@
   .card[data-status="done"]     { border-left-color: var(--done); }
   .card[data-status="blocked"]  { border-left-color: var(--blocked); }
   .card[data-status="idle"]     { border-left-color: var(--idle); }
+
+  /* the clickable top region (toggles the flow) */
+  .card-top {
+    cursor: pointer;
+    user-select: none;
+  }
 
   .card-header {
     display: flex;
@@ -224,6 +239,23 @@
   .dot.blocked { background: var(--blocked); }
   .dot.idle    { background: var(--idle); }
 
+  /* chevron + event count, pushed to the right of the status row */
+  .flow-count {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+  }
+
+  .chev {
+    font-size: 10px;
+    color: var(--dim);
+    transition: transform 0.15s;
+    user-select: none;
+  }
+
+  .card.expanded .chev { transform: rotate(90deg); }
+
   .task-line {
     font-family: var(--mono);
     font-size: 11px;
@@ -237,6 +269,86 @@
 
   .task-line.active-task {
     color: var(--text);
+  }
+
+  /* ── Output flow (expandable) ── */
+  .card-flow {
+    display: none;
+    margin-top: 12px;
+    border-top: 1px dashed var(--line);
+    padding-top: 10px;
+  }
+
+  .card.expanded .card-flow { display: block; }
+
+  .flow-label {
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--dim);
+    margin-bottom: 10px;
+  }
+
+  .flow-list {
+    display: flex;
+    flex-direction: column;
+    border-left: 1px solid var(--line);
+    margin-left: 3px;
+  }
+
+  .flow-entry {
+    position: relative;
+    padding: 5px 0 5px 16px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    line-height: 1.45;
+    color: var(--dim);
+    word-break: break-word;
+  }
+
+  .flow-entry::before {
+    content: '';
+    position: absolute;
+    left: -3.5px;
+    top: 9px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--line);
+    box-shadow: 0 0 0 2px var(--panel);
+  }
+
+  .flow-entry.working::before { background: var(--working); }
+  .flow-entry.done::before    { background: var(--done); }
+  .flow-entry.blocked::before { background: var(--blocked); }
+  .flow-entry.idle::before    { background: var(--idle); }
+  .flow-entry.log::before     { background: var(--dim); }
+
+  .flow-entry.latest { color: var(--text); }
+  .flow-entry.latest::before { box-shadow: 0 0 0 2px var(--panel), 0 0 6px currentColor; }
+
+  .flow-ts {
+    color: var(--dim);
+    margin-right: 8px;
+    opacity: 0.85;
+  }
+
+  .flow-verb {
+    font-weight: 600;
+    margin-right: 6px;
+  }
+
+  .flow-verb.working { color: var(--working); }
+  .flow-verb.done    { color: var(--done); }
+  .flow-verb.blocked { color: var(--blocked); }
+  .flow-verb.idle    { color: var(--idle); }
+  .flow-verb.log     { color: var(--dim); }
+
+  .flow-empty {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--dim);
+    padding-left: 4px;
   }
 
   /* ── Footer ── */
@@ -269,27 +381,27 @@
 <body>
 
 <script>
-// Fallback inline data — exact copy of status.json
+// Fallback inline data — used only when fetch() fails (e.g. opened via file://).
 const FALLBACK_DATA = {
   "project": "SentinelOS",
-  "updated": "2026-06-03",
+  "updated": "2026-06-04",
   "pipeline": ["spec","architect","implement","verify","test","review"],
-  "activeStage": "architect",
+  "activeStage": "implement",
   "agents": [
-    {"name":"kernel-architect","role":"Subsystem design & framekernel decomposition","model":"opus","status":"done","task":"Sub-project #2 decomposed; #2a interrupts spec written"},
-    {"name":"hal-specialist","role":"The tiny unsafe HAL/arch TCB","model":"opus","status":"done","task":"GDT/TSS/IST + IDT + ISR stubs built (stable); registration API exposed"},
-    {"name":"kernel-engineer","role":"Safe-Rust kernel implementation","model":"sonnet","status":"done","task":"Exception handlers (#BP/#PF/#DF/#GP) registered; init wired into kmain"},
-    {"name":"verification-engineer","role":"Miri + Kani + fuzz CI gate","model":"opus","status":"idle","task":"—"},
-    {"name":"test-engineer","role":"QEMU boot/integration tests","model":"sonnet","status":"done","task":"Deterministic boot test; full banner (fixed a real triple-fault)"},
-    {"name":"toolchain-engineer","role":"Limine, linker, target, xtask, CI","model":"sonnet","status":"done","task":"kernel CI workflow (build+clippy+fmt+boot-test)"},
-    {"name":"kernel-reviewer","role":"Adversarial review / human-gate","model":"opus","status":"done","task":"Sub-project #1: APPROVED"},
-    {"name":"memory-engineer","role":"Frame allocator, VMM policy, kernel heap","model":"opus","status":"idle","task":"—"},
-    {"name":"driver-engineer","role":"Device drivers over HAL MMIO/port APIs","model":"sonnet","status":"idle","task":"—"},
-    {"name":"scheduler-engineer","role":"Run queue, sync primitives, SMP","model":"opus","status":"idle","task":"—"},
-    {"name":"security-engineer","role":"sentinel-core integration, capabilities, sandbox","model":"opus","status":"idle","task":"—"},
-    {"name":"userland-engineer","role":"Syscall ABI, ELF loader, process lifecycle","model":"sonnet","status":"idle","task":"—"},
-    {"name":"ui-engineer","role":"Compositor, widgets, display — security-ops aesthetic","model":"sonnet","status":"idle","task":"—"},
-    {"name":"docs-writer","role":"Design docs, ADRs, API refs, dev-setup","model":"sonnet","status":"idle","task":"—"}
+    {"name":"kernel-architect","role":"Subsystem design & framekernel decomposition","model":"opus","status":"done","task":"Windowed-desktop design spec written","history":[]},
+    {"name":"hal-specialist","role":"The tiny unsafe HAL/arch TCB","model":"opus","status":"done","task":"Memory: frame allocator + paging + heap + global allocator","history":[]},
+    {"name":"kernel-engineer","role":"Safe-Rust kernel implementation","model":"sonnet","status":"working","task":"Deepening the shell: history + filesystem + more commands","history":[]},
+    {"name":"verification-engineer","role":"Miri + Kani + fuzz CI gate","model":"opus","status":"idle","task":"—","history":[]},
+    {"name":"test-engineer","role":"QEMU boot/integration tests","model":"sonnet","status":"done","task":"Deterministic boot test; full banner","history":[]},
+    {"name":"toolchain-engineer","role":"Limine, linker, target, xtask, CI","model":"sonnet","status":"working","task":"Building the SentinelOS demo video (Remotion + real QEMU frames)","history":[]},
+    {"name":"kernel-reviewer","role":"Adversarial review / human-gate","model":"opus","status":"done","task":"Sub-project #1: APPROVED","history":[]},
+    {"name":"memory-engineer","role":"Frame allocator, VMM policy, kernel heap","model":"opus","status":"idle","task":"—","history":[]},
+    {"name":"driver-engineer","role":"Device drivers over HAL MMIO/port APIs","model":"sonnet","status":"working","task":"Networking: NIC driver + minimal stack","history":[]},
+    {"name":"scheduler-engineer","role":"Run queue, sync primitives, SMP","model":"opus","status":"idle","task":"—","history":[]},
+    {"name":"security-engineer","role":"sentinel-core integration, capabilities, sandbox","model":"opus","status":"idle","task":"—","history":[]},
+    {"name":"userland-engineer","role":"Syscall ABI, ELF loader, process lifecycle","model":"sonnet","status":"idle","task":"—","history":[]},
+    {"name":"ui-engineer","role":"Compositor, widgets, display — security-ops aesthetic","model":"sonnet","status":"done","task":"Terminal console renderer ready","history":[]},
+    {"name":"docs-writer","role":"Design docs, ADRs, API refs, dev-setup","model":"sonnet","status":"idle","task":"—","history":[]}
   ]
 };
 </script>
@@ -313,7 +425,7 @@ const FALLBACK_DATA = {
 </div>
 
 <div class="agents-section">
-  <div class="section-label">Agents</div>
+  <div class="section-label">Agents <span class="hint">— click a card to expand its output flow</span></div>
   <div class="grid" id="grid"></div>
 </div>
 
@@ -323,6 +435,9 @@ const FALLBACK_DATA = {
 </footer>
 
 <script>
+// agent names whose flow is expanded — persisted across the 5s re-renders
+const expanded = new Set();
+
 function renderPipeline(stages, activeStage) {
   const el = document.getElementById('pipeline');
   el.innerHTML = '';
@@ -340,36 +455,84 @@ function renderPipeline(stages, activeStage) {
   });
 }
 
+function fmtTime(ts) {
+  // "2026-06-04T10:42:13" → "10:42:13"; tolerate empty/date-only
+  if (!ts) return '';
+  const parts = String(ts).split('T');
+  return (parts[1] || parts[0] || '').slice(0, 8);
+}
+
+function flowHtml(a) {
+  let hist = Array.isArray(a.history) ? a.history.slice() : [];
+  if (hist.length === 0) {
+    // synthesize a "current" entry so an expanded card is never empty
+    hist = [{ ts: a._ts || '', kind: 'status', status: a.status, task: a.task }];
+  }
+  const rows = hist.map((e, i) => {
+    const isLog = e.kind === 'log';
+    const cls = isLog ? 'log' : (e.status || 'idle');
+    const verb = isLog ? 'log' : (e.status || '');
+    const latest = (i === hist.length - 1) ? ' latest' : '';
+    const ts = fmtTime(e.ts);
+    return `<div class="flow-entry ${cls}${latest}">`
+      + (ts ? `<span class="flow-ts">${escHtml(ts)}</span>` : '')
+      + `<span class="flow-verb ${cls}">${escHtml(verb)}</span>`
+      + `<span class="flow-task">${escHtml(e.task || '—')}</span>`
+      + `</div>`;
+  }).join('');
+  const n = hist.length;
+  return `<div class="card-flow">
+    <div class="flow-label">output flow</div>
+    <div class="flow-list">${rows}</div>
+  </div>`;
+}
+
 function renderAgents(agents) {
   const grid = document.getElementById('grid');
   grid.innerHTML = '';
   agents.forEach(a => {
     const card = document.createElement('div');
-    card.className = 'card';
+    card.className = 'card' + (expanded.has(a.name) ? ' expanded' : '');
     card.dataset.status = a.status;
+    card.dataset.name = a.name;
 
     const isActive = a.status === 'working';
     const statusClass = a.status;
+    const histLen = Array.isArray(a.history) ? a.history.length : 0;
+    const countLabel = histLen > 0 ? `${histLen} event${histLen === 1 ? '' : 's'}` : 'flow';
 
     card.innerHTML = `
-      <div class="card-header">
-        <span class="agent-name">${escHtml(a.name)}</span>
-        <span class="model-badge ${a.model.toLowerCase()}">${a.model.toUpperCase()}</span>
+      <div class="card-top">
+        <div class="card-header">
+          <span class="agent-name">${escHtml(a.name)}</span>
+          <span class="model-badge ${a.model.toLowerCase()}">${a.model.toUpperCase()}</span>
+        </div>
+        <div class="agent-role">${escHtml(a.role)}</div>
+        <div class="status-row">
+          <div class="dot ${statusClass}"></div>
+          <span class="status-label ${statusClass}">${escHtml(a.status)}</span>
+          <span class="flow-count">${escHtml(countLabel)}</span>
+          <span class="chev">▸</span>
+        </div>
+        <div class="task-line${isActive ? ' active-task' : ''}">${escHtml(a.task)}</div>
       </div>
-      <div class="agent-role">${escHtml(a.role)}</div>
-      <div class="status-row">
-        <div class="dot ${statusClass}"></div>
-        <span class="status-label ${statusClass}">${escHtml(a.status)}</span>
-      </div>
-      <div class="task-line${isActive ? ' active-task' : ''}">${escHtml(a.task)}</div>
+      ${flowHtml(a)}
     `;
+
+    card.querySelector('.card-top').addEventListener('click', () => {
+      if (expanded.has(a.name)) expanded.delete(a.name);
+      else expanded.add(a.name);
+      card.classList.toggle('expanded');
+    });
+
     grid.appendChild(card);
   });
 }
 
-function renderMeta(project, updated) {
+function renderMeta(project, updated, updatedAt) {
+  const stamp = updatedAt ? updatedAt.replace('T', ' ') : updated;
   document.getElementById('meta-line').textContent =
-    `project: ${project}  |  updated: ${updated}`;
+    `project: ${project}  |  updated: ${stamp || '—'}`;
 }
 
 function escHtml(s) {
@@ -379,7 +542,7 @@ function escHtml(s) {
 }
 
 function render(data) {
-  renderMeta(data.project, data.updated);
+  renderMeta(data.project, data.updated, data.updatedAt);
   renderPipeline(data.pipeline, data.activeStage);
   renderAgents(data.agents);
 }
@@ -398,7 +561,6 @@ async function load() {
     render(data);
     pulseTick();
   } catch (_) {
-    // Fallback to inline data (file:// or fetch error)
     render(FALLBACK_DATA);
   }
 }

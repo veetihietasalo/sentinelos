@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Atomically update one agent's status in status.json."""
+"""Atomically update one agent's status in status.json, appending to its activity flow.
+
+Usage:
+  set-status <agent-name> <idle|working|blocked|done> [task words...]
+  set-status <agent-name> log <message words...>     # append a flow line WITHOUT changing status
+
+Every call appends a timestamped entry to the agent's `history` array (capped),
+which the dashboard renders as that agent's expandable "output flow".
+"""
 
 import json
 import os
@@ -8,18 +16,20 @@ import tempfile
 import datetime
 
 VALID_STATUSES = {"idle", "working", "blocked", "done"}
+HISTORY_CAP = 40  # keep the most recent N flow entries per agent
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: set-status <agent-name> <idle|working|blocked|done> [task words...]", file=sys.stderr)
+        print("Usage: set-status <agent-name> <idle|working|blocked|done|log> [words...]", file=sys.stderr)
         sys.exit(1)
 
     agent_name = sys.argv[1]
-    status = sys.argv[2]
-    task = " ".join(sys.argv[3:]) if len(sys.argv) > 3 else "—"
+    verb = sys.argv[2]
+    text = " ".join(sys.argv[3:]) if len(sys.argv) > 3 else "—"
 
-    if status not in VALID_STATUSES:
-        print(f"Error: status must be one of {sorted(VALID_STATUSES)}, got: {repr(status)}", file=sys.stderr)
+    is_log = (verb == "log")
+    if not is_log and verb not in VALID_STATUSES:
+        print(f"Error: status must be one of {sorted(VALID_STATUSES)} or 'log', got: {repr(verb)}", file=sys.stderr)
         sys.exit(1)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -28,18 +38,31 @@ def main():
     with open(status_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    now = datetime.datetime.now()
+    ts = now.isoformat(timespec="seconds")
+
     agents = data.get("agents", [])
     for agent in agents:
         if agent.get("name") == agent_name:
-            agent["status"] = status
-            agent["task"] = task
+            history = agent.get("history") or []
+            if is_log:
+                # a flow note that does not change the agent's current status
+                history.append({"ts": ts, "kind": "log", "status": agent.get("status", "idle"), "task": text})
+            else:
+                agent["status"] = verb
+                agent["task"] = text
+                history.append({"ts": ts, "kind": "status", "status": verb, "task": text})
+            if len(history) > HISTORY_CAP:
+                history = history[-HISTORY_CAP:]
+            agent["history"] = history
             break
     else:
         known = [a.get("name") for a in agents]
         print(f"Error: unknown agent {repr(agent_name)}. Known agents: {known}", file=sys.stderr)
         sys.exit(1)
 
-    data["updated"] = datetime.date.today().isoformat()
+    data["updated"] = now.date().isoformat()
+    data["updatedAt"] = ts
 
     tmp_fd, tmp_path = tempfile.mkstemp(dir=script_dir, suffix=".json.tmp")
     try:
@@ -51,7 +74,7 @@ def main():
         os.unlink(tmp_path)
         raise
 
-    print(f"[dashboard] {agent_name} → {status}: {task}")
+    print(f"[dashboard] {agent_name} → {'log' if is_log else verb}: {text}")
 
 if __name__ == "__main__":
     main()
