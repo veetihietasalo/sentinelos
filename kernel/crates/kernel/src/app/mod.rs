@@ -62,8 +62,9 @@ pub trait App {
 /// The catalogue of app types the launcher can spawn a new window from.
 ///
 /// Each variant maps to a concrete `App` constructor in [`spawn`]. Adding an app
-/// is a matter of adding a variant here, a label in [`AppKind::label`], and a
-/// match arm in [`spawn`].
+/// is a matter of adding a variant here, listing it in [`AppKind::ALL`], a label
+/// in [`AppKind::label`], and a match arm in [`spawn`] — the launcher renders
+/// straight from `ALL`, so the window manager needs no change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppKind {
     /// The interactive shell (the [`terminal::Terminal`] app).
@@ -73,6 +74,11 @@ pub enum AppKind {
 }
 
 impl AppKind {
+    /// Every app kind the launcher offers, in menu order. The launcher renders its
+    /// menu straight from this list, so adding an app here (plus a `label`/`spawn`
+    /// arm) makes it appear with **no** change to the window manager.
+    pub const ALL: &'static [AppKind] = &[AppKind::Terminal, AppKind::System];
+
     /// The human-readable label shown for this app in the launcher menu.
     #[must_use]
     pub const fn label(self) -> &'static str {

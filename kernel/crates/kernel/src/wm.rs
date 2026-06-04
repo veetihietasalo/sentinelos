@@ -170,12 +170,22 @@ enum LauncherItem {
     CloseFocused,
 }
 
-/// The fixed launcher menu (catalogue + the close action).
-const LAUNCHER_ITEMS: [LauncherItem; 3] = [
-    LauncherItem::Spawn(AppKind::Terminal),
-    LauncherItem::Spawn(AppKind::System),
-    LauncherItem::CloseFocused,
-];
+/// The launcher menu length: every spawnable app kind ([`AppKind::ALL`]) plus the
+/// trailing "Close focused" action. Data-driven, so adding an app to `AppKind::ALL`
+/// extends the launcher with no change here.
+const fn launcher_len() -> usize {
+    AppKind::ALL.len() + 1
+}
+
+/// The launcher menu item at `idx`: the spawnable app kinds in order, then the
+/// "Close focused" action as the final item.
+const fn launcher_item(idx: usize) -> LauncherItem {
+    if idx < AppKind::ALL.len() {
+        LauncherItem::Spawn(AppKind::ALL[idx])
+    } else {
+        LauncherItem::CloseFocused
+    }
+}
 
 impl Launcher {
     /// A closed launcher with the first item highlighted.
@@ -464,19 +474,19 @@ impl WindowManager {
         match event {
             KeyEvent::UpArrowPressed => {
                 if self.launcher.selected == 0 {
-                    self.launcher.selected = LAUNCHER_ITEMS.len() - 1;
+                    self.launcher.selected = launcher_len() - 1;
                 } else {
                     self.launcher.selected -= 1;
                 }
                 WmAction::Redraw
             }
             KeyEvent::DownArrowPressed => {
-                self.launcher.selected = (self.launcher.selected + 1) % LAUNCHER_ITEMS.len();
+                self.launcher.selected = (self.launcher.selected + 1) % launcher_len();
                 WmAction::Redraw
             }
             KeyEvent::Char(c) if c.is_ascii_digit() && c != '0' => {
                 let idx = (c as usize) - ('1' as usize);
-                if idx < LAUNCHER_ITEMS.len() {
+                if idx < launcher_len() {
                     self.launcher.selected = idx;
                     self.activate_launcher_item();
                     WmAction::Redraw
@@ -495,7 +505,7 @@ impl WindowManager {
     /// Act on the highlighted launcher item (spawn or close), then close the
     /// launcher so the freshly-laid-out desktop shows.
     fn activate_launcher_item(&mut self) {
-        let item = LAUNCHER_ITEMS[self.launcher.selected];
+        let item = launcher_item(self.launcher.selected);
         // Close the overlay first so its region is damaged for repaint.
         self.launcher.open = false;
         for w in &mut self.windows {
@@ -617,7 +627,7 @@ impl WindowManager {
         let card_w = (w * 34 / 100).clamp(220, w.saturating_sub(40));
         let row_h = ui::font::GLYPH_SIZE * 2 + 10;
         let chrome = WindowChrome::cyber_dusk();
-        let card_h = (chrome.titlebar_h + chrome.border + row_h * (LAUNCHER_ITEMS.len() + 1))
+        let card_h = (chrome.titlebar_h + chrome.border + row_h * (launcher_len() + 1))
             .min(h.saturating_sub(40));
         let card_x = (w.saturating_sub(card_w)) / 2;
         let card_y = (h.saturating_sub(card_h)) / 2;
@@ -638,7 +648,8 @@ impl WindowManager {
 
         // Each menu item, numbered "1 Terminal", with the selection in cyan.
         let mut buf = [0u8; 2];
-        for (i, item) in LAUNCHER_ITEMS.iter().enumerate() {
+        for i in 0..launcher_len() {
+            let item = launcher_item(i);
             let selected = i == self.launcher.selected;
             let color = if selected { accent } else { primary };
             // Number prefix "N ".
