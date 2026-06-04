@@ -93,7 +93,9 @@ pub fn map_mmio(phys: PhysAddr, len: usize) -> Result<VirtAddr, MmioError> {
     // region is covered by whole 4 KiB pages.
     let phys_base = phys.frame_floor().as_u64();
     let offset_in_page = phys.as_u64() - phys_base;
-    let phys_end = PhysAddr::new(phys.as_u64() + len as u64).frame_ceil().as_u64();
+    let phys_end = PhysAddr::new(phys.as_u64() + len as u64)
+        .frame_ceil()
+        .as_u64();
     let span = (phys_end - phys_base) as usize;
     let pages = span / PAGE_SIZE as usize;
 

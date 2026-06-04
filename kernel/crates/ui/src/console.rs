@@ -298,7 +298,15 @@ pub fn draw_console(
             .saturating_sub(titlebar_h() - CONTENT_INSET)
             .saturating_sub(PANEL_PAD - CONTENT_INSET),
     };
-    draw_console_in(fb, area, scrollback, prompt, input, cursor_visible, cursor_style);
+    draw_console_in(
+        fb,
+        area,
+        scrollback,
+        prompt,
+        input,
+        cursor_visible,
+        cursor_style,
+    );
 }
 
 /// Render the console text grid into an arbitrary **content rectangle** `area`.
@@ -410,18 +418,42 @@ fn draw_panel_chrome(fb: &Framebuffer, gradient: &Gradient, geom: &ConsoleGeomet
 
     // Body glass fill (dark, fairly opaque) + bright 1px border.
     raster::fill_rounded_rect_alpha(
-        fb, gradient, x, y, pw, ph, PANEL_RADIUS, GLASS_DARK, GLASS_FILL_ALPHA,
+        fb,
+        gradient,
+        x,
+        y,
+        pw,
+        ph,
+        PANEL_RADIUS,
+        GLASS_DARK,
+        GLASS_FILL_ALPHA,
     );
 
     // Title-bar strip across the top, sharing the panel's top corner radius.
     let tb_h = titlebar_h();
     raster::fill_rounded_rect_alpha(
-        fb, gradient, x, y, pw, tb_h, PANEL_RADIUS, TITLEBAR_TINT, TITLEBAR_ALPHA,
+        fb,
+        gradient,
+        x,
+        y,
+        pw,
+        tb_h,
+        PANEL_RADIUS,
+        TITLEBAR_TINT,
+        TITLEBAR_ALPHA,
     );
 
     // Bright border + inner top highlight for the glossy glass edge.
     raster::stroke_rounded_rect_alpha(
-        fb, gradient, x, y, pw, ph, PANEL_RADIUS, GLASS_WHITE, GLASS_BORDER_ALPHA,
+        fb,
+        gradient,
+        x,
+        y,
+        pw,
+        ph,
+        PANEL_RADIUS,
+        GLASS_WHITE,
+        GLASS_BORDER_ALPHA,
     );
     raster::inner_top_highlight(
         fb,
@@ -448,7 +480,14 @@ fn draw_panel_chrome(fb: &Framebuffer, gradient: &Gradient, geom: &ConsoleGeomet
     let title_w = font::text_width(CONSOLE_TITLE, TITLE_SCALE);
     let title_x = x + (pw.saturating_sub(title_w)) / 2;
     let title_y = y + (tb_h.saturating_sub(font::GLYPH_SIZE * TITLE_SCALE)) / 2;
-    font::draw_text(fb, title_x, title_y, CONSOLE_TITLE, TITLE_SCALE, ACCENT_CYAN.pack(fb));
+    font::draw_text(
+        fb,
+        title_x,
+        title_y,
+        CONSOLE_TITLE,
+        TITLE_SCALE,
+        ACCENT_CYAN.pack(fb),
+    );
 }
 
 /// Draw a small filled disc of radius `r` centred at `(cx, cy)` in a solid
@@ -475,7 +514,14 @@ fn fill_dot(fb: &Framebuffer, cx: usize, cy: usize, r: usize, color: Rgb) {
 ///
 /// Unlike [`font::draw_text`] (which uses proportional 1px gaps), this advances
 /// by exactly one cell per glyph so the console is a true monospace grid.
-fn draw_cells(fb: &Framebuffer, x0: usize, y: usize, max_cols: usize, text: &str, color: Rgb) -> usize {
+fn draw_cells(
+    fb: &Framebuffer,
+    x0: usize,
+    y: usize,
+    max_cols: usize,
+    text: &str,
+    color: Rgb,
+) -> usize {
     let packed = color.pack(fb);
     let mut col = 0usize;
     // Stack buffer to encode each char into a 1-char `&str` for the font plotter,

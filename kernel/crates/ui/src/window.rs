@@ -26,9 +26,9 @@
 
 use hal::framebuffer::Framebuffer;
 
+use crate::font;
 use crate::raster::{self, Gradient, Rgb};
 use crate::{backdrop_at, GRAD_END, GRAD_MID, GRAD_START};
-use crate::font;
 
 // --- Geometry -----------------------------------------------------------------
 
@@ -177,9 +177,7 @@ impl Default for WindowChrome {
 pub fn content_rect(bounds: Rect, chrome: &WindowChrome) -> Rect {
     let x = bounds.x + chrome.border;
     let y = bounds.y + chrome.titlebar_h;
-    let w = bounds
-        .w
-        .saturating_sub(chrome.border.saturating_mul(2));
+    let w = bounds.w.saturating_sub(chrome.border.saturating_mul(2));
     let h = bounds
         .h
         .saturating_sub(chrome.titlebar_h)
@@ -312,19 +310,33 @@ pub fn draw_window_chrome_with(
 
     // 2) Body glass fill (dark, fairly opaque).
     raster::fill_rounded_rect_alpha(
-        fb, &gradient, x, y, pw, ph, radius, GLASS_DARK, GLASS_FILL_ALPHA,
+        fb,
+        &gradient,
+        x,
+        y,
+        pw,
+        ph,
+        radius,
+        GLASS_DARK,
+        GLASS_FILL_ALPHA,
     );
 
     // 3) Title-bar strip across the top, sharing the panel's top corner radius.
     let tb_h = chrome.titlebar_h.min(ph);
     raster::fill_rounded_rect_alpha(
-        fb, &gradient, x, y, pw, tb_h, radius, TITLEBAR_TINT, titlebar_a,
+        fb,
+        &gradient,
+        x,
+        y,
+        pw,
+        tb_h,
+        radius,
+        TITLEBAR_TINT,
+        titlebar_a,
     );
 
     // 4) Bright border + inner top highlight for the glossy glass edge.
-    raster::stroke_rounded_rect_alpha(
-        fb, &gradient, x, y, pw, ph, radius, GLASS_WHITE, border_a,
-    );
+    raster::stroke_rounded_rect_alpha(fb, &gradient, x, y, pw, ph, radius, GLASS_WHITE, border_a);
     raster::inner_top_highlight(
         fb,
         &gradient,

@@ -478,7 +478,10 @@ mod tests {
     #[test]
     fn validate_rejects_bad_count() {
         assert_eq!(validate(0, 0, 0), Err(AtaError::OutOfRange));
-        assert_eq!(validate(0, 257, 257 * SECTOR_SIZE), Err(AtaError::OutOfRange));
+        assert_eq!(
+            validate(0, 257, 257 * SECTOR_SIZE),
+            Err(AtaError::OutOfRange)
+        );
     }
 
     /// `validate` rejects a buffer whose length is not `count * 512`.

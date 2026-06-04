@@ -95,13 +95,7 @@ pub struct Gradient {
 impl Gradient {
     /// A three-stop gradient sized to the framebuffer.
     #[must_use]
-    pub const fn three_stop(
-        start: Rgb,
-        mid: Rgb,
-        end: Rgb,
-        width: usize,
-        height: usize,
-    ) -> Self {
+    pub const fn three_stop(start: Rgb, mid: Rgb, end: Rgb, width: usize, height: usize) -> Self {
         Self {
             start,
             mid,
@@ -357,8 +351,7 @@ pub fn drop_shadow_rounded_rect(
             }
             if let Some(k) = covered {
                 // Alpha fades from `peak_alpha` (innermost) toward 0 (outermost).
-                let alpha =
-                    (peak_alpha as usize * (rings - k) / rings) as u8;
+                let alpha = (peak_alpha as usize * (rings - k) / rings) as u8;
                 if alpha == 0 {
                     continue;
                 }
