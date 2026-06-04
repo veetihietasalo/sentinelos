@@ -152,6 +152,37 @@ fn bounding_box(a: Rect, b: Rect) -> Rect {
     Rect::new(x, y, right - x, bottom - y)
 }
 
+/// Left-button bit in a PS/2 mouse packet's button bitmap (mirrors
+/// `hal::mouse::BTN_LEFT`; kept local so the WM does not depend on the TCB's
+/// bit layout beyond this one well-known flag).
+const MOUSE_BTN_LEFT: u8 = 1 << 0;
+
+/// Add a signed delta to an unsigned coordinate, clamped to `[0, max]` (saturating
+/// at both ends). Used to advance the cursor without wrapping past a screen edge.
+#[inline]
+fn clamp_add(value: usize, delta: i16, max: usize) -> usize {
+    let signed = value as i64 + i64::from(delta);
+    if signed < 0 {
+        0
+    } else {
+        (signed as usize).min(max)
+    }
+}
+
+/// Build a [`Rect`] from a `(x, y, w, h)` tuple (as returned by
+/// [`ui::cursor_rect`]).
+#[inline]
+fn rect_from_tuple(t: (usize, usize, usize, usize)) -> Rect {
+    Rect::new(t.0, t.1, t.2, t.3)
+}
+
+/// `true` if the point `(px, py)` lies inside `rect` (left/top inclusive,
+/// right/bottom exclusive).
+#[inline]
+fn point_in_rect(px: usize, py: usize, rect: Rect) -> bool {
+    px >= rect.x && py >= rect.y && px < rect.right() && py < rect.bottom()
+}
+
 /// The keyboard launcher: a glass overlay listing the apps that can be spawned,
 /// plus a "Close focused" action, navigated by digit-select + Enter.
 pub struct Launcher {
@@ -236,6 +267,15 @@ pub struct WindowManager {
     /// Cached framebuffer dimensions, so tiling is computed once on entry.
     screen_w: usize,
     screen_h: usize,
+    /// Cursor hotspot position in absolute framebuffer pixels, clamped to the
+    /// screen. The compositor draws the arrow sprite here **last**, on top of
+    /// every window, each composite.
+    cursor_x: usize,
+    cursor_y: usize,
+    /// The button bitmap from the previous mouse packet, so
+    /// [`on_mouse`](Self::on_mouse) can edge-detect a left-button *press* (0 → 1)
+    /// for click-to-focus rather than re-firing every packet while it is held.
+    prev_buttons: u8,
 }
 
 impl WindowManager {
@@ -254,6 +294,11 @@ impl WindowManager {
             next_id: 1,
             screen_w,
             screen_h,
+            // Start the cursor at the screen centre so it is visible the moment
+            // the desktop appears, regardless of the first mouse delta's sign.
+            cursor_x: screen_w / 2,
+            cursor_y: screen_h / 2,
+            prev_buttons: 0,
         }
     }
 
@@ -420,6 +465,108 @@ impl WindowManager {
         for w in &mut self.windows {
             w.needs_redraw = true;
         }
+    }
+
+    /// Route one mouse event: move the cursor and, on a left-button *press*,
+    /// click-to-focus the topmost window under the pointer.
+    ///
+    /// `dx`/`dy` are the relative deltas from a PS/2 packet (right is +x; PS/2
+    /// reports **up** as +y, so we negate `dy` for screen-down). `buttons` is the
+    /// packet's button bitmap (bit 0 = left).
+    ///
+    /// Behaviour:
+    /// 1. **Move.** The cursor hotspot is advanced by `(dx, -dy)` and clamped to
+    ///    the screen. Both the old and new cursor rectangles are pushed to the
+    ///    damage queue so the compositor repaints the desktop under the cursor's
+    ///    former spot and then draws the arrow at its new spot on top.
+    /// 2. **Click-to-focus.** On the rising edge of the left button (it was up in
+    ///    the previous packet and is down now), hit-test the topmost window whose
+    ///    bounds contain the cursor hotspot and focus + raise it. A click on empty
+    ///    desktop changes nothing.
+    ///
+    /// Always returns [`WmAction::Redraw`] when the cursor moved or focus changed
+    /// (so the idle loop composites); [`WmAction::None`] only when a zero-delta,
+    /// no-edge packet did nothing.
+    pub fn on_mouse(&mut self, dx: i16, dy: i16, buttons: u8) -> WmAction {
+        let mut changed = false;
+
+        // 1) Move the cursor, clamped to the screen. PS/2 y is up-positive; flip it
+        //    so pushing the mouse forward moves the cursor up the screen.
+        let old = ui::cursor_rect(self.cursor_x, self.cursor_y);
+        let new_x = clamp_add(self.cursor_x, dx, self.screen_w.saturating_sub(1));
+        let new_y = clamp_add(self.cursor_y, -dy, self.screen_h.saturating_sub(1));
+        if new_x != self.cursor_x || new_y != self.cursor_y {
+            let old_rect = rect_from_tuple(old);
+            self.cursor_x = new_x;
+            self.cursor_y = new_y;
+            let new_rect = rect_from_tuple(ui::cursor_rect(self.cursor_x, self.cursor_y));
+            // Damage the old position (so the desktop/window under it repaints) and
+            // the new position (so the arrow is composited there).
+            self.damage.push(old_rect);
+            self.damage.push(new_rect);
+            // The compositor erases damage to the backdrop only where no window
+            // covers it, and otherwise repaints whole windows flagged
+            // `needs_redraw`. So any window the cursor's *old* footprint overlapped
+            // must be flagged, or the arrow would ghost where it sat over a window.
+            for w in &mut self.windows {
+                if rects_touch(w.bounds, old_rect) {
+                    w.needs_redraw = true;
+                }
+            }
+            changed = true;
+        }
+
+        // 2) Click-to-focus on the left-button rising edge.
+        let left_now = buttons & MOUSE_BTN_LEFT != 0;
+        let left_was = self.prev_buttons & MOUSE_BTN_LEFT != 0;
+        self.prev_buttons = buttons;
+        if left_now && !left_was && self.focus_window_at(self.cursor_x, self.cursor_y) {
+            changed = true;
+        }
+
+        if changed {
+            WmAction::Redraw
+        } else {
+            WmAction::None
+        }
+    }
+
+    /// Hit-test the topmost window whose bounds contain `(px, py)` and, if found
+    /// and not already focused, focus + raise it (click-to-focus). Returns `true`
+    /// when focus actually changed (so the caller composites).
+    ///
+    /// "Topmost" means the front of the z-order: we scan `z_order` from front
+    /// (last) to back (first) and pick the first window covering the point. The
+    /// previously- and newly-focused windows are damaged so their focus accents
+    /// repaint.
+    fn focus_window_at(&mut self, px: usize, py: usize) -> bool {
+        // Find the front-most window under the point.
+        let mut hit: Option<usize> = None;
+        for &wi in self.z_order.iter().rev() {
+            if point_in_rect(px, py, self.windows[wi].bounds) {
+                hit = Some(wi);
+                break;
+            }
+        }
+        let Some(target) = hit else {
+            return false; // clicked empty desktop
+        };
+        if self.focused == Some(target) {
+            return false; // already focused — nothing to do
+        }
+        let old = self.focused;
+        self.focused = Some(target);
+        // Raise the clicked window to the front of the z-order (it draws last).
+        self.z_order.retain(|&i| i != target);
+        self.z_order.push(target);
+        // Repaint the two windows whose focus accent changed.
+        if let Some(o) = old {
+            self.windows[o].needs_redraw = true;
+            self.damage.push(self.windows[o].bounds);
+        }
+        self.windows[target].needs_redraw = true;
+        self.damage.push(self.windows[target].bounds);
+        true
     }
 
     /// Route one decoded key event. Global WM hotkeys are handled here; anything
@@ -612,6 +759,12 @@ impl WindowManager {
         if self.launcher.open {
             self.draw_launcher(fb);
         }
+
+        // 5) The mouse cursor is drawn LAST, so the arrow always sits on top of
+        //    the windows and the launcher. Its previous position was damaged in
+        //    `on_mouse`, so the desktop/window under it has already been repainted
+        //    above; here we just stamp the arrow at the current hotspot.
+        ui::draw_cursor(fb, self.cursor_x, self.cursor_y);
     }
 
     /// Draw the launcher glass overlay: a centred Cyber Dusk card listing the
@@ -683,6 +836,13 @@ impl WindowManager {
     #[must_use]
     pub fn launcher_open(&self) -> bool {
         self.launcher.open
+    }
+
+    /// The cursor hotspot position in absolute framebuffer pixels (for tests /
+    /// introspection).
+    #[must_use]
+    pub fn cursor_pos(&self) -> (usize, usize) {
+        (self.cursor_x, self.cursor_y)
     }
 }
 
@@ -811,5 +971,84 @@ mod tests {
         q.push(Rect::new(100, 100, 10, 10));
         q.coalesce();
         assert_eq!(q.drain().len(), 2);
+    }
+
+    /// A fresh WM starts the cursor at the screen centre.
+    #[test]
+    fn cursor_starts_centred() {
+        let wm = WindowManager::new(1024, 768);
+        assert_eq!(wm.cursor_pos(), (512, 384));
+    }
+
+    /// Mouse motion moves the cursor; PS/2 up-positive y maps to screen-up.
+    #[test]
+    fn mouse_motion_moves_cursor_and_flips_y() {
+        let mut wm = WindowManager::new(1024, 768);
+        // dx=+10 right, dy=+10 (PS/2 up) → screen y decreases by 10.
+        assert_eq!(wm.on_mouse(10, 10, 0), WmAction::Redraw);
+        assert_eq!(wm.cursor_pos(), (522, 374));
+    }
+
+    /// The cursor clamps to the screen edges and never wraps.
+    #[test]
+    fn cursor_clamps_to_screen() {
+        let mut wm = WindowManager::new(1024, 768);
+        // Slam left and down far past the edges.
+        wm.on_mouse(-10_000, 10_000, 0); // far left, far up (PS/2 +y) ...
+        assert_eq!(wm.cursor_pos(), (0, 0));
+        wm.on_mouse(10_000, -10_000, 0); // ... far right, far down
+        assert_eq!(wm.cursor_pos(), (1023, 767));
+    }
+
+    /// A zero-delta, no-button packet does nothing (no needless composite).
+    #[test]
+    fn idle_mouse_packet_is_noop() {
+        let mut wm = WindowManager::new(1024, 768);
+        assert_eq!(wm.on_mouse(0, 0, 0), WmAction::None);
+    }
+
+    /// A left-click over a window focuses + raises it (click-to-focus); only the
+    /// rising edge fires (a held button does not re-focus).
+    #[test]
+    fn left_click_focuses_window_under_cursor() {
+        let mut wm = WindowManager::new(1024, 768);
+        let a = wm.spawn(AppKind::Terminal).unwrap();
+        let b = wm.spawn(AppKind::System).unwrap();
+        // Two tiles side by side; `b` is focused (spawned last).
+        assert_eq!(wm.focused_id(), Some(b));
+        // Move the cursor into window `a`'s tile and left-click.
+        let a_bounds = wm.windows[0].bounds; // storage order = spawn order
+        let target_x = a_bounds.x + a_bounds.w / 2;
+        let target_y = a_bounds.y + a_bounds.h / 2;
+        let (cx, cy) = wm.cursor_pos();
+        // Drive the cursor there with a single delta, then press left.
+        let dx = target_x as i16 - cx as i16;
+        // PS/2 y is up-positive, so to move DOWN to target_y we send negative dy.
+        let dy = -(target_y as i16 - cy as i16);
+        wm.on_mouse(dx, dy, 0); // move, no button
+        assert_eq!(wm.on_mouse(0, 0, MOUSE_BTN_LEFT), WmAction::Redraw); // press
+        assert_eq!(wm.focused_id(), Some(a));
+        // Holding the button (same bitmap) must not re-fire focus logic.
+        assert_eq!(wm.on_mouse(0, 0, MOUSE_BTN_LEFT), WmAction::None);
+    }
+
+    /// A left-click on empty desktop (no window under the cursor) changes nothing.
+    #[test]
+    fn left_click_on_empty_desktop_is_noop() {
+        let mut wm = WindowManager::new(1024, 768);
+        wm.spawn(AppKind::Terminal);
+        // Park the cursor at the very top-left (status bar region, above tiles).
+        wm.on_mouse(-10_000, 10_000, 0);
+        let before = wm.focused_id();
+        assert_eq!(wm.on_mouse(0, 0, MOUSE_BTN_LEFT), WmAction::None);
+        assert_eq!(wm.focused_id(), before);
+    }
+
+    /// `clamp_add` saturates at both ends and never wraps.
+    #[test]
+    fn clamp_add_saturates() {
+        assert_eq!(clamp_add(5, -10, 100), 0);
+        assert_eq!(clamp_add(95, 20, 100), 100);
+        assert_eq!(clamp_add(50, 7, 100), 57);
     }
 }

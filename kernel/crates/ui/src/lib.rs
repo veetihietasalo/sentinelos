@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod console;
+pub mod cursor;
 pub mod font;
 pub mod raster;
 pub mod window;
@@ -29,6 +30,7 @@ pub use console::{
     console_cols, console_geometry, console_geometry_in, console_rows, draw_console,
     draw_console_in, ConsoleGeometry, CursorStyle,
 };
+pub use cursor::{cursor_rect, draw_cursor, CURSOR_H, CURSOR_W};
 pub use window::{clear_rect, content_rect, draw_window_chrome, Rect, WindowChrome};
 
 use hal::framebuffer::Framebuffer;

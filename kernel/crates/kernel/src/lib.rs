@@ -96,11 +96,11 @@ pub fn kmain() -> ! {
     idle_loop(framebuffer.as_ref())
 }
 
-/// The kernel idle loop: park on `hlt`, service keyboard input, and run the
-/// lock-screen state machine to its desktop.
+/// The kernel idle loop: park on `hlt`, service keyboard + mouse input, and run
+/// the lock-screen state machine to its desktop.
 ///
 /// `hlt` halts the core until the next interrupt — the PIT wakes us ~100×/s, and
-/// any keystroke (IRQ1) wakes us too. On each wake we:
+/// any keystroke (IRQ1) or mouse packet (IRQ12) wakes us too. On each wake we:
 ///
 /// 1. **Drain & decode keyboard input.** Pull every raw scancode byte the IRQ1
 ///    handler queued ([`hal::keyboard::poll_scancode`]) and feed it through the
@@ -173,6 +173,26 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
                             manager.composite(fb);
                         }
                     }
+                }
+            }
+        }
+
+        // 1b) Service all pending MOUSE packets the IRQ12 handler queued. Only the
+        //     desktop cares about the pointer: each decoded packet moves the cursor
+        //     (the WM clamps + damages it) and a left-click hit-tests for
+        //     click-to-focus. We composite once after draining the batch so a burst
+        //     of motion packets coalesces into a single repaint. The privileged
+        //     port read lives in `hal::mouse`; everything here is safe policy.
+        if let (LockState::Desktop, Some(manager)) = (state, wm.as_mut()) {
+            let mut moved = false;
+            while let Some(ev) = hal::mouse::poll_event() {
+                if manager.on_mouse(ev.dx, ev.dy, ev.buttons) == WmAction::Redraw {
+                    moved = true;
+                }
+            }
+            if moved {
+                if let Some(fb) = fb {
+                    manager.composite(fb);
                 }
             }
         }
