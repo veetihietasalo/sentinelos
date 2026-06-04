@@ -33,18 +33,20 @@ mod frame;
 mod heap;
 mod paging;
 // `sync` is the project's only sanctioned interior-mutability primitive
-// (`SpinMutex`). It is published so safe kernel subsystems that need shared global
-// state (e.g. `kernel::security::audit`'s global log) can reuse it rather than
-// inventing their own. This exposes the *existing* type only — no new code, no new
-// `unsafe`, no new TCB surface; `sync.rs`'s `unsafe` is already documented in
-// `kernel/docs/hal-tcb.md` (§5e).
-pub mod sync;
+// (`SpinMutex`). It stays a *private* module; its types are re-exported at the
+// `mm` level (below) so safe kernel subsystems that need shared global state
+// (e.g. `kernel::security::audit`'s global log) can reuse it rather than inventing
+// their own — mirroring how `addr`'s types are re-exported. This exposes the
+// *existing* types only — no new code, no new `unsafe`, no new TCB surface;
+// `sync.rs`'s `unsafe` is already documented in `kernel/docs/hal-tcb.md` (§5e).
+mod sync;
 
 pub use addr::{PhysAddr, VirtAddr, PAGE_SIZE};
 pub use bootinfo::{hhdm_offset, usable_regions, UsableRegion};
 pub use frame::FrameAllocator;
 pub use heap::{LockedHeap, HEAP_SIZE, HEAP_START};
 pub use paging::{ActivePageTable, MapError, PageFlags};
+pub use sync::{SpinGuard, SpinMutex};
 
 // `DmaFrame`, `MmioError`, and `map_mmio` are defined below in this module and
 // are part of the public `hal::mm` API consumed by device drivers (the NIC).

@@ -836,11 +836,19 @@ const AUDIT_VIEW_LIMIT: usize = 16;
 
 /// Emit a filesystem-mutation audit record for a shell-driven `fs` op.
 ///
-/// Spec §9.3 resolution: for the seed we emit at the *shell* wrapper, where the
-/// principal is unambiguously [`Principal::Shell`](crate::security::audit::Principal::Shell)
-/// (clean layering; `fs.rs` stays unaware of `security`). When a non-shell caller
-/// (an agent/process) appears, the emit moves into `fs.rs` with the principal
-/// passed *in* by the caller, never assumed. Called only on a successful mutation.
+/// Spec §9.3 resolution: for the seed we emit at the *shell* wrapper, but stamp
+/// the principal as
+/// [`Principal::FileSystem`](crate::security::audit::Principal::FileSystem) — the
+/// filesystem is the actor that performed the mutation, so attributing the record
+/// to it is the defensible choice (clean layering is preserved because `fs.rs`
+/// stays unaware of `security`). When a non-shell caller (an agent/process)
+/// appears, the emit moves into `fs.rs` with the principal passed *in* by the
+/// caller, never assumed. Called only on a successful mutation.
+///
+/// Note: a successful fs shell command therefore intentionally emits **two**
+/// records — a `Shell`/`Command` record from `execute` (which logs every command
+/// uniformly) plus this `FileSystem`/`Fs*` record describing the mutation it
+/// produced. They share the same boot and chain, distinguished by principal.
 fn audit_fs(action: crate::security::audit::Action, target: &str, summary: &str) {
     crate::security::audit::append(
         crate::security::audit::Principal::FileSystem,

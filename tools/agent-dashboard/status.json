@@ -116,7 +116,27 @@
       "role": "Adversarial review / human-gate",
       "model": "opus",
       "status": "done",
-      "task": "Sub-project #1: APPROVED"
+      "task": "Audit-log SEED review: APPROVED WITH NOTES (no blockers; flagged forensic-erase-on-tamper + no host-test CI gate)",
+      "history": [
+        {
+          "ts": "2026-06-04T14:47:53",
+          "kind": "status",
+          "status": "working",
+          "task": "Adversarial review of audit-log SEED (0266d2b)"
+        },
+        {
+          "ts": "2026-06-04T14:49:53",
+          "kind": "status",
+          "status": "working",
+          "task": "Adversarial review of audit-log SEED (0266d2b)"
+        },
+        {
+          "ts": "2026-06-04T14:53:56",
+          "kind": "status",
+          "status": "done",
+          "task": "Audit-log SEED review: APPROVED WITH NOTES (no blockers; flagged forensic-erase-on-tamper + no host-test CI gate)"
+        }
+      ]
     },
     {
       "name": "memory-engineer",
@@ -143,8 +163,8 @@
       "name": "security-engineer",
       "role": "sentinel-core integration, capabilities, sandbox",
       "model": "opus",
-      "status": "working",
-      "task": "Implementing security/{sha256,audit,mod}.rs + emit sites + audit shell cmd",
+      "status": "done",
+      "task": "Addressed 5 audit-log review notes: evidence preservation on tamper, head_hash+version load checks, shell doc fix, version byte, narrowed HAL surface",
       "history": [
         {
           "ts": "2026-06-04T14:28:22",
@@ -163,6 +183,24 @@
           "kind": "status",
           "status": "working",
           "task": "Implementing security/{sha256,audit,mod}.rs + emit sites + audit shell cmd"
+        },
+        {
+          "ts": "2026-06-04T14:57:38",
+          "kind": "status",
+          "status": "working",
+          "task": "Fast-follow on audit-log seed: addressing 5 reviewer findings"
+        },
+        {
+          "ts": "2026-06-04T14:59:40",
+          "kind": "status",
+          "status": "working",
+          "task": "Fast-follow audit-log review notes (5 findings)"
+        },
+        {
+          "ts": "2026-06-04T15:04:22",
+          "kind": "status",
+          "status": "done",
+          "task": "Addressed 5 audit-log review notes: evidence preservation on tamper, head_hash+version load checks, shell doc fix, version byte, narrowed HAL surface"
         }
       ]
     },
@@ -188,5 +226,5 @@
       "task": "\u2014"
     }
   ],
-  "updatedAt": "2026-06-04T14:31:38"
+  "updatedAt": "2026-06-04T15:04:22"
 }

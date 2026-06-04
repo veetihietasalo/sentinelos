@@ -4,7 +4,7 @@
 //! tamper-evident" direction. It carries the crate's `#![forbid(unsafe_code)]`
 //! and adds **no** new `unsafe` and **no** new TCB surface: every privileged
 //! primitive it needs (ATA block I/O, the PIT tick counter, the sanctioned
-//! [`SpinMutex`](hal::mm::sync::SpinMutex)) is already wrapped by the `hal` TCB
+//! [`SpinMutex`](hal::mm::SpinMutex)) is already wrapped by the `hal` TCB
 //! and reached through its **safe** surface. This is the framekernel thesis
 //! working as designed (spec §5.1).
 //!

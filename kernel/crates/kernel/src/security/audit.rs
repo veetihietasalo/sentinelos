@@ -13,7 +13,7 @@
 //! new `unsafe` and grows the TCB by not one line (spec §5.1). All disk access is
 //! delegated to the safe [`hal::ata`] block API, the timestamp to
 //! [`hal::pit::ticks`], and shared global state lives behind the project's only
-//! sanctioned interior-mutability primitive, [`hal::mm::sync::SpinMutex`].
+//! sanctioned interior-mutability primitive, [`hal::mm::SpinMutex`].
 //!
 //! # What "append-only" does and does not mean (honest framing)
 //!
@@ -48,7 +48,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use hal::mm::sync::SpinMutex;
+use hal::mm::SpinMutex;
 
 use super::sha256;
 
@@ -253,7 +253,8 @@ pub struct AuditLog {
     /// Records in append order; index 0 is genesis. Never edited or removed.
     records: Vec<AuditRecord>,
     /// The chain head: the `entry_hash` of the last record, or [`GENESIS_HASH`]
-    /// when empty. A fast integrity anchor written to the superblock.
+    /// when empty. A fast integrity anchor written to the superblock and
+    /// re-checked against the decoded records on the next load (`disk::load`).
     head_hash: [u8; 32],
     /// The next sequence number to assign (== `records.len()` as a `u64`).
     next_seq: Seq,
@@ -282,12 +283,23 @@ impl AuditLog {
     ///
     /// 1. Probe the primary-master disk.
     /// 2. A disk holding a **valid** SentinelOS log image → load it and re-verify
-    ///    the chain. A passing chain → restore those records. A *failed* chain or
-    ///    bad CRC → start empty **and** record an [`Action::SecurityEvent`] noting
-    ///    the break (honesty: report, don't hide — spec §5.4).
+    ///    the chain. A passing chain → restore those records (persistent).
     /// 3. A disk that is blank/unformatted in the log region → start an empty
     ///    persistent log (the first append will write the superblock).
     /// 4. No disk → an empty in-RAM log (boot never fails for lack of a disk).
+    ///
+    /// # Tamper/corruption → preserve the suspect image (forensics)
+    ///
+    /// A *failed* chain (tamper evidence) or a `Corrupt` load outcome
+    /// (CRC/length/format/structure failure) means the on-disk bytes are
+    /// untrustworthy *and* possible evidence. In that case `boot` does **not**
+    /// start a fresh persistent log — that would `save()` over the suspect region
+    /// and destroy the evidence. Instead it returns an empty, **non-persistent**
+    /// in-RAM log (so no subsequent append ever calls `save()` and clobbers the
+    /// suspect bytes) carrying a single in-RAM [`Action::SecurityEvent`] recording
+    /// the detection, and emits a clear serial warning. The suspect image stays on
+    /// disk for offline analysis until an operator deliberately re-seeds it
+    /// (honesty: report and *preserve*, don't hide — spec §5.4).
     #[must_use]
     pub fn boot() -> Self {
         match disk::probe() {
@@ -295,19 +307,14 @@ impl AuditLog {
                 disk::LoadOutcome::Loaded(records) => {
                     let log = Self::from_records(records, true);
                     if let Err(e) = log.verify_chain() {
-                        // A loaded-but-broken chain: do not trust it. Start empty
-                        // and record the break as its own first event.
+                        // A loaded-but-broken chain is tamper evidence: do NOT
+                        // trust it and do NOT overwrite the suspect on-disk bytes.
                         hal::serial::write_str("[audit] WARNING: on-disk chain broke at seq ");
                         hal::serial::write_dec(e.at_seq);
-                        hal::serial::write_str("; starting fresh log\n");
-                        let mut fresh = Self::from_records(Vec::new(), true);
-                        fresh.append(
-                            Principal::Kernel,
-                            Action::SecurityEvent,
-                            "audit-log",
-                            "on-disk chain verification failed on load",
+                        hal::serial::write_str("\n");
+                        return Self::preserving_in_ram_log(
+                            "on-disk chain verification failed on load (suspect image preserved)",
                         );
-                        return fresh;
                     }
                     hal::serial::write_str("[audit] loaded log from disk (");
                     hal::serial::write_dec(log.records.len() as u64);
@@ -319,18 +326,11 @@ impl AuditLog {
                     Self::from_records(Vec::new(), true)
                 }
                 disk::LoadOutcome::Corrupt => {
-                    // CRC/format failure (accidental corruption) — report and reset.
-                    hal::serial::write_str(
-                        "[audit] WARNING: on-disk log corrupt (CRC/format); starting fresh\n",
-                    );
-                    let mut fresh = Self::from_records(Vec::new(), true);
-                    fresh.append(
-                        Principal::Kernel,
-                        Action::SecurityEvent,
-                        "audit-log",
-                        "on-disk log failed CRC/format check on load",
-                    );
-                    fresh
+                    // CRC/length/format/structure failure — the bytes are
+                    // untrustworthy AND possible evidence; preserve them.
+                    Self::preserving_in_ram_log(
+                        "on-disk log failed CRC/format check on load (suspect image preserved)",
+                    )
                 }
             },
             None => {
@@ -338,6 +338,28 @@ impl AuditLog {
                 Self::from_records(Vec::new(), false)
             }
         }
+    }
+
+    /// Build the empty, **non-persistent** in-RAM log used when tamper or
+    /// corruption is detected on load (see [`AuditLog::boot`]). Because it is
+    /// non-persistent, no later [`append`] will `save()` and clobber the suspect
+    /// on-disk region. Emits the standard preservation warning, then records the
+    /// detection `summary` as the session's first (in-RAM only) security event.
+    fn preserving_in_ram_log(summary: &str) -> Self {
+        hal::serial::write_str(
+            "[audit] WARNING: on-disk log tamper/corruption detected; \
+             preserving suspect image, running in-RAM only\n",
+        );
+        // `persistent: false` is the load-bearing choice here — every append on
+        // this session stays in RAM and never writes back over the evidence.
+        let mut session = Self::from_records(Vec::new(), false);
+        session.append(
+            Principal::Kernel,
+            Action::SecurityEvent,
+            "audit-log",
+            summary,
+        );
+        session
     }
 
     /// Build a log from already-decoded `records`, recomputing the head hash and
@@ -467,7 +489,7 @@ impl Default for AuditLog {
 // ── kernel-global instance (spec §6.3 resolution) ──────────────────────────────
 
 /// The single kernel-global audit log, behind the project's sanctioned
-/// interior-mutability primitive ([`hal::mm::sync::SpinMutex`]).
+/// interior-mutability primitive ([`hal::mm::SpinMutex`]).
 ///
 /// `SpinMutex::new` and `AuditLog::new` are both `const`, so this is
 /// const-constructible without a lazy init. It starts empty + non-persistent;
@@ -550,6 +572,21 @@ mod disk {
 
     /// The 8-byte magic identifying a SentinelOS audit-log image (`"SNTLLOG1"`).
     const MAGIC: &[u8; 8] = b"SNTLLOG1";
+
+    /// Current on-disk superblock **format version** (spec §12), written at offset
+    /// `[48]` and validated on load. Reserved now so the format can evolve
+    /// (rotation/compaction, a signed head, an extended superblock) in a
+    /// forward-compatible way: a future reader can branch on this byte. The on-disk
+    /// format is *unreleased*, so there is no migration — an image carrying any
+    /// other version (including the all-zero of a pre-version image) is treated as
+    /// [`LoadOutcome::Empty`] and re-seeded, the graceful path (it avoids raising a
+    /// false tamper alarm for what is only a format bump). Offsets `[0..48)` are
+    /// unchanged, so magic/len/crc/head_hash still decode identically.
+    const FORMAT_VERSION: u8 = 1;
+
+    /// Superblock byte offset of the [`FORMAT_VERSION`] field (in the previously
+    /// reserved `[48..512)` region; `[49]` stays reserved for future flags).
+    const VERSION_OFF: usize = 48;
 
     /// Fixed starting LBA of the audit-log superblock — the 8 MiB midpoint of the
     /// 16 MiB (32768-sector) image. Chosen to sit far above `kernel::fs`'s region
@@ -730,10 +767,29 @@ mod disk {
             return LoadOutcome::Empty;
         }
 
+        // Format-version gate (spec §12). An image written by a *different* format
+        // version (including the all-zero of a pre-version image) is not corrupt —
+        // it is just a layout this build does not understand — so re-seed it
+        // gracefully rather than raising a false tamper alarm.
+        if sb[VERSION_OFF] != FORMAT_VERSION {
+            return LoadOutcome::Empty;
+        }
+
         let payload_len = read_u32(&sb[8..12]) as usize;
         let payload_crc = read_u32(&sb[12..16]);
+        // The stored chain head (`head_hash`) is a cheap integrity anchor: after
+        // decoding we re-check it against the records' actual head. Snapshot it now
+        // while the superblock buffer is in scope.
+        let mut stored_head = [0u8; 32];
+        stored_head.copy_from_slice(&sb[16..48]);
         if payload_len == 0 {
-            return LoadOutcome::Empty;
+            // No payload: the only consistent head is GENESIS. A non-genesis stored
+            // head over an empty payload is a corrupt/forged superblock.
+            return if stored_head == super::GENESIS_HASH {
+                LoadOutcome::Empty
+            } else {
+                LoadOutcome::Corrupt
+            };
         }
         if payload_len > MAX_PAYLOAD {
             return LoadOutcome::Corrupt;
@@ -770,7 +826,21 @@ mod disk {
         }
 
         match deserialise_records(payload) {
-            Some(records) => LoadOutcome::Loaded(records),
+            Some(records) => {
+                // Cheap pre-check against the superblock's stored chain head: the
+                // last decoded record's `entry_hash` (or GENESIS for an empty log)
+                // must match the head written at save time. A mismatch means the
+                // payload and its anchor disagree — treat it as corruption (which
+                // the caller's `boot` then handles by preserving the suspect image,
+                // not overwriting it). This makes the previously write-only
+                // `head_hash` field meaningful without a full chain re-walk here
+                // (the caller still does `verify_chain` on the loaded records).
+                let actual_head = records.last().map_or(super::GENESIS_HASH, |r| r.entry_hash);
+                if actual_head != stored_head {
+                    return LoadOutcome::Corrupt;
+                }
+                LoadOutcome::Loaded(records)
+            }
             None => LoadOutcome::Corrupt,
         }
     }
@@ -779,7 +849,8 @@ mod disk {
     /// payload after it) to the primary ATA disk. Returns `Err(())` on any disk
     /// error or if the image would exceed the disk (the caller logs + keeps the
     /// in-memory log). The `head_hash` is stored in the superblock as a fast
-    /// integrity anchor (honest note: still rewritable on disk).
+    /// integrity anchor (re-checked against the records by [`load`] on the next
+    /// boot; honest note: still rewritable on disk by a privileged writer).
     #[cfg(not(test))]
     pub(super) fn save(records: &[AuditRecord], head_hash: &[u8; 32]) -> Result<(), ()> {
         use hal::ata::{self, SECTOR_SIZE};
@@ -807,7 +878,8 @@ mod disk {
         write_u32(&mut image[8..12], payload.len() as u32);
         write_u32(&mut image[12..16], crc);
         image[16..48].copy_from_slice(head_hash);
-        // [48..512) of the superblock stays reserved/zero.
+        // [48] = format version (spec §12); [49..512) stays reserved/zero.
+        image[VERSION_OFF] = FORMAT_VERSION;
         image[SECTOR_SIZE..SECTOR_SIZE + payload.len()].copy_from_slice(&payload);
 
         let mut done = 0usize;
