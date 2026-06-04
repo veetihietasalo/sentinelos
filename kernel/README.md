@@ -6,109 +6,107 @@ Bare-metal x86-64 kernel crate.  Workspace root: `kernel/`.
 
 ```
 kernel/
-  .cargo/config.toml     # workspace-wide: build.target = x86_64-unknown-none + linker flags
-  rust-toolchain.toml    # nightly (required by the limine 0.6.x crate)
-  Cargo.toml             # workspace members: crates/hal, crates/kernel
+  .cargo/config.toml     # workspace-wide: [target.x86_64-unknown-none] rustflags + xtask alias
+  rust-toolchain.toml    # stable toolchain pinned by version
+  Cargo.toml             # workspace members: crates/hal, crates/ui, crates/kernel, crates/boot
   xtask/                 # host-side build driver (standalone workspace — see below)
   crates/
     hal/                 # hardware abstraction layer (no_std)
-    kernel/              # kernel binary (no_std)
+    ui/                  # UI/rendering crate (no_std)
+    kernel/              # kernel crate (no_std)
+    boot/                # kernel entry point binary (no_std)
 ```
 
 ## Build commands
 
 All commands run from `kernel/`.
 
-### Cross-compile the kernel (bare-metal, x86_64-unknown-none)
+### Build and boot via xtask (recommended — mirrors CI exactly)
 
 ```sh
-cargo build
+cargo xtask build      # cross-compile the boot binary for x86_64-unknown-none
+cargo xtask run        # build ISO, launch QEMU with serial output on stdout
+cargo xtask test       # build ISO, run QEMU up to 90 s, assert boot banner
+cargo xtask screenshot # build ISO, boot headless, capture PNG via QMP
 ```
 
-Produces `target/x86_64-unknown-none/debug/kernel`.
+`cargo xtask` builds the host-side driver binary automatically for whatever host
+triple is active (`x86_64-unknown-linux-gnu` on CI/Linux, `aarch64-apple-darwin`
+on an M-series Mac, etc.).  No per-host hand-editing is needed.
 
-### Build via xtask (recommended — mirrors CI)
+### Cross-compile the kernel directly (without xtask)
 
 ```sh
-cargo xtask build
+cargo build --target x86_64-unknown-none
 ```
 
-### Run under QEMU (pending deps — see below)
+> Note: a bare `cargo build` (without `--target`) now compiles for the **host**,
+> not the bare-metal kernel target, because `kernel/.cargo/config.toml` no longer
+> sets a global `[build] target`.  Always pass `--target x86_64-unknown-none`
+> explicitly, or use `cargo xtask build` which does this for you.
+
+### Lint / format
 
 ```sh
-cargo xtask run
-```
-
-### Run tests under QEMU (pending deps — see below)
-
-```sh
-cargo xtask test
+cargo fmt --all --check
+cargo clippy --target x86_64-unknown-none -- -D warnings
 ```
 
 ---
 
 ## Why xtask is a standalone workspace
 
-`kernel/.cargo/config.toml` sets `build.target = "x86_64-unknown-none"` for the entire
-kernel workspace.  If `xtask` were a workspace member, Cargo would compile it for the
-bare-metal target too, causing `can't find crate for 'std'`.
+`xtask/` is NOT listed in `kernel/Cargo.toml`'s `members` list — it is its own
+standalone workspace (`xtask/Cargo.toml` contains `[workspace]`).
 
-The fix has two parts:
+Previously `kernel/.cargo/config.toml` set `build.target = "x86_64-unknown-none"`
+for the entire workspace, which forced xtask to be compiled for the bare-metal
+target too (causing `can't find crate for 'std'`).  That global default has been
+removed.  The `xtask` alias in `.cargo/config.toml` no longer passes `--target`,
+so Cargo resolves the host triple automatically on every platform:
 
-1. `xtask/` is NOT listed in `kernel/Cargo.toml`'s `members` list — it is its own
-   standalone workspace (`xtask/Cargo.toml` contains `[workspace]`).
-2. The `cargo xtask` alias in `kernel/.cargo/config.toml` passes
-   `--target aarch64-apple-darwin` explicitly, overriding the workspace default for
-   that one invocation.
+| Platform        | xtask host triple              |
+|-----------------|-------------------------------|
+| Linux x86_64    | `x86_64-unknown-linux-gnu`    |
+| macOS M-series  | `aarch64-apple-darwin`        |
+| macOS Intel     | `x86_64-apple-darwin`         |
 
-On CI with an x86_64-Linux runner, override the alias target:
-
-```sh
-CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu cargo xtask build
-```
-
-Or invoke directly:
-
-```sh
-cargo run --manifest-path xtask/Cargo.toml \
-          --target x86_64-unknown-linux-gnu \
-          --target-dir target/xtask \
-          -- build
-```
+The `[target.x86_64-unknown-none]` rustflags block in `.cargo/config.toml` is
+untouched — it only activates when that specific target is requested (e.g. by
+xtask or by an explicit `--target x86_64-unknown-none`), so host builds are
+unaffected.
 
 ---
 
-## QEMU / Limine — pending installation
+## QEMU / Limine — prerequisites
 
-`cargo xtask run` and `cargo xtask test` require:
+`cargo xtask run`, `cargo xtask test`, and `cargo xtask screenshot` require:
 
-| Tool | Install |
-|------|---------|
-| `qemu-system-x86_64` | `brew install qemu` |
-| `xorriso` | `brew install xorriso` |
-| `limine` binary | see below |
+| Tool | macOS | Linux |
+|------|-------|-------|
+| `qemu-system-x86_64` | `brew install qemu` | `apt-get install qemu-system-x86` |
+| `xorriso` | `brew install xorriso` | `apt-get install xorriso` |
+| `kernel/limine/` | see below | see below |
 
-### Fetching a pinned Limine release
+### Fetching Limine (pinned to v11.4.1)
 
 ```sh
-LIMINE_VER=8.0.4
-curl -Lo /usr/local/bin/limine \
-  "https://github.com/limine-bootloader/limine/releases/download/v${LIMINE_VER}/limine-$(uname -m)-unknown-linux"
-chmod +x /usr/local/bin/limine
+git clone --branch v11.4.1-binary --depth 1 \
+    https://github.com/limine-bootloader/limine.git \
+    kernel/limine
+make -C kernel/limine
 ```
 
-Once both `qemu-system-x86_64` and `limine` are on `$PATH`, implement the TODO stubs
-in `xtask/src/main.rs` (`run()` and `test_kernel()`) using the QEMU invocation:
+The `kernel/limine/` directory is gitignored; CI clones it as part of the
+"Clone Limine" step in `.github/workflows/kernel.yml`.
+
+### QEMU invocation (for reference)
 
 ```sh
 qemu-system-x86_64 \
+  -M q35 -m 256M \
+  -cdrom target/sentinelos.iso \
   -serial stdio \
-  -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
   -display none \
-  -no-reboot \
-  -cdrom target/sentinelos.iso
+  -no-reboot
 ```
-
-Exit code interpretation for `isa-debug-exit`:
-- `33` (0x21 = `0x10 << 1 | 1`) → tests passed
-- anything else → tests failed

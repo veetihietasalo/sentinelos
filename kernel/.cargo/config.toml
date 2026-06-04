@@ -1,5 +1,18 @@
-[build]
-target = "x86_64-unknown-none"
+# NOTE: There is intentionally NO global [build] target here.
+#
+# Removing build.target = "x86_64-unknown-none" lets `cargo xtask` compile the
+# host-side driver for whatever host triple is running (x86_64-unknown-linux-gnu
+# on CI/Linux, aarch64-apple-darwin on an M-series Mac, etc.) without any
+# per-host hand-editing.
+#
+# The kernel itself is always cross-compiled to x86_64-unknown-none:
+#   * xtask/src/main.rs calls `cargo build --target x86_64-unknown-none` explicitly.
+#   * CI steps `cargo clippy` and `cargo build` both pass `--target x86_64-unknown-none`.
+#   * A bare `cargo build` in kernel/ (without --target) now builds for the host;
+#     use `cargo xtask build` or pass --target explicitly for the kernel ELF.
+#
+# The [target.x86_64-unknown-none] rustflags block below is untouched — it only
+# activates when that specific target is requested, so host builds are unaffected.
 
 [target.x86_64-unknown-none]
 rustflags = [
@@ -22,11 +35,11 @@ rustflags = [
 [alias]
 # Build the xtask host binary and forward remaining args to it.
 #
-# --target aarch64-apple-darwin  — compile xtask for the host, not bare-metal.
-#   This overrides the workspace-wide `build.target = "x86_64-unknown-none"` above
-#   for this specific invocation.  CI on x86_64-linux should instead run:
-#     CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu cargo xtask <subcommand>
+# No --target flag here: Cargo picks the host triple automatically
+# (x86_64-unknown-linux-gnu on CI/Linux, aarch64-apple-darwin on M-series Mac).
+# This works because we removed the global build.target above, so there is no
+# bare-metal default to override.
 #
 # xtask lives in its own standalone workspace (kernel/xtask/Cargo.toml has [workspace])
 # so it does not share kernel workspace deps or profiles.
-xtask = "run --manifest-path xtask/Cargo.toml --target aarch64-apple-darwin --target-dir target/xtask --"
+xtask = "run --manifest-path xtask/Cargo.toml --target-dir target/xtask --"

@@ -57,7 +57,9 @@ jobs:
 
       # ── 4. System dependencies ────────────────────────────────────────────
       - name: Install QEMU and xorriso
-        run: sudo apt-get install -y qemu-system-x86 xorriso
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 xorriso
 
       # ── 5. Limine (pinned to tag v11.4.1-binary on branch v11.x-binary) ──
       # Clone the exact tag so we get the pre-built BIOS/EFI binaries and the
@@ -87,8 +89,9 @@ jobs:
         run: cargo build --target x86_64-unknown-none
 
       # ── 9. Boot test (deterministic QEMU serial-output check) ─────────────
-      # cargo xtask test builds the ISO, spawns QEMU for 8 s, captures serial
-      # output to target/serial.log, and asserts the "SentinelOS" banner.
+      # cargo xtask test builds the ISO, spawns QEMU under TCG (no KVM in CI),
+      # polls serial output for up to 90 s, and asserts the boot banner +
+      # "boot-bringup-ok" end-marker in target/serial.log.
       - name: cargo xtask test
         working-directory: kernel
         run: cargo xtask test

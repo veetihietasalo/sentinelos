@@ -71,7 +71,45 @@
       "role": "Limine, linker, target, xtask, CI",
       "model": "sonnet",
       "status": "done",
-      "task": "kernel CI workflow (build+clippy+fmt+boot-test)"
+      "task": "fixed hardcoded-aarch64 alias + CI apt-get + stale comments + pre-existing fmt issues; cargo xtask test passes TEST PASSED",
+      "history": [
+        {
+          "ts": "2026-06-04T14:17:39",
+          "kind": "status",
+          "status": "working",
+          "task": "surveying current build/CI state"
+        },
+        {
+          "ts": "2026-06-04T14:17:52",
+          "kind": "status",
+          "status": "working",
+          "task": "implementing fixes: config.toml, xtask config, CI yaml"
+        },
+        {
+          "ts": "2026-06-04T14:18:50",
+          "kind": "status",
+          "status": "working",
+          "task": "running cargo xtask test (plain alias, may take up to 90s)"
+        },
+        {
+          "ts": "2026-06-04T14:19:37",
+          "kind": "status",
+          "status": "working",
+          "task": "surveying repo state before fixing hardcoded-aarch64 and CI bugs"
+        },
+        {
+          "ts": "2026-06-04T14:22:04",
+          "kind": "status",
+          "status": "working",
+          "task": "running cargo xtask test (plain alias, up to 90s TCG boot)"
+        },
+        {
+          "ts": "2026-06-04T14:23:09",
+          "kind": "status",
+          "status": "done",
+          "task": "fixed hardcoded-aarch64 alias + CI apt-get + stale comments + pre-existing fmt issues; cargo xtask test passes TEST PASSED"
+        }
+      ]
     },
     {
       "name": "kernel-reviewer",
@@ -130,5 +168,5 @@
       "task": "\u2014"
     }
   ],
-  "updatedAt": "2026-06-04T13:41:52"
+  "updatedAt": "2026-06-04T14:23:09"
 }

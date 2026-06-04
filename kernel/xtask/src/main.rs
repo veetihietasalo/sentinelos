@@ -9,7 +9,7 @@
 //! ```sh
 //! cargo xtask build      # cross-compile the boot binary for x86_64-unknown-none
 //! cargo xtask run        # build ISO, launch QEMU with serial output on stdout
-//! cargo xtask test       # build ISO, run QEMU ~8s, assert banner in serial.log
+//! cargo xtask test       # build ISO, run QEMU up to 90 s (TCG), assert banner in serial.log
 //! cargo xtask screenshot # build ISO, boot in headless QEMU, capture PNG via QMP
 //! ```
 //!
@@ -376,7 +376,7 @@ fn do_test() -> ExitCode {
 
     if !found {
         eprintln!(
-            "TEST FAILED: end-marker '{}' not found within 20 s.",
+            "TEST FAILED: end-marker '{}' not found within 90 s.",
             END_MARKER
         );
         return ExitCode::FAILURE;
@@ -510,7 +510,7 @@ fn do_screenshot() -> ExitCode {
         .spawn()
         .expect("failed to spawn qemu-system-x86_64");
 
-    // ── Step 1: wait for boot-bringup-ok in serial log (up to 20 s) ──────────
+    // ── Step 1: wait for boot-bringup-ok in serial log (up to 90 s) ──────────
     println!("Waiting for '{}' in serial log ...", END_MARKER);
     let boot_deadline = Instant::now() + Duration::from_secs(90);
     let mut boot_found = false;
@@ -525,7 +525,7 @@ fn do_screenshot() -> ExitCode {
     }
 
     if !boot_found {
-        eprintln!("Timed out waiting for boot marker '{}' (20 s).", END_MARKER);
+        eprintln!("Timed out waiting for boot marker '{}' (90 s).", END_MARKER);
         let log = fs::read_to_string(&serial_log).unwrap_or_default();
         eprintln!("--- serial.log so far ---\n{}\n---", log);
         let _ = child.kill();
