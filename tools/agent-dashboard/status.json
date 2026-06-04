@@ -1,6 +1,6 @@
 {
   "project": "SentinelOS",
-  "updated": "2026-06-03",
+  "updated": "2026-06-04",
   "pipeline": [
     "spec",
     "architect",
@@ -16,7 +16,27 @@
       "role": "Subsystem design & framekernel decomposition",
       "model": "opus",
       "status": "done",
-      "task": "Sub-project #2 decomposed; #2a interrupts spec written"
+      "task": "Wrote audit-log + agent-native architecture spec (docs/specs/2026-06-04-...)",
+      "history": [
+        {
+          "ts": "2026-06-04T13:35:15",
+          "kind": "status",
+          "status": "working",
+          "task": "Designing kernel-native tamper-evident audit log spec"
+        },
+        {
+          "ts": "2026-06-04T13:37:22",
+          "kind": "status",
+          "status": "working",
+          "task": "Designing kernel-native tamper-evident audit log spec"
+        },
+        {
+          "ts": "2026-06-04T13:41:52",
+          "kind": "status",
+          "status": "done",
+          "task": "Wrote audit-log + agent-native architecture spec (docs/specs/2026-06-04-...)"
+        }
+      ]
     },
     {
       "name": "hal-specialist",
@@ -37,7 +57,7 @@
       "role": "Miri + Kani + fuzz CI gate",
       "model": "opus",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     },
     {
       "name": "test-engineer",
@@ -65,49 +85,50 @@
       "role": "Frame allocator, VMM policy, kernel heap",
       "model": "opus",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     },
     {
       "name": "driver-engineer",
       "role": "Device drivers over HAL MMIO/port APIs",
       "model": "sonnet",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     },
     {
       "name": "scheduler-engineer",
       "role": "Run queue, sync primitives, SMP",
       "model": "opus",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     },
     {
       "name": "security-engineer",
       "role": "sentinel-core integration, capabilities, sandbox",
       "model": "opus",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     },
     {
       "name": "userland-engineer",
       "role": "Syscall ABI, ELF loader, process lifecycle",
       "model": "sonnet",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     },
     {
       "name": "ui-engineer",
-      "role": "Compositor, widgets, display — security-ops aesthetic",
+      "role": "Compositor, widgets, display \u2014 security-ops aesthetic",
       "model": "sonnet",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     },
     {
       "name": "docs-writer",
       "role": "Design docs, ADRs, API refs, dev-setup",
       "model": "sonnet",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     }
-  ]
+  ],
+  "updatedAt": "2026-06-04T13:41:52"
 }
