@@ -30,7 +30,7 @@ pub mod ethernet;
 pub mod icmp;
 pub mod ipv4;
 
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
 use ethernet::{EthFrame, MacAddr, ETHERTYPE_ARP, ETHERTYPE_IPV4};
 use ipv4::Ipv4Addr;
@@ -48,10 +48,79 @@ static UP: AtomicBool = AtomicBool::new(false);
 /// A simple monotonically-increasing IP identification / ICMP sequence counter.
 static SEQ: AtomicU16 = AtomicU16::new(1);
 
+/// The last ICMP echo *reply* we received, encoded so a single relaxed
+/// `AtomicU32` load gives the whole status to a reader (the Net app) without a
+/// lock: the low 16 bits hold the answered sequence number, and the next bit
+/// (`0x0001_0000`) is a "we have seen at least one reply" flag. Zero means "no
+/// reply yet". Recorded by [`handle_icmp`] on an echo reply and read by
+/// [`status`].
+static LAST_PING_REPLY: AtomicU32 = AtomicU32::new(0);
+
+/// Bit set in [`LAST_PING_REPLY`] once at least one echo reply has arrived.
+const PING_SEEN_BIT: u32 = 0x0001_0000;
+
 /// Has the stack come up (NIC initialised)?
 #[must_use]
 pub fn is_up() -> bool {
     UP.load(Ordering::Acquire)
+}
+
+/// The result of the most recent outgoing ping (ICMP echo), as observed by the
+/// stack, for the Net status app to display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PingResult {
+    /// No echo reply has been received yet (stack down, or still waiting).
+    Pending,
+    /// An echo reply arrived; the field is the answered sequence number.
+    Replied(u16),
+}
+
+/// A read-only snapshot of the network stack's status, for the Net app.
+///
+/// Built by [`status`] from the NIC ([`hal::e1000::mac`]/[`hal::e1000::link_up`])
+/// and the stack's static configuration + last-ping state. Plain `Copy` data, so
+/// the caller owns it with no borrow of the live stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetStatus {
+    /// `true` once the NIC + stack have initialised (see [`is_up`]).
+    pub up: bool,
+    /// The NIC's MAC address (`00:00:00:00:00:00` if the stack is down).
+    pub mac: MacAddr,
+    /// Our static IPv4 address ([`OUR_IP`]).
+    pub ip: Ipv4Addr,
+    /// The gateway IPv4 address ([`GATEWAY_IP`]).
+    pub gateway: Ipv4Addr,
+    /// Whether the NIC reports the physical link as up.
+    pub link_up: bool,
+    /// The result of the most recent ICMP echo (ping).
+    pub last_ping: PingResult,
+}
+
+/// A read-only snapshot of the current network status, for the Net status app.
+///
+/// Reads the live MAC/link from the NIC ([`hal::e1000`]) and the last observed
+/// ICMP echo reply from the stack. Cheap and lock-free: a couple of atomic loads
+/// plus a NIC register read. Safe to call from app render/tick.
+#[must_use]
+pub fn status() -> NetStatus {
+    let up = is_up();
+    // The NIC only has a valid MAC once it's initialised; report zeros otherwise.
+    let mac = if up { hal::e1000::mac() } else { [0u8; 6] };
+    let link_up = up && hal::e1000::link_up();
+    let raw = LAST_PING_REPLY.load(Ordering::Relaxed);
+    let last_ping = if raw & PING_SEEN_BIT != 0 {
+        PingResult::Replied((raw & 0xFFFF) as u16)
+    } else {
+        PingResult::Pending
+    };
+    NetStatus {
+        up,
+        mac,
+        ip: OUR_IP,
+        gateway: GATEWAY_IP,
+        link_up,
+        last_ping,
+    }
 }
 
 /// Bring up the NIC and the stack, log the MAC, and (if the link is up) send an
@@ -210,8 +279,7 @@ fn handle_icmp(src_mac: MacAddr, ip: &ipv4::Ipv4Header<'_>) {
             // Build reply: Ethernet -> IPv4 -> ICMP echo reply.
             let mut out = [0u8; FRAME_BUF];
             let our_mac = hal::e1000::mac();
-            let Some(eth_len) =
-                ethernet::write_header(&mut out, src_mac, our_mac, ETHERTYPE_IPV4)
+            let Some(eth_len) = ethernet::write_header(&mut out, src_mac, our_mac, ETHERTYPE_IPV4)
             else {
                 return;
             };
@@ -243,6 +311,10 @@ fn handle_icmp(src_mac: MacAddr, ip: &ipv4::Ipv4Header<'_>) {
             hal::serial::write_str(" (ping answered!) seq=");
             hal::serial::write_dec(echo.seq as u64);
             hal::serial::write_str("\n");
+            // Record the answered sequence for the Net status app: low 16 bits =
+            // seq, plus the "seen a reply" flag. A single relaxed store keeps the
+            // status readable lock-free by `status()`.
+            LAST_PING_REPLY.store(PING_SEEN_BIT | echo.seq as u32, Ordering::Relaxed);
         }
         _ => {}
     }
@@ -297,9 +369,13 @@ pub fn send_ping(target_ip: Ipv4Addr) {
         return;
     };
     let icmp_off = eth_len + ipv4::HEADER_LEN;
-    let Some(icmp_len) =
-        icmp::write_echo(&mut out[icmp_off..], icmp::TYPE_ECHO_REQUEST, 0x5E05, seq, payload)
-    else {
+    let Some(icmp_len) = icmp::write_echo(
+        &mut out[icmp_off..],
+        icmp::TYPE_ECHO_REQUEST,
+        0x5E05,
+        seq,
+        payload,
+    ) else {
         return;
     };
     if ipv4::write_header(

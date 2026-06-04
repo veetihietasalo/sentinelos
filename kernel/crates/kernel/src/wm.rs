@@ -851,10 +851,10 @@ impl WindowManager {
 /// Log a window spawn via the fmt-arg-free serial helper (`core::fmt` integer
 /// args fault on this target — see `hal::serial`).
 fn log_spawn(kind: AppKind, _id: WindowId) {
-    match kind {
-        AppKind::Terminal => hal::serial::print_line("[wm] spawned terminal"),
-        AppKind::System => hal::serial::print_line("[wm] spawned system"),
-    }
+    // fmt-free "[wm] spawned <label>" — data-driven over AppKind::label() so new
+    // app variants (Files, Net, …) need no per-variant arm here.
+    hal::serial::write_str("[wm] spawned ");
+    hal::serial::print_line(kind.label());
 }
 
 /// Log a window close via the fmt-free serial helper.

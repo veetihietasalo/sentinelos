@@ -8,12 +8,16 @@
 //! like the rest of the kernel — this module carries the crate's
 //! `#![forbid(unsafe_code)]` and never reaches below the framebuffer abstraction.
 //!
-//! Two apps ship in this milestone:
+//! The apps that ship in this milestone:
 //! * [`terminal::Terminal`] — the interactive shell, rendered into a window.
 //! * [`system_panel::SystemPanel`] — a live read-only memory/uptime panel that
 //!   refreshes once a second, proving the compositor handles a second,
 //!   independently-updating window.
+//! * [`files::Files`] — a read-only browser over the in-memory VFS.
+//! * [`net::Net`] — a live read-only panel showing the network stack's status.
 
+pub mod files;
+pub mod net;
 pub mod system_panel;
 pub mod terminal;
 
@@ -62,22 +66,31 @@ pub trait App {
 /// The catalogue of app types the launcher can spawn a new window from.
 ///
 /// Each variant maps to a concrete `App` constructor in [`spawn`]. Adding an app
-/// is a matter of adding a variant here, listing it in [`AppKind::ALL`], a label
-/// in [`AppKind::label`], and a match arm in [`spawn`] — the launcher renders
-/// straight from `ALL`, so the window manager needs no change.
+/// is a matter of adding a variant here, an entry in [`AppKind::ALL`] (the order
+/// the launcher lists them in), a label in [`AppKind::label`], and a match arm in
+/// [`spawn`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppKind {
     /// The interactive shell (the [`terminal::Terminal`] app).
     Terminal,
     /// The live memory/uptime panel (the [`system_panel::SystemPanel`] app).
     System,
+    /// The read-only VFS browser (the [`files::Files`] app).
+    Files,
+    /// The live network-status panel (the [`net::Net`] app).
+    Net,
 }
 
 impl AppKind {
-    /// Every app kind the launcher offers, in menu order. The launcher renders its
-    /// menu straight from this list, so adding an app here (plus a `label`/`spawn`
-    /// arm) makes it appear with **no** change to the window manager.
-    pub const ALL: &'static [AppKind] = &[AppKind::Terminal, AppKind::System];
+    /// Every spawnable app kind, in launcher-listing order. The launcher renders
+    /// its menu from this slice, so adding a variant here makes a new app appear
+    /// automatically — no per-app launcher wiring.
+    pub const ALL: &'static [AppKind] = &[
+        AppKind::Terminal,
+        AppKind::System,
+        AppKind::Files,
+        AppKind::Net,
+    ];
 
     /// The human-readable label shown for this app in the launcher menu.
     #[must_use]
@@ -85,6 +98,8 @@ impl AppKind {
         match self {
             AppKind::Terminal => "Terminal",
             AppKind::System => "System",
+            AppKind::Files => "Files",
+            AppKind::Net => "Net",
         }
     }
 }
@@ -99,5 +114,7 @@ pub fn spawn(kind: AppKind) -> Box<dyn App> {
     match kind {
         AppKind::Terminal => Box::new(terminal::Terminal::new()),
         AppKind::System => Box::new(system_panel::SystemPanel::new()),
+        AppKind::Files => Box::new(files::Files::new()),
+        AppKind::Net => Box::new(net::Net::new()),
     }
 }
