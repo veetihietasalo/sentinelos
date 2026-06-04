@@ -28,6 +28,7 @@ use hal::framebuffer::Framebuffer;
 
 use crate::font;
 use crate::raster::{self, Gradient, Rgb};
+use crate::window::Rect;
 
 // --- Cyber Dusk backdrop (must match `lib.rs`) -------------------------------
 
@@ -127,6 +128,57 @@ pub struct ConsoleGeometry {
 #[inline]
 const fn titlebar_h() -> usize {
     CELL_H + PANEL_PAD // title row + symmetric padding
+}
+
+/// The text grid (whole columns/rows) that fits a console **content rectangle**.
+///
+/// Returned by [`console_geometry_in`]. This is the windowed analogue of
+/// [`ConsoleGeometry`]: it carries only the grid dimensions for an arbitrary
+/// content area (no outer-panel coordinates, because in the windowed case the
+/// chrome is owned by `window::draw_window_chrome`, not the console). The WM uses
+/// it to size the shell's scrollback and wrap its input line to the window's
+/// content rect, so the text always lands on the cells [`draw_console_in`] paints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsoleGrid {
+    /// Number of whole character columns the content area holds.
+    pub cols: usize,
+    /// Number of whole text rows the content area holds (scrollback + input).
+    pub rows: usize,
+}
+
+/// Compute the text grid (`cols`/`rows`) that fits an arbitrary console content
+/// rectangle `area`.
+///
+/// `area` is the inner region the text is drawn into (already inset past any
+/// window chrome — e.g. the `content_rect` of a window). A symmetric
+/// [`PANEL_PAD`]/2 breathing-room inset is applied inside `area` so glyphs don't
+/// touch the content edge, then the whole cells that fit are counted. A content
+/// area too small for even one cell yields `cols == 0` / `rows == 0` (a no-op for
+/// [`draw_console_in`]).
+#[must_use]
+pub fn console_geometry_in(area: Rect) -> ConsoleGrid {
+    let (text_w, text_h) = inner_text_extent(area);
+    let cols = text_w / CELL_W;
+    let rows = if text_h >= CELL_H {
+        // Each row after the first also consumes the leading.
+        (text_h + ROW_LEADING) / (CELL_H + ROW_LEADING)
+    } else {
+        0
+    };
+    ConsoleGrid { cols, rows }
+}
+
+/// Inner padding from a content rect's edge to the first character cell.
+const CONTENT_INSET: usize = PANEL_PAD / 2;
+
+/// The drawable text extent `(width, height)` inside a content rect, after the
+/// symmetric [`CONTENT_INSET`] breathing room. Shared by [`console_geometry_in`]
+/// and [`draw_console_in`] so the counted cells and the drawn cells agree.
+#[inline]
+const fn inner_text_extent(area: Rect) -> (usize, usize) {
+    let text_w = area.w.saturating_sub(CONTENT_INSET * 2);
+    let text_h = area.h.saturating_sub(CONTENT_INSET * 2);
+    (text_w, text_h)
 }
 
 /// Compute the console panel + grid [`ConsoleGeometry`] for a framebuffer of
@@ -229,15 +281,76 @@ pub fn draw_console(
     }
     let gradient = Gradient::three_stop(GRAD_START, GRAD_MID, GRAD_END, w, h);
 
+    // The full-screen console owns its own glass panel chrome (title bar, dots,
+    // border, shadow) — drawn here — then delegates the text grid to the shared
+    // windowed renderer for the inner content rectangle.
     draw_panel_chrome(fb, &gradient, &geom);
 
-    // Text-area origin (top-left of the first cell, below the title bar).
-    let text_x0 = geom.panel_x + PANEL_PAD;
-    let text_y0 = geom.panel_y + titlebar_h();
+    // Content rectangle: the panel inset past the title bar and border. This is
+    // exactly the area a window's `content_rect` would yield, so the full-screen
+    // and windowed consoles render their text through one code path.
+    let area = Rect {
+        x: geom.panel_x + (PANEL_PAD - CONTENT_INSET),
+        y: geom.panel_y + titlebar_h() - CONTENT_INSET,
+        w: geom.panel_w.saturating_sub((PANEL_PAD - CONTENT_INSET) * 2),
+        h: geom
+            .panel_h
+            .saturating_sub(titlebar_h() - CONTENT_INSET)
+            .saturating_sub(PANEL_PAD - CONTENT_INSET),
+    };
+    draw_console_in(fb, area, scrollback, prompt, input, cursor_visible, cursor_style);
+}
+
+/// Render the console text grid into an arbitrary **content rectangle** `area`.
+///
+/// This is the windowed console renderer: it draws scrollback + the live input
+/// line + the cursor into `area` (a window's `content_rect`), with **no panel
+/// chrome of its own** — the window chrome is drawn separately by
+/// [`crate::window::draw_window_chrome`]. The full-screen [`draw_console`] is a
+/// thin wrapper that paints its own glass panel and then calls this for the text.
+///
+/// Like [`draw_console`] it owns no state; the kernel passes the same borrowed
+/// slices:
+///
+/// * `scrollback` — already-wrapped history lines, oldest first; only the last
+///   rows that fit `area` (leaving one for the input line) are shown.
+/// * `prompt` — the prompt drawn before the input, in Cyber Dusk pink.
+/// * `input` — the current input line text (without the prompt).
+/// * `cursor_visible` — whether to draw the blinking cursor this frame.
+/// * `cursor_style` — block or underline caret.
+///
+/// The grid (`cols`/`rows`) is derived from `area` via [`console_geometry_in`],
+/// so the kernel sizes and wraps its text to the same cells drawn here. Drawing
+/// is clipped by the `Framebuffer`, so an oversized `area` or overrun is a safe
+/// no-op. A content rect too small for any cell, or a zero-size framebuffer, is a
+/// no-op.
+pub fn draw_console_in(
+    fb: &Framebuffer,
+    area: Rect,
+    scrollback: &[&str],
+    prompt: &str,
+    input: &str,
+    cursor_visible: bool,
+    cursor_style: CursorStyle,
+) {
+    let w = fb.width();
+    let h = fb.height();
+    if w == 0 || h == 0 {
+        return;
+    }
+    let grid = console_geometry_in(area);
+    if grid.cols == 0 || grid.rows == 0 {
+        return;
+    }
+    let gradient = Gradient::three_stop(GRAD_START, GRAD_MID, GRAD_END, w, h);
+
+    // Text-area origin: the content rect inset by the symmetric breathing room.
+    let text_x0 = area.x + CONTENT_INSET;
+    let text_y0 = area.y + CONTENT_INSET;
     let row_pitch = CELL_H + ROW_LEADING;
 
     // Reserve the bottom row for the live input line; the rest shows scrollback.
-    let body_rows = geom.rows.saturating_sub(1);
+    let body_rows = grid.rows.saturating_sub(1);
     // Show only the last `body_rows` of scrollback (the newest history).
     let start = scrollback.len().saturating_sub(body_rows);
     for (i, line) in scrollback[start..].iter().enumerate() {
@@ -248,17 +361,17 @@ pub fn draw_console(
         } else {
             TEXT_DIM
         };
-        draw_cells(fb, text_x0, y, geom.cols, line, color);
+        draw_cells(fb, text_x0, y, grid.cols, line, color);
     }
 
     // --- Input line: prompt (pink) + input (white) + cursor (cyan) ----------
-    let input_row = geom.rows.saturating_sub(1);
+    let input_row = grid.rows.saturating_sub(1);
     let iy = text_y0 + input_row * row_pitch;
 
     // Prompt, clamped to the grid width.
-    let prompt_cells = draw_cells(fb, text_x0, iy, geom.cols, prompt, ACCENT_PINK);
+    let prompt_cells = draw_cells(fb, text_x0, iy, grid.cols, prompt, ACCENT_PINK);
     // Input text continues after the prompt, within remaining columns.
-    let input_cols = geom.cols.saturating_sub(prompt_cells);
+    let input_cols = grid.cols.saturating_sub(prompt_cells);
     let input_used = draw_cells(
         fb,
         text_x0 + prompt_cells * CELL_W,
@@ -269,9 +382,9 @@ pub fn draw_console(
     );
 
     // Cursor sits in the cell right after the last input character (clamped to
-    // the last visible column so it never spills outside the panel).
+    // the last visible column so it never spills outside the content area).
     if cursor_visible {
-        let cursor_col = (prompt_cells + input_used).min(geom.cols.saturating_sub(1));
+        let cursor_col = (prompt_cells + input_used).min(grid.cols.saturating_sub(1));
         let cx = text_x0 + cursor_col * CELL_W;
         draw_cursor(fb, &gradient, cx, iy, cursor_style);
     }

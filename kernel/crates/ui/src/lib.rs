@@ -23,10 +23,13 @@
 pub mod console;
 pub mod font;
 pub mod raster;
+pub mod window;
 
 pub use console::{
-    console_cols, console_geometry, console_rows, draw_console, ConsoleGeometry, CursorStyle,
+    console_cols, console_geometry, console_geometry_in, console_rows, draw_console,
+    draw_console_in, ConsoleGeometry, CursorStyle,
 };
+pub use window::{clear_rect, content_rect, draw_window_chrome, Rect, WindowChrome};
 
 use hal::framebuffer::Framebuffer;
 use raster::{Gradient, Rgb};
@@ -34,11 +37,11 @@ use raster::{Gradient, Rgb};
 // --- Cyber Dusk design tokens -------------------------------------------------
 
 /// Backdrop gradient stop 1 — deep indigo `#2a1a4a`.
-const GRAD_START: Rgb = Rgb::hex(0x2a_1a_4a);
+pub(crate) const GRAD_START: Rgb = Rgb::hex(0x2a_1a_4a);
 /// Backdrop gradient stop 2 — violet `#5b2a8c`.
-const GRAD_MID: Rgb = Rgb::hex(0x5b_2a_8c);
+pub(crate) const GRAD_MID: Rgb = Rgb::hex(0x5b_2a_8c);
 /// Backdrop gradient stop 3 — magenta `#c43e8f`.
-const GRAD_END: Rgb = Rgb::hex(0xc4_3e_8f);
+pub(crate) const GRAD_END: Rgb = Rgb::hex(0xc4_3e_8f);
 
 /// Primary text — pure white.
 const TEXT_PRIMARY: Rgb = Rgb::hex(0xff_ff_ff);
@@ -221,7 +224,7 @@ fn draw_corner_glow(fb: &Framebuffer, gradient: &Gradient, w: usize, h: usize) {
 /// This is the single source of truth for "what colour is the background here",
 /// so both the initial paint ([`draw_corner_glow`]) and any partial repaint
 /// (the live [`draw_clock`] erasing old digits) agree exactly — no seams.
-fn backdrop_at(gradient: &Gradient, px: usize, py: usize, w: usize, h: usize) -> Rgb {
+pub(crate) fn backdrop_at(gradient: &Gradient, px: usize, py: usize, w: usize, h: usize) -> Rgb {
     let backdrop = gradient.color_at(px, py);
 
     // Glow ellipse centre and radii, in pixels (must match `draw_corner_glow`).
