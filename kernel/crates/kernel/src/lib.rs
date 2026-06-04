@@ -23,6 +23,7 @@ pub mod fs;
 pub mod input;
 pub mod interrupts;
 pub mod memory;
+pub mod net;
 pub mod shell;
 
 /// Kernel entry point — called by `boot::_start` after serial initialisation.
@@ -50,6 +51,16 @@ pub fn kmain() -> ! {
     // ~100 Hz, and unmask IRQ0. Interrupts stay DISABLED until `sti` below — we
     // only enable them once every handler is registered.
     interrupts::init_timer();
+
+    // Bring up NETWORKING: find + init the e1000 NIC (heap is ready), read its
+    // MAC, set up RX/TX rings, then start the minimal ARP/IPv4/ICMP stack and
+    // fire an ARP request + ICMP echo at the gateway as a TX proof. Degrades
+    // gracefully — if no NIC is present this logs and continues, never breaking
+    // the boot path. Done with interrupts still DISABLED.
+    net::init();
+    // Register the NIC's receive-interrupt handler and unmask its PIC line (a
+    // no-op if no NIC came up). Must run before `sti`, after `net::init`.
+    interrupts::init_nic_irq();
 
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");

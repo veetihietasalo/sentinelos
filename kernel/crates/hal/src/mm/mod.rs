@@ -40,6 +40,138 @@ pub use frame::FrameAllocator;
 pub use heap::{LockedHeap, HEAP_SIZE, HEAP_START};
 pub use paging::{ActivePageTable, MapError, PageFlags};
 
+// `DmaFrame`, `MmioError`, and `map_mmio` are defined below in this module and
+// are part of the public `hal::mm` API consumed by device drivers (the NIC).
+
+/// Base of the higher-half virtual window reserved for device MMIO mappings.
+///
+/// Chosen well clear of the kernel-heap window ([`HEAP_START`] =
+/// `0xFFFF_F000_…`) so the two never overlap. [`map_mmio`] lays successive
+/// mappings out from here, bumping [`MMIO_NEXT`] by the (page-rounded) size of
+/// each region.
+const MMIO_WINDOW_BASE: u64 = 0xFFFF_F100_0000_0000;
+
+/// Bump pointer for the next free MMIO virtual address (see [`map_mmio`]).
+static MMIO_NEXT: AtomicUsize = AtomicUsize::new(MMIO_WINDOW_BASE as usize);
+
+/// Why [`map_mmio`] could not map a device register window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MmioError {
+    /// Memory management was not initialised (no HHDM offset available).
+    NotInitialised,
+    /// A page in the region could not be mapped (out of frames or a clash).
+    MapFailed(MapError),
+}
+
+impl From<MapError> for MmioError {
+    fn from(e: MapError) -> Self {
+        Self::MapFailed(e)
+    }
+}
+
+/// Map a physical device-MMIO region into the kernel address space, **uncached**.
+///
+/// Limine's HHDM only covers RAM, so a device's BAR (e.g. a NIC's register
+/// window in the `0xFEB…` hole) is **not** reachable until we map it ourselves.
+/// This maps the page-aligned span covering `[phys, phys + len)` into the
+/// higher-half MMIO window ([`MMIO_WINDOW_BASE`]) with [`PageFlags::mmio`]
+/// (PCD+PWT, so reads/writes always reach the device), and returns the
+/// [`VirtAddr`] corresponding to `phys` (preserving the in-page offset).
+///
+/// Mappings are laid out by bumping a global cursor, so repeated calls never
+/// overlap. Must be called after [`init`] (it needs the HHDM offset and the
+/// frame allocator). Single-core at bring-up; not re-entrant-safe across cores.
+///
+/// # Errors
+///
+/// Returns [`MmioError::NotInitialised`] if `init` has not run, or
+/// [`MmioError::MapFailed`] if a page could not be mapped.
+pub fn map_mmio(phys: PhysAddr, len: usize) -> Result<VirtAddr, MmioError> {
+    let hhdm = hhdm_offset().ok_or(MmioError::NotInitialised)?;
+
+    // Page-align the physical span: floor the base, ceil the end, so the whole
+    // region is covered by whole 4 KiB pages.
+    let phys_base = phys.frame_floor().as_u64();
+    let offset_in_page = phys.as_u64() - phys_base;
+    let phys_end = PhysAddr::new(phys.as_u64() + len as u64).frame_ceil().as_u64();
+    let span = (phys_end - phys_base) as usize;
+    let pages = span / PAGE_SIZE as usize;
+
+    // Reserve a contiguous virtual span from the MMIO bump cursor.
+    let virt_base = MMIO_NEXT.fetch_add(span, Ordering::Relaxed) as u64;
+
+    let table = ActivePageTable::new(hhdm);
+    let flags = PageFlags::mmio();
+    for i in 0..pages {
+        let virt = VirtAddr::new(virt_base + (i * PAGE_SIZE as usize) as u64);
+        let frame = PhysAddr::new(phys_base + (i * PAGE_SIZE as usize) as u64);
+        table.map_page(virt, frame, flags, &FRAME_ALLOCATOR)?;
+    }
+
+    Ok(VirtAddr::new(virt_base + offset_in_page))
+}
+
+/// A single 4 KiB physical frame reserved for device DMA (descriptor rings /
+/// packet buffers), reachable by the CPU through the HHDM.
+///
+/// A device that does DMA needs the **physical** address of its buffers, while
+/// the CPU needs a virtual pointer to read/write them. Since Limine
+/// higher-half-direct-maps all RAM, a frame at physical `p` is reachable at
+/// `p + hhdm` (cached, ordinary RAM — fine for DMA on x86, where the device
+/// snoops the caches). [`DmaFrame::alloc`] grabs one frame from the global
+/// [`FRAME_ALLOCATOR`], zeroes it, and records both addresses.
+///
+/// The frame is **leaked** (never returned to the allocator): NIC rings live for
+/// the lifetime of the kernel, so there is no free path to get wrong.
+#[derive(Clone, Copy, Debug)]
+pub struct DmaFrame {
+    phys: PhysAddr,
+    virt: VirtAddr,
+}
+
+impl DmaFrame {
+    /// Allocate and zero one 4 KiB DMA-capable frame, or `None` if out of frames.
+    ///
+    /// The frame is zeroed with an explicit `u64` loop (never `write_bytes`,
+    /// which lowers to a `memset` libcall that faults on this target — see the
+    /// `mm` paging notes), so it is allocation-clean and panic-free.
+    #[must_use]
+    pub fn alloc() -> Option<Self> {
+        let hhdm = hhdm_offset()?;
+        let phys = FRAME_ALLOCATOR.alloc_frame()?;
+        let virt = VirtAddr::new(phys.as_u64() + hhdm);
+        let ptr = virt.as_u64() as *mut u64;
+        // SAFETY: `phys` was just handed out by the frame allocator, so it is a
+        // 4 KiB-aligned USABLE-RAM frame owned exclusively by us; Limine
+        // HHDM-maps all RAM, so `virt = phys + hhdm` is a valid, writable,
+        // 8-byte-aligned (4 KiB-aligned) virtual address for the whole frame.
+        // Each `ptr.add(i)` for `i < 512` is within the 4 KiB frame
+        // (`8 * 512 == 4096`). We zero with a `u64` loop, not `write_bytes`,
+        // because the `memset` libcall faults on this higher-half target (see the
+        // `mm` notes / HAL TCB §5 M8). The frame is freshly allocated ⇒ unaliased.
+        unsafe {
+            let mut i = 0usize;
+            while i < (PAGE_SIZE as usize / 8) {
+                core::ptr::write(ptr.add(i), 0u64);
+                i += 1;
+            }
+        }
+        Some(Self { phys, virt })
+    }
+
+    /// Physical base address of the frame (what a DMA descriptor must reference).
+    #[must_use]
+    pub const fn phys(&self) -> PhysAddr {
+        self.phys
+    }
+
+    /// Virtual base address of the frame (the CPU's HHDM view of it).
+    #[must_use]
+    pub const fn virt(&self) -> VirtAddr {
+        self.virt
+    }
+}
+
 /// The global physical frame allocator, seeded by [`init`].
 ///
 /// Public so callers (and tests) can query [`FrameAllocator::free_frames`]; the

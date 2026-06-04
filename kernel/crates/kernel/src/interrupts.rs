@@ -183,6 +183,18 @@ fn handle_keyboard(_frame: &InterruptFrame) {
     hal::keyboard::on_irq();
 }
 
+/// The NIC receive interrupt (vector = `PIC1_OFFSET + NIC IRQ line`).
+///
+/// Delegates to [`hal::e1000::on_irq`], which acks the device's interrupt-cause
+/// register (read-to-clear) and signals End-Of-Interrupt to the PIC. The actual
+/// received frames are drained by the idle loop via the safe
+/// [`hal::e1000::poll_frame`]; the handler stays tiny (ack + EOI), keeping the
+/// privileged MMIO/EOI work inside the TCB. Returns normally so the interrupted
+/// code resumes.
+fn handle_nic(_frame: &InterruptFrame) {
+    hal::e1000::on_irq();
+}
+
 // ── Public initialisation ─────────────────────────────────────────────────────
 
 /// Register CPU exception handlers and arm the GDT + TSS + IDT.
@@ -249,6 +261,26 @@ pub fn init_timer() {
     hal::pit::init();
     hal::pic::unmask_irq(IRQ_TIMER);
     hal::keyboard::init();
+}
+
+/// Register the NIC receive-interrupt handler and unmask its PIC line.
+///
+/// Call **after** the NIC has been initialised (`net::init` → `hal::e1000::init`),
+/// which reads the NIC's IRQ line from PCI config space, and **before** `sti`.
+/// The vector is `PIC1_OFFSET + irq`. If the NIC was not brought up
+/// (`hal::e1000::irq()` returns the `0xFF` "none" sentinel) this is a no-op, so
+/// a missing NIC never opens a stray PIC line.
+///
+/// Registering the handler before unmasking the line guarantees no NIC interrupt
+/// can arrive before its handler exists.
+pub fn init_nic_irq() {
+    let irq = hal::e1000::irq();
+    if irq == 0xFF || irq >= 16 {
+        return; // NIC absent or an out-of-range (non-legacy) line — skip.
+    }
+    let vector = hal::e1000::vector_for(irq);
+    hal::interrupts::set_handler(vector, handle_nic as Handler);
+    hal::pic::unmask_irq(irq);
 }
 
 // ── Unit tests (host) ─────────────────────────────────────────────────────────

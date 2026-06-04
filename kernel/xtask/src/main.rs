@@ -45,6 +45,31 @@ fn main() -> ExitCode {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+/// QEMU arguments attaching an Intel **e1000** NIC (the Intel 82540EM the HAL
+/// driver targets) to a user-mode (SLIRP) network backend, plus a packet capture
+/// of everything that crosses that link.
+///
+/// - `-device e1000,netdev=n0` — the emulated 82540EM (vendor 0x8086 device
+///   0x100E) the `hal::e1000` driver binds to, on the `n0` backend.
+/// - `-netdev user,id=n0` — SLIRP user-mode networking (no host privileges
+///   needed); the guest gets `10.0.2.15`, the gateway is `10.0.2.2`.
+/// - `-object filter-dump,...,file=target/net.pcap` — dumps every TX/RX frame on
+///   `n0` to a pcap so the test can prove frames actually left/arrived
+///   (`tcpdump -r target/net.pcap`).
+///
+/// The pcap path is filled in per-call (it needs the kernel root); this returns
+/// the static flags and the caller appends the `filter-dump` object.
+fn e1000_args(pcap_path: &str) -> Vec<String> {
+    vec![
+        "-device".into(),
+        "e1000,netdev=n0".into(),
+        "-netdev".into(),
+        "user,id=n0".into(),
+        "-object".into(),
+        format!("filter-dump,id=d0,netdev=n0,file={}", pcap_path),
+    ]
+}
+
 /// Path to the `kernel/` workspace root (one level up from `xtask/`).
 fn kernel_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -210,18 +235,20 @@ fn do_run() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    let pcap = kr("target/net.pcap");
     println!("Launching QEMU (serial → stdout, Ctrl-C to quit) ...");
-    let ok = run_cmd(
-        Command::new("qemu-system-x86_64")
-            .args([
-                "-M", "q35",
-                "-m", "256M",
-                "-cdrom", iso.to_str().unwrap(),
-                "-serial", "stdio",
-                "-display", "none",
-                "-no-reboot",
-            ]),
-    );
+    println!("NIC: e1000 on SLIRP; frames captured to {}", pcap.display());
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.args([
+        "-M", "q35",
+        "-m", "256M",
+        "-cdrom", iso.to_str().unwrap(),
+        "-serial", "stdio",
+        "-display", "none",
+        "-no-reboot",
+    ])
+    .args(e1000_args(pcap.to_str().unwrap()));
+    let ok = run_cmd(&mut cmd);
 
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
@@ -240,13 +267,18 @@ fn do_test() -> ExitCode {
     };
 
     let serial_log = kr("target/serial.log");
+    let pcap = kr("target/net.pcap");
 
-    // Remove stale log from a previous run.
+    // Remove stale log + pcap from a previous run.
     let _ = fs::remove_file(&serial_log);
+    let _ = fs::remove_file(&pcap);
 
     println!("Launching QEMU (serial → file, polling for end-marker) ...");
+    println!("NIC: e1000 on SLIRP; frames captured to {}", pcap.display());
 
-    // Spawn QEMU in the background; direct COM1 to a file so we can poll it.
+    // Spawn QEMU in the background; direct COM1 to a file so we can poll it. The
+    // e1000 NIC + SLIRP backend + filter-dump pcap let the test confirm the NIC
+    // brings up and frames cross the wire (inspect target/net.pcap).
     let mut child = Command::new("qemu-system-x86_64")
         .args([
             "-M", "q35",
@@ -256,6 +288,7 @@ fn do_test() -> ExitCode {
             "-display", "none",
             "-no-reboot",
         ])
+        .args(e1000_args(pcap.to_str().unwrap()))
         .spawn()
         .expect("failed to spawn qemu-system-x86_64");
 
@@ -397,6 +430,8 @@ fn do_screenshot() -> ExitCode {
     //   - no interactive window (-display none)
     //   - GOP/VGA framebuffer rendered internally (screendump still works)
     //   - QMP control socket for programmatic screendump
+    let pcap = kr("target/net.pcap");
+    let _ = fs::remove_file(&pcap);
     let mut child = Command::new("qemu-system-x86_64")
         .args([
             "-M", "q35",
@@ -407,6 +442,7 @@ fn do_screenshot() -> ExitCode {
             "-serial", &format!("file:{}", serial_log.display()),
             "-qmp", &format!("unix:{},server,nowait", qmp_sock.display()),
         ])
+        .args(e1000_args(pcap.to_str().unwrap()))
         .spawn()
         .expect("failed to spawn qemu-system-x86_64");
 

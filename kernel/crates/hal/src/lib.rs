@@ -75,12 +75,14 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod cpu;
+pub mod e1000;
 pub mod framebuffer;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
 pub mod keyboard;
 pub mod mm;
+pub mod pci;
 pub mod pic;
 pub mod pit;
 pub mod serial;

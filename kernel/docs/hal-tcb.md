@@ -12,9 +12,12 @@ sound, and its formal-verification status.
   8254 PIT timer (`hal::pit`), and the `sti`/`int3`/`CR2` CPU primitives;
   sub-project #2a (interrupts) — GDT/TSS/IST, IDT, and the raw ISR stubs;
   sub-project #2 part 1 (memory) — frame allocator, paging, kernel heap +
-  `#[global_allocator]` (`hal::mm`, §5);
+  `#[global_allocator]` (`hal::mm`, §5); plus the device-MMIO mapping +
+  DMA-frame helpers `mm::map_mmio` / `mm::DmaFrame` (§5f) added for the NIC;
   sub-project #3 (input) — the PS/2 (i8042) keyboard on IRQ1 (`hal::keyboard`);
-  sub-project #5 (UI, first slice) — the Limine framebuffer surface (`hal::framebuffer`)
+  sub-project #5 (UI, first slice) — the Limine framebuffer surface (`hal::framebuffer`);
+  sub-project #6 (networking) — PCI config-space enumeration (`hal::pci`, §6a) and
+  the Intel e1000 NIC driver (`hal::e1000`, §6b)
 - **Crate lints:** `#![deny(unsafe_op_in_unsafe_fn)]`,
   `#![warn(clippy::undocumented_unsafe_blocks)]` — every `unsafe` block is
   forced to carry a `// SAFETY:` comment.
@@ -327,7 +330,84 @@ the types `Sync` and be correct under future SMP.
 > `kernel` crate uses to print `[mem] heap ok: allocated NNN bytes …`. No new
 > `unsafe`: they reuse the existing `Serial::write_bytes` path (S1–S5).
 
+### 5f. `hal::mm` — device-MMIO mapping + DMA frames (sub-project #6)
+
+Two **safe** additions to the `mm` public API so a device driver (the NIC) can
+reach memory-mapped registers and DMA buffers without writing `unsafe` itself:
+
+- `mm::map_mmio(phys, len) -> VirtAddr` — maps a device's physical BAR window
+  into a higher-half MMIO virtual window (`0xFFFF_F100_…`, clear of the heap)
+  **uncached** (`PageFlags::mmio()` sets PCD+PWT), via the existing
+  `ActivePageTable::map_page` (M6–M9). It adds **no** new raw op — it composes
+  the already-documented paging primitives; the only new code is a safe bump
+  cursor (an `AtomicUsize`) for laying out successive mappings. The PCD+PWT bits
+  are a pure value change in `PageFlags::bits()` (safe).
+- `mm::DmaFrame::alloc()` — allocates one 4 KiB frame from the global
+  `FRAME_ALLOCATOR` (M3–M5) and records both its physical address (for a DMA
+  descriptor) and its HHDM virtual address (for CPU access). The frame is zeroed
+  with an explicit `u64` loop, exactly as `new_table` (M8) — never
+  `ptr::write_bytes` (the `memset` libcall faults on this target).
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| M15 | `mm/mod.rs` · `DmaFrame::alloc()` | `ptr::write((phys + hhdm) as *mut u64, 0)` loop zeroing the frame | A DMA ring/buffer frame must start zeroed | `phys` is a fresh `alloc_frame` result (4 KiB-aligned USABLE RAM, HHDM-mapped, exclusively owned); each `ptr.add(i)` for `i < 512` is in the 4 KiB frame, 8-byte-aligned, writable, unaliased. Explicit `u64` loop (not `write_bytes`) for the same memset-fault reason as M8. | Reasoned + QEMU (NIC rings DMA correctly; pcap shows valid frames) |
+
+> `map_mmio`'s mapping writes go through `ActivePageTable::map_page` (M6–M9,
+> already documented); the only difference is the leaf flags carry PCD+PWT for an
+> uncached device window. No new raw page-table op is introduced. The MMIO
+> *accesses* themselves (volatile loads/stores to the mapped window) live in
+> `hal::e1000` and are documented in §6b (N3/N4).
+
 ---
+
+## 6. `hal::pci` + `hal::e1000` — networking (sub-project #6)
+
+Brings up QEMU's Intel **e1000** (82540EM, vendor `0x8086` device `0x100E`): PCI
+config-space enumeration to find it, MMIO BAR mapping (via `mm::map_mmio`, §5f),
+reset + RX/TX descriptor-ring setup in DMA RAM (via `mm::DmaFrame`, §5f), MAC
+read, and an RX interrupt. The privileged surface is two families of raw ops:
+**port I/O** of the PCI config ports (`0xCF8`/`0xCFC`), and **volatile MMIO**
+loads/stores to the mapped e1000 register window + the descriptor/buffer DMA
+memory. The public API (`pci::scan_for`, `PciDevice::*`, `e1000::init`/`mac`/
+`send_frame`/`poll_frame`/`on_irq`/`irq`) is **safe**, and **all** scancode-style
+protocol logic (Ethernet/ARP/IPv4/ICMP parsing + building) lives in the safe
+`kernel::net` module under `#![forbid(unsafe_code)]`, **not** the TCB.
+
+### 6a. `hal::pci` — PCI configuration-space access mechanism #1
+
+All config access goes through two private 32-bit port primitives, `inl`/`outl`,
+each with a `# Safety` section; the address-port write + data-port read/write
+pair is never interleaved (single-core init). The public surface (`scan_for`,
+`PciDevice` BAR/IRQ readers, `enable_bus_master`) is **safe**.
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| N1 | `pci.rs` · `inl()` | `in eax, dx` (32-bit port read) | Only way to read the PCI config data port (`0xCFC`) | `unsafe fn` whose `# Safety` requires a read-safe config port; every caller passes `0xCFC`. Pure device read, `nomem`/`nostack`. | Reasoned + QEMU (e1000 found at bus 0; vendor 0x8086) |
+| N2 | `pci.rs` · `outl()` | `out dx, eax` (32-bit port write) | Select a config register (`0xCF8`) and write the command register (`0xCFC`) | `unsafe fn` whose `# Safety` requires a write-safe config port; every caller passes `0xCF8`/`0xCFC` with the enable-bit address word or a command-register value (bus-master/memory-space). Device-only effect, `nomem`/`nostack`. | Reasoned + QEMU (bus-master enabled; DMA works) |
+
+### 6b. `hal::e1000` — Intel 82540EM NIC driver
+
+The driver maps BAR0 uncached (`mm::map_mmio`, §5f), allocates the RX/TX rings
+and per-descriptor 2048-byte packet buffers as `mm::DmaFrame`s (§5f, M15), and
+talks to the device through **volatile** 32-bit MMIO accesses and **volatile**
+descriptor/buffer reads/writes. Driver state is a single `static` behind a tiny
+local spin mutex (single-core ⇒ never spins). `init` runs once with interrupts
+disabled; `send_frame`/`poll_frame`/`on_irq` take the lock briefly.
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| N3 | `e1000.rs` · `Mmio::read()` | `ptr::read_volatile(*const u32)` of a register | Read an e1000 register (status, ICR, RDH/TDH, RAL/RAH) | `base` is the virtual base of BAR0 mapped writable+uncached over the device's 128 KiB window; every `reg` is a documented register offset within it and a multiple of 4 (aligned), so the load is in-bounds + aligned. Volatile ⇒ not elided/reordered; the only side effects (e.g. ICR read-to-clear) are accounted for by the driver. | Reasoned + QEMU (MAC read; rings advance; link up) |
+| N4 | `e1000.rs` · `Mmio::write()` | `ptr::write_volatile(*mut u32)` of a register | Program the device (CTRL/RCTL/TCTL, ring bases, IMS, tails) | As N3: `base + reg` is a 4-byte-aligned address in the mapped writable BAR window; the store only affects the NIC (config / ring tail / interrupt mask) and cannot alias Rust memory. | Reasoned + QEMU (TX/RX confirmed in pcap) |
+| N5 | `e1000.rs` · `read_*_desc`/`write_*_desc` | `ptr::read_volatile`/`write_volatile` of a 16-byte `RxDesc`/`TxDesc` in the ring frame | Maintain the DMA descriptor rings the NIC reads/writes | The ring is a `DmaFrame` (4 KiB, HHDM-mapped, exclusively owned); index `i < 32` and `32 × 16 = 512 ≤ 4096`, so the descriptor is fully in-frame and 16-byte-aligned. Writes are unaliased w.r.t. the NIC: we only advance the ring tail (handing a descriptor to the device) **after** writing it, and read a descriptor's status only to observe the NIC's completion writeback. | Reasoned + QEMU (DD bits observed; pcap frames) |
+| N6 | `e1000.rs` · `copy_into_buf`/`copy_out_of_buf` | `ptr::write_volatile`/`read_volatile` of bytes in a packet `DmaFrame` | Stage an outgoing frame / extract a received one | `buf` is a 4 KiB `DmaFrame`; the copy is bounded to `min(len, 2048) ≤ 4096`, byte-aligned, in-frame. The TX buffer is filled before the descriptor tail is advanced (unaliased); the RX buffer is read only after its descriptor reports DD (frame complete, not being written). | Reasoned + QEMU (ARP/ICMP payloads correct in pcap) |
+| N7 | `e1000.rs` · `unsafe impl Sync for NicLock` + `with()` `&mut *UnsafeCell` | Share the driver `static` and form `&mut Nic` while the lock is held | The driver state must live in a `static` and be mutated behind a lock | Access is serialised by the `locked` atomic (only one critical section at a time); single-core at bring-up ⇒ never concurrent; the inner reference never escapes the closure. Same pattern as `mm::sync` (M13/M14). The `Nic`'s raw addresses (MMIO base, DMA frames) are valid for the program's life. | Reasoned + QEMU |
+
+> **Protocol stack is out of the TCB.** Ethernet/ARP/IPv4/ICMP framing,
+> checksums, and the reply logic live entirely in `kernel::net`
+> (`#![forbid(unsafe_code)]`): pure byte arithmetic over slices, with co-located
+> unit tests. The TCB's job is only to move bytes to/from the wire (N3–N7) and
+> ack the RX interrupt (`on_irq` reads ICR + EOIs via `pic`, P5). The kernel's
+> registered NIC-vector handler is a one-line safe `fn(&InterruptFrame)`.
 
 ## 3. Verification roadmap (sub-project #2+)
 
