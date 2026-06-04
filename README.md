@@ -1,48 +1,140 @@
-# SentinelOS
+<div align="center">
 
-A security-first operating system project — **starting with its Security Center**.
+# 🌆 SentinelOS
 
-SentinelOS is a long-horizon vision for a from-scratch, Rust-based operating system. The first concrete artifact is **Sentinel**, a cross-platform desktop **Security Center** that continuously monitors a machine's integrity across **20 forensic vectors** and surfaces threats and anomalies in a calm, matte, Linux-styled dashboard.
+### A private, security-first operating system — built from scratch in Rust.
 
-Sentinel is built so its security logic ports *into* the future OS: the core is one Rust crate shared by the desktop app today and the OS's security subsystem later.
+[![Language](https://img.shields.io/badge/Rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
+[![Arch](https://img.shields.io/badge/arch-x86__64-blue)](#)
+[![Boot](https://img.shields.io/badge/bootloader-Limine-7ad7ff)](https://github.com/limine-bootloader/limine)
+[![Kernel](https://img.shields.io/badge/kernel-framekernel-ff5fae)](#architecture--the-framekernel)
+[![unsafe](https://img.shields.io/badge/kernel-forbid(unsafe__code)-success)](#architecture--the-framekernel)
+[![Status](https://img.shields.io/badge/status-pre--alpha-c43e8f)](#it-actually-boots)
 
-> Status: **early — design phase.** This repo currently holds the design; code lands next.
+<img src="docs/images/lock-screen.png" width="760" alt="SentinelOS — the Cyber Dusk lock screen running in QEMU"/>
 
-## Why
+**`private · secure · yours`**
 
-A security tool should be trustworthy, legible, and honest — "clean" is a valid result, not a reason to invent threats. Sentinel monitors the places real surveillance and persistence actually live, tiers findings by severity, and never takes destructive action on its own (read-only by default).
+</div>
 
-## Architecture (three layers)
+---
+
+## What is this?
+
+**SentinelOS is a from-scratch operating system written in Rust** — no Linux fork, no inherited C kernel. A new OS that boots on real x86_64 hardware, with privacy and security designed into its *architecture* rather than bolted on after the fact.
+
+Its foundation is a **framekernel**: a tiny `unsafe` core — the entire Trusted Computing Base — is the *only* place unsafe code is permitted, and **every other line is `#![forbid(unsafe_code)]` safe Rust.** A memory-safety bug in the safe kernel isn't "unlikely" — it's a *compile error*.
+
+The interface language is **"Cyber Dusk"** — a Y2K-Aero, dusk-toned aesthetic meant to feel personal and alive, while staying calm and trustworthy.
+
+> ⚠️ **Status: pre-alpha.** SentinelOS boots, paints a GUI, and runs an interactive shell — in QEMU, today. It's early, it's honest about that, and it's being **built in public.**
+
+---
+
+## It actually boots
+
+From power-on to an interactive desktop — all real, all verified in QEMU:
+
+- ✅ **Boots** via Limine on x86_64 — stable Rust, `no_std`, the built-in `x86_64-unknown-none` target (no nightly, no `-Z build-std`)
+- ✅ **Interrupts** — GDT / TSS / IST, a 256-entry IDT, exception handling with `#PF` CR2 reporting and a runtime `int3` IDT self-test
+- ✅ **Timer** — 8259 PIC remap + 8254 PIT → a **live, ticking clock**
+- ✅ **Memory** — physical frame allocator + paging + a kernel **heap** with a `#[global_allocator]` (`Box` / `Vec` / `String` all work)
+- ✅ **Input** — a PS/2 keyboard driver, full US-QWERTY ASCII
+- ✅ **GUI** — the **Cyber Dusk** boot/lock screen → press <kbd>→</kbd> to unlock (with an animation) → a desktop
+- ✅ **Shell** — an interactive terminal: `help` · `about` · `mem` · `echo` · `uptime`
+
+🚧 **In flight:** an in-memory filesystem + richer shell, **networking** (e1000 NIC + ARP / IPv4 / ICMP), and a windowed desktop.
+
+<div align="center">
+<img src="docs/images/shell.png" width="720" alt="The SentinelOS interactive shell — typing 'about' and getting real output"/>
+<br/>
+<em>The shell, responding to a real keystroke-injected <code>about</code> command.</em>
+</div>
+
+---
+
+## Architecture — the framekernel
 
 ```
-① UI layer        web (HTML/CSS/JS) — matte "Security Center"     [portable]
-② sentinel-core   Rust crate: 20-vector model, findings schema,   [portable, shared with the OS]
-                  scan orchestrator, live-monitor loop, diff/alerts
-③ providers       the actual checks, behind one SecurityProvider trait
-                  macOS ✓   Linux ✓   sentinelos ⟳ (later, native syscalls)
+┌──────────────────────────────────────────────────────────────┐
+│  kernel   ·  ui      →   #![forbid(unsafe_code)]   safe Rust   │
+│  (logic, shell, GUI, drivers' safe halves, protocol stacks)    │
+├──────────────────────────────────────────────────────────────┤
+│  hal  ·  boot         →   the TCB — the ONLY unsafe code       │
+│  (port I/O, paging, the ISR stubs, the framebuffer surface)    │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-Only the **provider** layer is rewritten per operating system. The core logic and the design language carry over unchanged. On macOS/Linux the UI renders via **Tauri**; on the bare-metal Rust OS it renders via a Rust-native GUI (iced/egui/Slint) — no webview required.
+- **Tiny, audited TCB.** Every `unsafe` operation in the HAL is catalogued in [`kernel/docs/hal-tcb.md`](kernel/docs/hal-tcb.md) with a `// SAFETY:` argument and a verification status. The `kernel` and `ui` crates carry `#![forbid(unsafe_code)]` — the compiler enforces the boundary.
+- **Stable Rust, end to end.** No nightly features. Lints (`deny(unsafe_op_in_unsafe_fn)`, `warn(clippy::undocumented_unsafe_blocks)`) make undocumented unsafety a hard error.
+- **Verifiable by design.** The roadmap brings Miri / Kani / fuzzing online over the TCB — its surface is small enough that this is actually tractable.
 
-## The 20 vectors
+---
 
-- **System integrity** — kernel extensions · system extensions · SIP/secure-boot · profiles/MDM
-- **Persistence** — launch agents/daemons (or systemd units) · login items/BTM · cron/timers · automation & mail hooks
-- **Network** — listening ports · outbound connections / beacons
-- **Privacy** — permission grants (TCC) · mic/camera usage · audio capture taps
-- **Access & software** — SSH / remote access · accounts & sudoers · browser extensions · unsigned apps · downloads/quarantine · recently modified binaries
+## The Sentinel Security Center
+
+Before the kernel, there was **Sentinel** — a cross-platform desktop Security Center (Tauri + Rust) that continuously monitors a machine's integrity across **20 forensic vectors** (persistence, network beacons, TCC/permission grants, remote access, kernel extensions, and more) and surfaces findings in a calm, matte dashboard. It's read-only by default and built on the principle that **"clean" is a valid result — never a reason to invent threats.**
+
+Its logic lives in one portable Rust crate, `sentinel-core`, deliberately built to port *into* SentinelOS as the OS's **native security subsystem** — continuous integrity monitoring as a first-class kernel citizen, not an app you install. The security mission predates the kernel; the kernel is how we deliver it without compromise.
+
+---
+
+## Quick start
+
+**Prerequisites:** a stable Rust toolchain, the bare-metal target, plus `qemu` and `xorriso`.
+
+```bash
+rustup target add x86_64-unknown-none
+# macOS:  brew install qemu xorriso
+# Debian: sudo apt install qemu-system-x86 xorriso
+```
+
+**Build, boot, and screenshot it:**
+
+```bash
+cd kernel
+cargo xtask build        # builds the bootable ISO (Limine + xorriso)
+cargo xtask test         # boots headless in QEMU, asserts the boot bring-up
+cargo xtask screenshot   # boots and captures a PNG of the framebuffer
+```
+
+`cargo xtask test` should finish with `TEST PASSED` and a serial log ending in `boot-bringup-ok`.
+
+---
 
 ## Roadmap
 
-1. **MVP — tracer-bullet slice:** full pipeline (UI → core → macOS provider → live monitor → tray) for 4 vectors: permission grants, outbound network, launch persistence, kernel extensions.
-2. Fill in the remaining 16 vectors (each ≈ one provider function).
-3. Linux provider.
-4. `sentinelos` native provider + GUI renderer once the OS has a userland.
+The spine, from bare metal toward a usable, private desktop OS:
 
-## Stack
+- [x] **1 — Boot bring-up** · serial, panic, the framekernel HAL
+- [x] **2 — Core kernel** · interrupts, the PIT timer, paging + heap
+- [x] **3 — Input + GUI** · keyboard, the Cyber Dusk boot screen, an interactive shell
+- [ ] **4 — A real shell** · filesystem, command history, more built-ins *(in progress)*
+- [ ] **5 — Networking** · NIC driver + a minimal TCP/IP stack *(in progress)*
+- [ ] **6 — A windowed desktop** · compositor, launcher, multiple apps
+- [ ] **7 — Storage & userland** · persistent FS, syscalls, processes
+- [ ] **8 — Native security subsystem** · port `sentinel-core` into the kernel
+- [ ] **9 — The long road** · our own browser engine, broader hardware & app support
 
-Tauri 2 · Rust (stable) · minimal web UI (dependency-light by design — it's a security tool).
+---
+
+## Why?
+
+Every mainstream OS asks you to trade privacy for capability. SentinelOS is a bet that you shouldn't have to — and that the only way to *mean* it is to build security into the kernel's architecture, in a language that makes whole classes of vulnerabilities impossible.
+
+It's a long road, and we're honest about that: broad app and game compatibility, GPU acceleration, and running on every laptop are **long-horizon** goals, not near-term promises. What's real today is what's in [It actually boots](#it-actually-boots) — and it grows every commit.
+
+---
+
+## Built in public
+
+SentinelOS is being built one verifiable milestone at a time, out in the open — watch it go from "prints text on a serial line" to a real desktop. ⭐ the repo to follow along; issues, ideas, and contributors are welcome as it opens up.
 
 ## License
 
-TBD.
+**TBD** — licensing is being finalized for the public release. Until then, all rights reserved.
+
+<div align="center">
+<br/>
+<sub>SentinelOS · a private OS, built from scratch, in Rust.</sub>
+</div>
