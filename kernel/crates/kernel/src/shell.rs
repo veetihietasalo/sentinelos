@@ -310,8 +310,20 @@ impl Shell {
             None => (trimmed, ""),
         };
 
+        // AUDIT (spec §9.2): one emit at the top of `execute` uniformly records
+        // every command as a `Principal::Shell / Action::Command` event
+        // (`target = cmd`, `summary = rest`). The audit `append` is best-effort and
+        // can never fail the command it records.
+        crate::security::audit::append(
+            crate::security::audit::Principal::Shell,
+            crate::security::audit::Action::Command,
+            cmd,
+            rest,
+        );
+
         match cmd {
             "help" => self.cmd_help(),
+            "audit" => self.cmd_audit(rest),
             "clear" => self.cmd_clear(),
             "about" => self.cmd_about(),
             "mem" => self.cmd_mem(),
@@ -362,6 +374,12 @@ impl Shell {
         self.push_line(String::from("  rm <path>     - remove a file/dir"));
         self.push_line(String::from("  cd <dir>      - change directory"));
         self.push_line(String::from("  pwd           - print working dir"));
+        self.push_line(String::from(
+            "  audit         - recent audit log + chain status",
+        ));
+        self.push_line(String::from(
+            "  audit verify  - re-walk the tamper-evidence chain",
+        ));
         self.push_line(String::from("history: Up/Down arrows recall commands"));
     }
 
@@ -606,8 +624,9 @@ impl Shell {
             self.push_line(String::from("mkdir: missing directory name"));
             return;
         }
-        if let Err(err) = self.fs.mkdir(arg) {
-            self.push_fs_error("mkdir", arg, err);
+        match self.fs.mkdir(arg) {
+            Ok(()) => audit_fs(crate::security::audit::Action::FsCreate, arg, "mkdir"),
+            Err(err) => self.push_fs_error("mkdir", arg, err),
         }
     }
 
@@ -625,8 +644,15 @@ impl Shell {
         // Store the text with a trailing newline so `cat` round-trips cleanly.
         let mut content = String::from(text);
         content.push('\n');
-        if let Err(err) = self.fs.write_file(path, content.as_bytes()) {
-            self.push_fs_error("write", path, err);
+        match self.fs.write_file(path, content.as_bytes()) {
+            Ok(()) => {
+                // Summarise the size written without core::fmt (which faults here).
+                let mut summary = String::new();
+                push_dec(&mut summary, content.len() as u64);
+                summary.push_str(" bytes");
+                audit_fs(crate::security::audit::Action::FsWrite, path, &summary);
+            }
+            Err(err) => self.push_fs_error("write", path, err),
         }
     }
 
@@ -636,8 +662,9 @@ impl Shell {
             self.push_line(String::from("rm: missing path"));
             return;
         }
-        if let Err(err) = self.fs.remove(arg) {
-            self.push_fs_error("rm", arg, err);
+        match self.fs.remove(arg) {
+            Ok(()) => audit_fs(crate::security::audit::Action::FsRemove, arg, "rm"),
+            Err(err) => self.push_fs_error("rm", arg, err),
         }
     }
 
@@ -653,6 +680,81 @@ impl Shell {
     fn cmd_pwd(&mut self) {
         let cwd = self.fs.cwd();
         self.push_line(cwd);
+    }
+
+    /// `audit` / `audit verify` — view the kernel-native audit log.
+    ///
+    /// * `audit` lists the most recent records (newest-first), one per line:
+    ///   `#<seq> t<tick> <principal>/<action> <target> - <summary>`, and reports
+    ///   the chain-verification status as a footer.
+    /// * `audit verify` re-walks the tamper-evidence chain and prints `Ok` or the
+    ///   `seq` where it broke.
+    ///
+    /// Read-only: it acquires the global log lock for the duration of the read and
+    /// never hands out a mutable record (append-only is preserved).
+    fn cmd_audit(&mut self, arg: &str) {
+        use crate::security::audit;
+
+        // Build the output under the lock, then print it (push_line borrows self
+        // mutably, so we collect lines first to avoid overlapping borrows).
+        let verify_only = arg.trim() == "verify";
+        let mut lines: Vec<String> = Vec::new();
+
+        audit::with_log(|log| {
+            let verify = log.verify_chain();
+
+            if verify_only {
+                match verify {
+                    Ok(()) => lines.push(String::from("audit: chain verified OK")),
+                    Err(e) => {
+                        let mut msg = String::from("audit: chain BROKEN at seq ");
+                        push_dec(&mut msg, e.at_seq);
+                        lines.push(msg);
+                    }
+                }
+                return;
+            }
+
+            // Header: record count.
+            let mut header = String::from("audit log: ");
+            push_dec(&mut header, log.len() as u64);
+            header.push_str(" records (newest first)");
+            lines.push(header);
+
+            // Up to the most-recent AUDIT_VIEW_LIMIT records, newest-first.
+            for record in log.iter_rev().take(AUDIT_VIEW_LIMIT) {
+                let mut line = String::from("#");
+                push_dec(&mut line, record.seq);
+                line.push_str(" t");
+                push_dec(&mut line, record.tick);
+                line.push(' ');
+                line.push_str(principal_name(record.principal));
+                line.push('/');
+                line.push_str(action_name(record.action));
+                line.push(' ');
+                line.push_str(record.target.as_str());
+                let summary = record.summary.as_str();
+                if !summary.is_empty() {
+                    line.push_str(" - ");
+                    line.push_str(summary);
+                }
+                lines.push(line);
+            }
+
+            // Footer: chain status.
+            match verify {
+                Ok(()) => lines.push(String::from("chain: verified OK")),
+                Err(e) => {
+                    let mut msg = String::from("chain: BROKEN at seq ");
+                    push_dec(&mut msg, e.at_seq);
+                    lines.push(msg);
+                }
+            }
+        });
+
+        for line in lines {
+            self.push_line(line);
+        }
     }
 
     /// Render the console to `fb`, with a solid (always-visible) block caret.
@@ -725,6 +827,54 @@ impl Shell {
 impl Default for Shell {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Maximum number of recent records the `audit` command lists, so a long log
+/// never floods the console; `audit` shows the newest [`AUDIT_VIEW_LIMIT`].
+const AUDIT_VIEW_LIMIT: usize = 16;
+
+/// Emit a filesystem-mutation audit record for a shell-driven `fs` op.
+///
+/// Spec §9.3 resolution: for the seed we emit at the *shell* wrapper, where the
+/// principal is unambiguously [`Principal::Shell`](crate::security::audit::Principal::Shell)
+/// (clean layering; `fs.rs` stays unaware of `security`). When a non-shell caller
+/// (an agent/process) appears, the emit moves into `fs.rs` with the principal
+/// passed *in* by the caller, never assumed. Called only on a successful mutation.
+fn audit_fs(action: crate::security::audit::Action, target: &str, summary: &str) {
+    crate::security::audit::append(
+        crate::security::audit::Principal::FileSystem,
+        action,
+        target,
+        summary,
+    );
+}
+
+/// Short display name for a [`Principal`](crate::security::audit::Principal) in
+/// the `audit` listing (no `core::fmt`).
+fn principal_name(p: crate::security::audit::Principal) -> &'static str {
+    use crate::security::audit::Principal;
+    match p {
+        Principal::Kernel => "kernel",
+        Principal::Shell => "shell",
+        Principal::FileSystem => "fs",
+        Principal::WindowManager => "wm",
+    }
+}
+
+/// Short display name for an [`Action`](crate::security::audit::Action) in the
+/// `audit` listing (no `core::fmt`).
+fn action_name(a: crate::security::audit::Action) -> &'static str {
+    use crate::security::audit::Action;
+    match a {
+        Action::Boot => "boot",
+        Action::Command => "cmd",
+        Action::FsCreate => "create",
+        Action::FsWrite => "write",
+        Action::FsRemove => "remove",
+        Action::AppSpawn => "spawn",
+        Action::AppClose => "close",
+        Action::SecurityEvent => "security",
     }
 }
 

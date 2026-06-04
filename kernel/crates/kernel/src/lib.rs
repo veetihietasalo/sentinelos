@@ -25,6 +25,7 @@ pub mod input;
 pub mod interrupts;
 pub mod memory;
 pub mod net;
+pub mod security;
 pub mod shell;
 pub mod wm;
 
@@ -70,6 +71,16 @@ pub fn kmain() -> ! {
     // boot on the same image can demonstrate the file survived. Degrades
     // gracefully — with no disk it logs and uses the in-memory seeded tree.
     fs::prove_persistence();
+
+    // Bring up the SECURITY subsystem: arm the kernel-native, append-only,
+    // hash-chained audit log. `init` constructs it via `AuditLog::boot` (probe
+    // disk → load + verify the chain, or start fresh), appends the first
+    // `Action::Boot` record so the log is non-empty, and emits the `[audit] log
+    // ready (N records)` + `[audit] chain verified ok` serial proof. The log
+    // persists to a non-overlapping high LBA region of the same ATA image as the
+    // filesystem, so it survives reboot without clobbering `fs`. Degrades
+    // gracefully — with no disk it logs and uses an in-memory log.
+    security::audit::init();
 
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");

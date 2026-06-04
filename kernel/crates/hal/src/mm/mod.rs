@@ -32,7 +32,13 @@ mod bootinfo;
 mod frame;
 mod heap;
 mod paging;
-mod sync;
+// `sync` is the project's only sanctioned interior-mutability primitive
+// (`SpinMutex`). It is published so safe kernel subsystems that need shared global
+// state (e.g. `kernel::security::audit`'s global log) can reuse it rather than
+// inventing their own. This exposes the *existing* type only — no new code, no new
+// `unsafe`, no new TCB surface; `sync.rs`'s `unsafe` is already documented in
+// `kernel/docs/hal-tcb.md` (§5e).
+pub mod sync;
 
 pub use addr::{PhysAddr, VirtAddr, PAGE_SIZE};
 pub use bootinfo::{hhdm_offset, usable_regions, UsableRegion};

@@ -143,8 +143,28 @@
       "name": "security-engineer",
       "role": "sentinel-core integration, capabilities, sandbox",
       "model": "opus",
-      "status": "idle",
-      "task": "\u2014"
+      "status": "working",
+      "task": "Implementing security/{sha256,audit,mod}.rs + emit sites + audit shell cmd",
+      "history": [
+        {
+          "ts": "2026-06-04T14:28:22",
+          "kind": "status",
+          "status": "working",
+          "task": "Implementing audit-log SEED per spec"
+        },
+        {
+          "ts": "2026-06-04T14:30:22",
+          "kind": "status",
+          "status": "working",
+          "task": "Reading audit-log spec + studying fs.rs/hal patterns"
+        },
+        {
+          "ts": "2026-06-04T14:31:38",
+          "kind": "status",
+          "status": "working",
+          "task": "Implementing security/{sha256,audit,mod}.rs + emit sites + audit shell cmd"
+        }
+      ]
     },
     {
       "name": "userland-engineer",
@@ -168,5 +188,5 @@
       "task": "\u2014"
     }
   ],
-  "updatedAt": "2026-06-04T14:23:09"
+  "updatedAt": "2026-06-04T14:31:38"
 }

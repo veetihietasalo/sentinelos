@@ -847,17 +847,40 @@ impl WindowManager {
 // --- fmt-free serial logging for structural WM events -------------------------
 
 /// Log a window spawn via the fmt-arg-free serial helper (`core::fmt` integer
-/// args fault on this target — see `hal::serial`).
+/// args fault on this target — see `hal::serial`) **and** append a first-class
+/// audit record.
+///
+/// Spec §9.4 resolution: the audit log *subsumes* `log_spawn`. We keep the
+/// `[wm] spawned <label>` serial line (a useful boot trace) and additionally
+/// append a `Principal::WindowManager / Action::AppSpawn` record (`target =
+/// kind.label()`), making the window manager the first *real* producer feeding the
+/// audit log — structural events already logged informally graduate to first-class
+/// auditable events.
 fn log_spawn(kind: AppKind, _id: WindowId) {
     // fmt-free "[wm] spawned <label>" — data-driven over AppKind::label() so new
     // app variants (Files, Net, …) need no per-variant arm here.
     hal::serial::write_str("[wm] spawned ");
     hal::serial::print_line(kind.label());
+
+    crate::security::audit::append(
+        crate::security::audit::Principal::WindowManager,
+        crate::security::audit::Action::AppSpawn,
+        kind.label(),
+        "",
+    );
 }
 
-/// Log a window close via the fmt-free serial helper.
+/// Log a window close via the fmt-free serial helper **and** append an audit
+/// record (spec §9.4 — the audit log subsumes `log_close`).
 fn log_close(_id: WindowId) {
     hal::serial::print_line("[wm] closed focused window");
+
+    crate::security::audit::append(
+        crate::security::audit::Principal::WindowManager,
+        crate::security::audit::Action::AppClose,
+        "window",
+        "",
+    );
 }
 
 #[cfg(test)]
