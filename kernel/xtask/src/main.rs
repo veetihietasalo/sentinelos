@@ -348,8 +348,10 @@ fn do_test() -> ExitCode {
         .spawn()
         .expect("failed to spawn qemu-system-x86_64");
 
-    // Poll every 200 ms for up to 20 s (safety cap) until the end-marker appears.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Poll for up to 90 s (safety cap) until the end-marker appears. Generous so
+    // a slow first boot under TCG software emulation (no KVM in CI/containers)
+    // still passes; on hardware-accelerated hosts the loop breaks in ~2 s.
+    let deadline = Instant::now() + Duration::from_secs(90);
     let poll_interval = Duration::from_millis(200);
     let mut found = false;
 
@@ -510,7 +512,7 @@ fn do_screenshot() -> ExitCode {
 
     // ── Step 1: wait for boot-bringup-ok in serial log (up to 20 s) ──────────
     println!("Waiting for '{}' in serial log ...", END_MARKER);
-    let boot_deadline = Instant::now() + Duration::from_secs(20);
+    let boot_deadline = Instant::now() + Duration::from_secs(90);
     let mut boot_found = false;
     while Instant::now() < boot_deadline {
         std::thread::sleep(Duration::from_millis(200));
@@ -533,7 +535,7 @@ fn do_screenshot() -> ExitCode {
 
     // ── Step 2: wait extra time for the per-pixel framebuffer draw ───────────
     // Under TCG (software emulation) the VGA/GOP pixel-by-pixel draw is slow.
-    std::thread::sleep(Duration::from_secs(10));
+    std::thread::sleep(Duration::from_secs(25));
 
     // ── Step 3: drive QMP via Python to capture screendump ───────────────────
     println!("Taking screendump via QMP ...");
