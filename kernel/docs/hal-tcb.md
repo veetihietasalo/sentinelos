@@ -18,7 +18,9 @@ sound, and its formal-verification status.
   and the PS/2 mouse on IRQ12 (`hal::mouse`, §2h);
   sub-project #5 (UI, first slice) — the Limine framebuffer surface (`hal::framebuffer`);
   sub-project #6 (networking) — PCI config-space enumeration (`hal::pci`, §6a) and
-  the Intel e1000 NIC driver (`hal::e1000`, §6b)
+  the Intel e1000 NIC driver (`hal::e1000`, §6b);
+  sub-project #7 (storage) — the legacy ATA (IDE) PIO disk driver (`hal::ata`,
+  §7) backing `kernel::fs` on-disk persistence
 - **Crate lints:** `#![deny(unsafe_op_in_unsafe_fn)]`,
   `#![warn(clippy::undocumented_unsafe_blocks)]` — every `unsafe` block is
   forced to carry a `// SAFETY:` comment.
@@ -451,12 +453,52 @@ disabled; `send_frame`/`poll_frame`/`on_irq` take the lock briefly.
 > ack the RX interrupt (`on_irq` reads ICR + EOIs via `pic`, P5). The kernel's
 > registered NIC-vector handler is a one-line safe `fn(&InterruptFrame)`.
 
+## 7. `hal::ata` — legacy ATA (IDE) PIO disk driver (storage persistence)
+
+Drives a legacy parallel-ATA hard disk on the **primary** IDE channel using
+*programmed I/O*: the CPU moves each 512-byte sector through the 16-bit data
+register (`0x1F0`) one word at a time, polling the status register (`0x1F7`) for
+the BSY/DRQ handshake. **No DMA, no interrupts** — the whole driver is four port
+primitives plus a request→poll→transfer state machine. It backs the on-disk
+filesystem persistence in `kernel::fs` (so files survive a reboot). The primary
+channel uses the standard PC legacy ports: command block `0x1F0..=0x1F7` and the
+control-block Alternate Status register `0x3F6`. Addressing is 28-bit LBA
+(LBA28). The public surface (`identify`, `read_sectors`, `write_sectors`,
+`DiskInfo`, `AtaError`) is **safe** and returns `Result` so the kernel degrades
+to an in-memory filesystem when no disk is attached. All hardware access is
+funnelled through four private primitives — `inb`/`outb` (8-bit) and `inw`/`outw`
+(16-bit) — each with a `# Safety` rustdoc section. The serialiser, CRC, and tree
+walk all live in `kernel::fs` under `#![forbid(unsafe_code)]`, **not** the TCB.
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| A1 | `ata.rs` · `inb()` | `in al, dx` (8-bit port read) | Read the ATA status (`0x1F7`) / alternate-status (`0x3F6`) / LBA-mid/hi registers | `unsafe fn` whose `# Safety` requires a read-safe ATA register; all callers pass a primary-channel command/control-block port. Pure device read, `nomem`/`nostack`. | Reasoned + QEMU |
+| A2 | `ata.rs` · `outb()` | `out dx, al` (8-bit port write) | Program the seccount/LBA/drive-select registers and issue command bytes (`IDENTIFY`/`READ`/`WRITE`/`FLUSH`) | `unsafe fn` whose `# Safety` requires a write-safe ATA register; all callers pass a primary command-block port (`0x1F2..=0x1F7`) with a defined LBA/seccount/command byte. Sets up/starts a device operation only; device-only effect, `nomem`/`nostack`. | Reasoned + QEMU |
+| A3 | `ata.rs` · `inw()` | `in ax, dx` (16-bit port read) | Pull one PIO data word from the data register (`0x1F0`) during a sector read | `unsafe fn` whose `# Safety` requires the read-safe data port; the sole caller (`read_sectors`, and the IDENTIFY block) reads `0x1F0` **only after DRQ is asserted** (the drive is offering a word). Pure device read, `nomem`/`nostack`. | Reasoned + QEMU |
+| A4 | `ata.rs` · `outw()` | `out dx, ax` (16-bit port write) | Push one PIO data word into the data register (`0x1F0`) during a sector write | `unsafe fn` whose `# Safety` requires the write-safe data port; the sole caller (`write_sectors`) writes `0x1F0` **only after DRQ is asserted** (the drive is ready for a word). Device-only effect, `nomem`/`nostack`. | Reasoned + QEMU |
+
+> **Bounded polling, no hangs.** Every BSY/DRQ wait (`wait_not_busy`,
+> `wait_for_drq`) spins a fixed budget (`POLL_LIMIT`) and then returns
+> `AtaError::Timeout`, so a wedged or absent controller can never hang boot. An
+> absent channel is detected early (`status == 0xFF` floating bus → `NoDevice`),
+> and an ATAPI signature in LBA-mid/hi is rejected as `NoDevice`, so the kernel
+> always falls back to the seeded in-memory filesystem rather than faulting.
+>
+> **Persistence layer is out of the TCB.** The on-disk image format (superblock
+> magic + CRC-32 + the recursively serialised VFS tree), the (de)serialiser, and
+> the load/save orchestration all live in `kernel::fs::disk`
+> (`#![forbid(unsafe_code)]`): pure byte arithmetic over slices and `Vec`s, with
+> co-located host unit tests (round-trip, truncation/bad-tag rejection, CRC
+> known-vectors). The TCB's job is only to move 512-byte sectors to/from the
+> media (A1–A4). `write_sectors` ends with a `FLUSH CACHE` so data reaches the
+> backing image before the guest can power off.
+
 ## 3. Verification roadmap (sub-project #2+)
 
 | Tool | Applicable to | Status |
 |------|---------------|--------|
 | Manual review + adversarial review (kernel-reviewer) | all entries | scheduled (build sequence step 6) |
-| QEMU boot evidence | S1–S5, C3–C4 (serial output + clean halt); F1–F2 (framebuffer plotted in QEMU once the boot screen renders); **M1–M14 (`cargo xtask test` boots, maps the heap, and allocates: `[mem] heap ok: allocated NNN bytes` — `Box`/`Vec` through the global allocator — before the banner + `boot-bringup-ok`)** | via `cargo xtask test` (test-engineer) |
+| QEMU boot evidence | S1–S5, C3–C4 (serial output + clean halt); F1–F2 (framebuffer plotted in QEMU once the boot screen renders); **M1–M14 (`cargo xtask test` boots, maps the heap, and allocates: `[mem] heap ok: allocated NNN bytes` — `Box`/`Vec` through the global allocator — before the banner + `boot-bringup-ok`)**; **A1–A4 (`cargo xtask test` attaches a persistent IDE disk; `kernel::fs` logs `[fs] loaded filesystem from disk` / `[fs] no valid image on disk; seeding + saving` proving IDENTIFY + sector read/write; reboot-persistence demonstrated by writing a file then re-launching QEMU on the same image)** | via `cargo xtask test` (test-engineer) |
 | QEMU **fault tests** (the #2a evidence) | G1–G5, I1–I5, X1 — `int3` → `EXCEPTION: BREAKPOINT`, deliberate #PF → `EXCEPTION: PAGE FAULT` + no reset loop, forced #DF on the IST stack → `EXCEPTION: DOUBLE FAULT` | via `cargo xtask test-faults` (test-engineer, build sequence step 4) — **this is the primary correctness check for the ISR/asm + descriptor-table loads** |
 | Miri | pure logic helpers only (cannot model port I/O / `hlt`/`cli`/`sti` / descriptor loads / ISR stubs / CR3 / `invlpg` / raw page-table writes) | **pending** |
 | Kani (bounded model checking) | bit-level helpers (e.g. IF/LSR masks, newline translation, gate/TSS descriptor bit-packing, RFLAGS/error-code decoders, **framebuffer `pack_rgb` channel packing + `byte_offset`/`fill_rect` bounds/clip arithmetic**, **`mm` address-index decomposition `VirtAddr::table_indices`, frame-align math, `PageFlags` bit-packing, and `align_up`/free-block split arithmetic**) | **pending** |
