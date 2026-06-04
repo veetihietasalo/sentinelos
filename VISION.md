@@ -1,7 +1,7 @@
 # SentinelOS — Vision & Strategy
 
 ## Vision
-SentinelOS aims to combine the best of **Windows** (apps, games, hardware), **Linux** (openness, flexibility, deep customization), and **macOS** (polish, UX) — a flexible, customizable desktop OS with great coding support and, in the long run, broad app/game and big-brand compatibility — built on a foundation of **better privacy and security** than any of them.
+SentinelOS aims to combine the best of **Windows** (apps, games, hardware), **Linux** (openness, flexibility, deep customization), and **macOS** (polish, UX) — a flexible, customizable desktop OS with great coding support and, in the long run, broad app/game and big-brand compatibility — built on a foundation of **better privacy and security** than any of them — and **best-in-class performance from day one**, never traded away for safety.
 
 ## North star: privacy & security (the differentiator)
 Privacy/security is the one goal that is both achievable now and uniquely ours, and it is delivered **architecturally**, not bolted on:
@@ -10,6 +10,21 @@ Privacy/security is the one goal that is both achievable now and uniquely ours, 
 - Stable Rust + a CI verification gate (Miri + Kani + fuzz) over the TCB.
 
 The OS UI design language is **"Cyber Dusk"** — Y2K Aero glass in a dark, privacy-forward palette (see `docs/specs/2026-06-03-ui-design-language.md`). The matte "security-ops" aesthetic is the **dev-tooling** theme (the agent dashboard), not the OS itself.
+
+## Co-equal mandate: best-in-class performance from day one
+SentinelOS must be **the most advanced OS on performance from the very first release** — speed is a constraint designed in from the start, never an optimization pass bolted on later, and **never traded away for safety**.
+
+This is credible *because* of the architecture, not despite it:
+- **Safe Rust is zero-overhead.** No garbage collector, no runtime, no VM. `#![forbid(unsafe_code)]` is a *compile-time* proof — monomorphised, zero-cost abstractions compile to the same machine code a hand-tuned C kernel would. Safety here costs nothing at runtime.
+- **A framekernel has no microkernel tax.** The tiny `unsafe` TCB is a *boundary*, not a message-passing layer on the hot path — we get microkernel-grade isolation of unsafety without the context-switch/IPC overhead that makes classic microkernels slow.
+- **Lean by construction.** No inherited C-kernel cruft, no legacy-compatibility weight; every subsystem is written once, for this machine.
+
+**Enforced from the start:**
+- Performance is **measured, not assumed** — boot time, interrupt/scheduler latency, IPC round-trip, allocation cost, and frame time get budgets and CI regression gates, right alongside the Miri/Kani verification gate.
+- The hot paths (scheduler, memory, IPC, syscalls, compositor) are designed for low latency and cache-friendliness up front; the compositor is already damage-driven, not full-redraw.
+- "Fast" is part of the definition of done for every milestone — a change that regresses a performance budget is not finished.
+
+**Honest grounding (consistent with the hardware section below):** raw *GPU-accelerated* throughput depends on vendor drivers that are long-horizon. So the mandate is precise: everything SentinelOS actually ships — the kernel, scheduler, memory, IPC, and the 2D Cyber Dusk path — must be **measurably best-in-class from the first release**, and stay that way.
 
 ## Strategy: Path A — pure from-scratch  (decided 2026-06-03)
 SentinelOS is built **from scratch in Rust** (x86_64 first, Limine boot). This **maximizes privacy and control** at the cost of compatibility speed.
