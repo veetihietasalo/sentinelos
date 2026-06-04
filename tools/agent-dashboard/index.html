@@ -83,7 +83,7 @@
 
   /* ── Pipeline ── */
   .pipeline-section {
-    margin-bottom: 28px;
+    margin-bottom: 24px;
   }
 
   .section-label {
@@ -103,6 +103,14 @@
     margin-left: 8px;
   }
 
+  .section-label .phase {
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: none;
+    color: var(--working);
+    margin-left: 8px;
+  }
+
   .pipeline {
     display: flex;
     align-items: center;
@@ -117,6 +125,9 @@
   }
 
   .stage {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     font-family: var(--mono);
     font-size: 11px;
     font-weight: 500;
@@ -124,13 +135,36 @@
     border-radius: 4px;
     color: var(--dim);
     white-space: nowrap;
-    transition: background 0.15s;
+    border: 1px solid transparent;
+    transition: background 0.15s, color 0.15s;
   }
 
-  .stage.active {
+  .stage .sdot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--line);
+    flex-shrink: 0;
+  }
+
+  .stage.done    { color: var(--done); }
+  .stage.done .sdot { background: var(--done); }
+
+  .stage.working {
     background: rgba(194, 162, 94, 0.15);
     color: var(--working);
-    border: 1px solid rgba(194, 162, 94, 0.3);
+    border-color: rgba(194, 162, 94, 0.3);
+  }
+  .stage.working .sdot { background: var(--working); }
+
+  .stage.blocked {
+    background: rgba(191, 107, 107, 0.12);
+    color: var(--blocked);
+    border-color: rgba(191, 107, 107, 0.3);
+  }
+  .stage.blocked .sdot { background: var(--blocked); }
+
+  .stage.current {
+    box-shadow: inset 0 0 0 1px currentColor;
+    font-weight: 600;
   }
 
   .stage-arrow {
@@ -140,16 +174,50 @@
     user-select: none;
   }
 
-  /* ── Agent grid ── */
-  .agents-section {
-    margin-bottom: 24px;
+  /* ── Filters ── */
+  .filters {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
   }
+
+  .filter-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 5px 10px;
+    cursor: pointer;
+    user-select: none;
+    transition: opacity 0.15s, border-color 0.15s;
+  }
+
+  .filter-chip:hover { border-color: var(--dim); }
+  .filter-chip .fc { color: var(--dim); }
+  .filter-chip.off { opacity: 0.4; text-decoration: line-through; }
+
+  /* ── Agent grid ── */
+  .agents-section { margin-bottom: 24px; }
 
   .grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
     gap: 12px;
     align-items: start;
+  }
+
+  .grid-empty {
+    color: var(--dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 12px 2px;
   }
 
   .card {
@@ -166,11 +234,7 @@
   .card[data-status="blocked"]  { border-left-color: var(--blocked); }
   .card[data-status="idle"]     { border-left-color: var(--idle); }
 
-  /* the clickable top region (toggles the flow) */
-  .card-top {
-    cursor: pointer;
-    user-select: none;
-  }
+  .card-top { cursor: pointer; user-select: none; }
 
   .card-header {
     display: flex;
@@ -224,11 +288,7 @@
     margin-bottom: 8px;
   }
 
-  .status-label {
-    font-size: 11px;
-    font-weight: 500;
-  }
-
+  .status-label { font-size: 11px; font-weight: 500; }
   .status-label.working { color: var(--working); }
   .status-label.done    { color: var(--done); }
   .status-label.blocked { color: var(--blocked); }
@@ -239,7 +299,6 @@
   .dot.blocked { background: var(--blocked); }
   .dot.idle    { background: var(--idle); }
 
-  /* chevron + event count, pushed to the right of the status row */
   .flow-count {
     margin-left: auto;
     font-family: var(--mono);
@@ -267,9 +326,7 @@
     text-overflow: ellipsis;
   }
 
-  .task-line.active-task {
-    color: var(--text);
-  }
+  .task-line.active-task { color: var(--text); }
 
   /* ── Output flow (expandable) ── */
   .card-flow {
@@ -327,29 +384,14 @@
   .flow-entry.latest { color: var(--text); }
   .flow-entry.latest::before { box-shadow: 0 0 0 2px var(--panel), 0 0 6px currentColor; }
 
-  .flow-ts {
-    color: var(--dim);
-    margin-right: 8px;
-    opacity: 0.85;
-  }
+  .flow-ts { color: var(--dim); margin-right: 8px; opacity: 0.85; }
 
-  .flow-verb {
-    font-weight: 600;
-    margin-right: 6px;
-  }
-
+  .flow-verb { font-weight: 600; margin-right: 6px; }
   .flow-verb.working { color: var(--working); }
   .flow-verb.done    { color: var(--done); }
   .flow-verb.blocked { color: var(--blocked); }
   .flow-verb.idle    { color: var(--idle); }
   .flow-verb.log     { color: var(--dim); }
-
-  .flow-empty {
-    font-family: var(--mono);
-    font-size: 10.5px;
-    color: var(--dim);
-    padding-left: 4px;
-  }
 
   /* ── Footer ── */
   footer {
@@ -361,7 +403,6 @@
     padding-top: 14px;
   }
 
-  /* ── Refresh indicator ── */
   .refresh-tick {
     display: inline-block;
     width: 5px;
@@ -373,9 +414,7 @@
     transition: background 0.3s;
   }
 
-  .refresh-tick.pulse {
-    background: var(--done);
-  }
+  .refresh-tick.pulse { background: var(--done); }
 </style>
 </head>
 <body>
@@ -386,23 +425,35 @@ const FALLBACK_DATA = {
   "project": "SentinelOS",
   "updated": "2026-06-04",
   "pipeline": ["spec","architect","implement","verify","test","review"],
-  "activeStage": "implement",
   "agents": [
     {"name":"kernel-architect","role":"Subsystem design & framekernel decomposition","model":"opus","status":"done","task":"Windowed-desktop design spec written","history":[]},
-    {"name":"hal-specialist","role":"The tiny unsafe HAL/arch TCB","model":"opus","status":"done","task":"Memory: frame allocator + paging + heap + global allocator","history":[]},
-    {"name":"kernel-engineer","role":"Safe-Rust kernel implementation","model":"sonnet","status":"working","task":"Deepening the shell: history + filesystem + more commands","history":[]},
+    {"name":"hal-specialist","role":"The tiny unsafe HAL/arch TCB","model":"opus","status":"done","task":"Memory: frame allocator + paging + heap","history":[]},
+    {"name":"kernel-engineer","role":"Safe-Rust kernel implementation","model":"sonnet","status":"working","task":"Windowed desktop: WM + apps","history":[]},
     {"name":"verification-engineer","role":"Miri + Kani + fuzz CI gate","model":"opus","status":"idle","task":"—","history":[]},
-    {"name":"test-engineer","role":"QEMU boot/integration tests","model":"sonnet","status":"done","task":"Deterministic boot test; full banner","history":[]},
-    {"name":"toolchain-engineer","role":"Limine, linker, target, xtask, CI","model":"sonnet","status":"working","task":"Building the SentinelOS demo video (Remotion + real QEMU frames)","history":[]},
+    {"name":"test-engineer","role":"QEMU boot/integration tests","model":"sonnet","status":"done","task":"Deterministic boot test","history":[]},
+    {"name":"toolchain-engineer","role":"Limine, linker, target, xtask, CI","model":"sonnet","status":"idle","task":"—","history":[]},
     {"name":"kernel-reviewer","role":"Adversarial review / human-gate","model":"opus","status":"done","task":"Sub-project #1: APPROVED","history":[]},
     {"name":"memory-engineer","role":"Frame allocator, VMM policy, kernel heap","model":"opus","status":"idle","task":"—","history":[]},
-    {"name":"driver-engineer","role":"Device drivers over HAL MMIO/port APIs","model":"sonnet","status":"working","task":"Networking: NIC driver + minimal stack","history":[]},
+    {"name":"driver-engineer","role":"Device drivers over HAL MMIO/port APIs","model":"sonnet","status":"done","task":"Networking: e1000 + ARP/IP/ICMP","history":[]},
     {"name":"scheduler-engineer","role":"Run queue, sync primitives, SMP","model":"opus","status":"idle","task":"—","history":[]},
     {"name":"security-engineer","role":"sentinel-core integration, capabilities, sandbox","model":"opus","status":"idle","task":"—","history":[]},
     {"name":"userland-engineer","role":"Syscall ABI, ELF loader, process lifecycle","model":"sonnet","status":"idle","task":"—","history":[]},
-    {"name":"ui-engineer","role":"Compositor, widgets, display — security-ops aesthetic","model":"sonnet","status":"done","task":"Terminal console renderer ready","history":[]},
+    {"name":"ui-engineer","role":"Compositor, widgets, display — security-ops aesthetic","model":"sonnet","status":"done","task":"Window chrome + compositor primitives","history":[]},
     {"name":"docs-writer","role":"Design docs, ADRs, API refs, dev-setup","model":"sonnet","status":"idle","task":"—","history":[]}
   ]
+};
+
+// Which agents belong to each pipeline stage — drives auto-detection of the
+// current phase (a stage is "working" if any of its agents is working, "done"
+// if work happened and all non-idle agents are done, else idle).
+const STAGE_AGENTS = {
+  spec:      ["kernel-architect", "docs-writer"],
+  architect: ["kernel-architect"],
+  implement: ["hal-specialist","memory-engineer","kernel-engineer","driver-engineer",
+              "ui-engineer","scheduler-engineer","userland-engineer","security-engineer"],
+  verify:    ["verification-engineer"],
+  test:      ["test-engineer"],
+  review:    ["kernel-reviewer"]
 };
 </script>
 
@@ -420,31 +471,62 @@ const FALLBACK_DATA = {
 </header>
 
 <div class="pipeline-section">
-  <div class="section-label">Pipeline</div>
+  <div class="section-label">Pipeline <span class="phase" id="phase-hint"></span></div>
   <div class="pipeline" id="pipeline"></div>
 </div>
 
 <div class="agents-section">
-  <div class="section-label">Agents <span class="hint">— click a card to expand its output flow</span></div>
+  <div class="section-label">Agents <span class="hint" id="agents-hint"></span></div>
+  <div class="filters" id="filters"></div>
   <div class="grid" id="grid"></div>
 </div>
 
 <footer>
-  live &nbsp;&middot;&nbsp; agents report via tools/agent-dashboard/set-status &nbsp;&middot;&nbsp; polls status.json every 5s
+  live &nbsp;&middot;&nbsp; phase auto-detected from agent states &nbsp;&middot;&nbsp; click a card for its output flow &nbsp;&middot;&nbsp; polls status.json every 5s
   <span class="refresh-tick" id="tick"></span>
 </footer>
 
 <script>
-// agent names whose flow is expanded — persisted across the 5s re-renders
-const expanded = new Set();
+const expanded = new Set();        // agent names whose flow is open
+const hidden = new Set();          // statuses currently filtered out
+let lastData = null;               // last payload, for re-render on filter toggle
+const STATUS_ORDER = ['working', 'done', 'idle', 'blocked'];
 
-function renderPipeline(stages, activeStage) {
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Pipeline auto-detection ───────────────────────────────────────────────
+function stageState(stage, agents) {
+  const names = STAGE_AGENTS[stage] || [];
+  const mine = agents.filter(a => names.includes(a.name));
+  if (mine.some(a => a.status === 'blocked')) return 'blocked';
+  if (mine.some(a => a.status === 'working')) return 'working';
+  if (mine.length && mine.some(a => a.status === 'done')
+      && mine.every(a => a.status === 'done' || a.status === 'idle')) return 'done';
+  return 'idle';
+}
+
+function renderPipeline(stages, agents) {
   const el = document.getElementById('pipeline');
   el.innerHTML = '';
+  const states = stages.map(s => stageState(s, agents));
+
+  // current phase: the rightmost working/blocked stage, else the rightmost done stage
+  let current = -1;
+  for (let i = 0; i < stages.length; i++) {
+    if (states[i] === 'working' || states[i] === 'blocked') current = i;
+  }
+  if (current === -1) {
+    for (let i = 0; i < stages.length; i++) if (states[i] === 'done') current = i;
+  }
+
   stages.forEach((s, i) => {
     const stage = document.createElement('span');
-    stage.className = 'stage' + (s === activeStage ? ' active' : '');
-    stage.textContent = s;
+    stage.className = 'stage ' + states[i] + (i === current ? ' current' : '');
+    stage.innerHTML = `<span class="sdot"></span>${escHtml(s)}`;
     el.appendChild(stage);
     if (i < stages.length - 1) {
       const arrow = document.createElement('span');
@@ -453,10 +535,38 @@ function renderPipeline(stages, activeStage) {
       el.appendChild(arrow);
     }
   });
+
+  const hint = document.getElementById('phase-hint');
+  if (current >= 0) {
+    const verb = states[current] === 'done' ? 'completed' : states[current];
+    hint.textContent = `— phase: ${stages[current]} (${verb})`;
+  } else {
+    hint.textContent = '';
+  }
 }
 
+// ── Status filters ────────────────────────────────────────────────────────
+function renderFilters(agents) {
+  const counts = { working: 0, done: 0, idle: 0, blocked: 0 };
+  agents.forEach(a => { if (counts[a.status] !== undefined) counts[a.status]++; });
+
+  const el = document.getElementById('filters');
+  el.innerHTML = '';
+  STATUS_ORDER.forEach(st => {
+    const chip = document.createElement('button');
+    chip.className = 'filter-chip ' + st + (hidden.has(st) ? ' off' : '');
+    chip.title = (hidden.has(st) ? 'show ' : 'hide ') + st + ' agents';
+    chip.innerHTML = `<span class="dot ${st}"></span> ${st} <span class="fc">${counts[st]}</span>`;
+    chip.addEventListener('click', () => {
+      if (hidden.has(st)) hidden.delete(st); else hidden.add(st);
+      if (lastData) render(lastData);   // re-render from cached data, no refetch
+    });
+    el.appendChild(chip);
+  });
+}
+
+// ── Output flow ───────────────────────────────────────────────────────────
 function fmtTime(ts) {
-  // "2026-06-04T10:42:13" → "10:42:13"; tolerate empty/date-only
   if (!ts) return '';
   const parts = String(ts).split('T');
   return (parts[1] || parts[0] || '').slice(0, 8);
@@ -465,8 +575,7 @@ function fmtTime(ts) {
 function flowHtml(a) {
   let hist = Array.isArray(a.history) ? a.history.slice() : [];
   if (hist.length === 0) {
-    // synthesize a "current" entry so an expanded card is never empty
-    hist = [{ ts: a._ts || '', kind: 'status', status: a.status, task: a.task }];
+    hist = [{ ts: '', kind: 'status', status: a.status, task: a.task }];
   }
   const rows = hist.map((e, i) => {
     const isLog = e.kind === 'log';
@@ -480,21 +589,30 @@ function flowHtml(a) {
       + `<span class="flow-task">${escHtml(e.task || '—')}</span>`
       + `</div>`;
   }).join('');
-  const n = hist.length;
   return `<div class="card-flow">
     <div class="flow-label">output flow</div>
     <div class="flow-list">${rows}</div>
   </div>`;
 }
 
+// ── Agent cards ───────────────────────────────────────────────────────────
 function renderAgents(agents) {
   const grid = document.getElementById('grid');
   grid.innerHTML = '';
-  agents.forEach(a => {
+  const visible = agents.filter(a => !hidden.has(a.status));
+
+  document.getElementById('agents-hint').textContent =
+    `— showing ${visible.length} of ${agents.length}`;
+
+  if (visible.length === 0) {
+    grid.innerHTML = '<div class="grid-empty">all agents hidden by the filters above.</div>';
+    return;
+  }
+
+  visible.forEach(a => {
     const card = document.createElement('div');
     card.className = 'card' + (expanded.has(a.name) ? ' expanded' : '');
     card.dataset.status = a.status;
-    card.dataset.name = a.name;
 
     const isActive = a.status === 'working';
     const statusClass = a.status;
@@ -535,16 +653,13 @@ function renderMeta(project, updated, updatedAt) {
     `project: ${project}  |  updated: ${stamp || '—'}`;
 }
 
-function escHtml(s) {
-  return String(s)
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
 function render(data) {
+  lastData = data;
+  const agents = data.agents || [];
   renderMeta(data.project, data.updated, data.updatedAt);
-  renderPipeline(data.pipeline, data.activeStage);
-  renderAgents(data.agents);
+  renderPipeline(data.pipeline || [], agents);
+  renderFilters(agents);
+  renderAgents(agents);
 }
 
 function pulseTick() {
@@ -565,7 +680,6 @@ async function load() {
   }
 }
 
-// Initial load + poll every 5s
 load();
 setInterval(load, 5000);
 </script>
