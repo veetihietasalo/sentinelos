@@ -87,11 +87,13 @@ jobs:
         run: cargo build --target x86_64-unknown-none
 
       # ── 9. Boot test (deterministic QEMU serial-output check) ─────────────
-      # cargo xtask test builds the ISO, spawns QEMU for 8 s, captures serial
-      # output to target/serial.log, and asserts the "SentinelOS" banner.
-      - name: cargo xtask test
+      # `make test` (host-detecting wrapper over xtask — works on this Linux
+      # runner and on macOS) builds the ISO, boots QEMU headless, captures serial
+      # output to target/serial.log, and asserts the "SentinelOS — boot bring-up
+      # OK" banner plus the boot-bringup-ok end-marker.
+      - name: make test (boot test)
         working-directory: kernel
-        run: cargo xtask test
+        run: make test
 
       # ── 10. Upload serial log on failure ─────────────────────────────────
       - name: Upload serial log (on failure)

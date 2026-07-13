@@ -20,13 +20,15 @@ rustflags = [
 ]
 
 [alias]
-# Build the xtask host binary and forward remaining args to it.
+# macOS-only convenience shortcut for the xtask host driver. The explicit
+# --target pins xtask to this host so it is NOT cross-compiled to the bare-metal
+# `build.target = "x86_64-unknown-none"` set above (which ships no std). xtask
+# lives in its own standalone workspace (kernel/xtask/Cargo.toml has [workspace]).
 #
-# --target aarch64-apple-darwin  — compile xtask for the host, not bare-metal.
-#   This overrides the workspace-wide `build.target = "x86_64-unknown-none"` above
-#   for this specific invocation.  CI on x86_64-linux should instead run:
-#     CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu cargo xtask <subcommand>
-#
-# xtask lives in its own standalone workspace (kernel/xtask/Cargo.toml has [workspace])
-# so it does not share kernel workspace deps or profiles.
+# A cargo alias cannot expand the host triple, so this hard-codes it — meaning
+# `cargo xtask` only works on aarch64-apple-darwin. For a PORTABLE runner that
+# works on Linux (CI / Claude Code on the web) and macOS alike, use the Makefile:
+#   make build | make run | make test | make screenshot
+# Because the --target here is explicit, CARGO_BUILD_TARGET does NOT override it;
+# the Makefile instead passes the detected host (`rustc -vV`) as --target.
 xtask = "run --manifest-path xtask/Cargo.toml --target aarch64-apple-darwin --target-dir target/xtask --"
