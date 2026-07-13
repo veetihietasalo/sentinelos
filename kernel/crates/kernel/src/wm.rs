@@ -593,7 +593,8 @@ impl WindowManager {
         if let Some(focused) = self.focused {
             if self.windows[focused].app.on_key(event) {
                 self.windows[focused].needs_redraw = true;
-                let content = ui::content_rect(self.windows[focused].bounds, &WindowChrome::cyber_dusk());
+                let content =
+                    ui::content_rect(self.windows[focused].bounds, &WindowChrome::cyber_dusk());
                 self.damage.push(content);
                 return WmAction::Redraw;
             }
@@ -721,10 +722,7 @@ impl WindowManager {
             // Only the portion of this damage rect not covered by any window needs
             // a backdrop erase. Cheap and correct for the few rects we hold: if no
             // window fully covers it, clear it (windows repaint over it below).
-            let covered = self
-                .windows
-                .iter()
-                .any(|w| rect_contains(w.bounds, *rect));
+            let covered = self.windows.iter().any(|w| rect_contains(w.bounds, *rect));
             if !covered {
                 ui::clear_rect(fb, *rect);
             }

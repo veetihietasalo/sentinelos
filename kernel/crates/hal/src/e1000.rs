@@ -439,7 +439,8 @@ pub fn init() -> Result<NicInfo, InitError> {
     if mmio_phys == 0 {
         return Err(InitError::NoMmio);
     }
-    let virt = mm::map_mmio(PhysAddr::new(mmio_phys), 128 * 1024).map_err(|_| InitError::MapFailed)?;
+    let virt =
+        mm::map_mmio(PhysAddr::new(mmio_phys), 128 * 1024).map_err(|_| InitError::MapFailed)?;
     let mmio = Mmio {
         base: virt.as_u64(),
     };
