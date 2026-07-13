@@ -56,8 +56,13 @@ jobs:
             ${{ runner.os }}-cargo-
 
       # ── 4. System dependencies ────────────────────────────────────────────
+      # `apt-get update` first: the runner image ships a stale package index, so
+      # a bare `install` can 404 on a superseded transitive dependency (observed
+      # with `ovmf`, pulled in by qemu-system-x86).
       - name: Install QEMU and xorriso
-        run: sudo apt-get install -y qemu-system-x86 xorriso
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 xorriso
 
       # ── 5. Limine (pinned to tag v11.4.1-binary on branch v11.x-binary) ──
       # Clone the exact tag so we get the pre-built BIOS/EFI binaries and the
