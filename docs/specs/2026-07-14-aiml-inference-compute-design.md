@@ -1,15 +1,15 @@
 # AI/ML Inference Compute Path — Design
 
-Status: **scalar + AVX2 + AVX-512F tiers implemented; AVX-512 VNNI / AMX tiers
+Status: **scalar + AVX2 + AVX-512F + AVX-512 VNNI tiers implemented; AMX tier
 proposed** · Track C (AI/ML compute), step 1 · Author: kernel / compute track
 Depends on: `hal::cpuid` AMX + AVX-512 **detection** (C1, shipped — `Feature`
 flags `amx_tile`/`amx_int8`/`amx_bf16`/`avx512f`/`avx512_vnni`/`avx512_bf16`).
-Escalation: the scalar tier is pure **safe** Rust (no TCB change). The AVX2 and
-AVX-512F tiers add inline-`asm!` vector kernels + `CR4.OSXSAVE`/`XCR0` enablement
-(new TCB, shipped — hal-tcb.md §2j, SM1/SM2 + C11/C12); the VNNI and AMX tiers add
-`XFD`/tile-config on top. Each TCB-touching phase requires kernel-reviewer +
-verification-engineer sign-off (charter invariants #2/#6), same gate as the SMP
-MSR path.
+Escalation: the scalar tier is pure **safe** Rust (no TCB change). The AVX2,
+AVX-512F, and VNNI tiers add inline-`asm!` vector kernels + `CR4.OSXSAVE`/`XCR0`
+enablement (new TCB, shipped — hal-tcb.md §2j, SM1/SM2/SM3 + C11/C12; VNNI reuses
+the `avx512f` `ZMM` state, no new privileged op); the AMX tier adds `XFD`/tile-config
+on top. Each TCB-touching phase requires kernel-reviewer + verification-engineer
+sign-off (charter invariants #2/#6), same gate as the SMP MSR path.
 
 ## Goal
 
@@ -53,22 +53,22 @@ scalar reference (a differential test, not a tolerance).
 | **Scalar** | plain `i32 += i8*i8` loop | always | **implemented** — the reference |
 | **AVX2** | `VPMULLD`/`VPADDD` (256-bit, broadcast-A × 8 cols/step) | `avx2` | **implemented** (`hal::simd`) |
 | **AVX-512F** | `VPMULLD`/`VPADDD` (512-bit, broadcast-A × 16 cols/step) | `avx512f` | **implemented** (`hal::simd`) |
-| **AVX-512 VNNI** | `VPDPBUSD` (512-bit, fused 4×int8 dot-product/lane) | `avx512_vnni` (+`avx512f`/`bw`/`vl`) | proposed |
+| **AVX-512 VNNI** | `VPDPBUSD` (512-bit, fused unsigned×signed 4×int8 dot-product/lane) | `avx512_vnni` (+`avx512f`) | **implemented** (`hal::simd`) |
 | **AMX int8** | `TDPBSSD` on tile registers | `amx_int8` + `amx_tile` | proposed |
 
 Note the AVX-512F tier is the **same broadcast scheme** as AVX2, just 512-bit (16
-columns/step) — it uses the foundation `VPMULLD`/`VPADDD` ops, distinct from the
-proposed VNNI tier's fused `VPDPBUSD` dot-product (which needs a packed B-panel
-layout). It is a genuine throughput step (2× the columns/step of AVX2) that ships
-now because it reuses the proven kernel structure verbatim.
+columns/step) — it uses the foundation `VPMULLD`/`VPADDD` ops, distinct from the VNNI
+tier's fused `VPDPBUSD` dot-product (which needs a packed B-panel layout + an
+unsigned/signed bias correction). Both ship now: AVX-512F because it reuses the
+proven broadcast structure verbatim, and VNNI as the genuine throughput jump (64
+int8 MACs/step vs. 16).
 
 `detected_capability()` reports the best tier the CPU *advertises*; `active_tier()`
-reports the best tier actually *implemented and verified* — AVX-512F when present
-and its self-test passes, else AVX2 when present and its self-test passes (see
-Phases 2–3), else Scalar. `gemm_i8` dispatches best-first (AVX-512F → AVX2 →
-scalar), so the result is always correct and never claims a tier it does not run.
-The boot proof prints both `detected` and `active` so the gap is visible, not
-hidden.
+reports the best tier actually *implemented and verified* — VNNI, else AVX-512F,
+else AVX2 (each when present *and* its self-test passes; see Phases 2–4), else
+Scalar. `gemm_i8` dispatches best-first (VNNI → AVX-512F → AVX2 → scalar), so the
+result is always correct and never claims a tier it does not run. The boot proof
+prints both `detected` and `active` so the gap is visible, not hidden.
 
 ## Phase 1 — scalar reference + dispatch (**implemented**)
 
@@ -176,20 +176,40 @@ a `detected=avx512-vnni` boot). The KVM boot job accepts `active=avx2` **or**
 `active=avx512f` (plus `int8 GEMM ok`), so it proves whichever tier the assigned
 runner's silicon supports without a flaky dependency on landing AVX-512 hardware.
 
-## Phase 4 — AVX-512 VNNI tier (proposed)
+## Phase 4 — AVX-512 VNNI tier (**implemented**)
 
-A throughput upgrade over Phase 3 on the same 512-bit substrate: replace the
-`VPMULLD`+`VPADDD` broadcast with a `VPDPBUSD`-based kernel (a fused 4×int8
-dot-product-accumulate per lane), selected when `avx512_vnni` is present. Unlike
-Phase 3, `VPDPBUSD` needs the B operand **packed** into a `[k/4][n][4]` layout so
-each lane sees 4 contiguous K values — a real restructuring, which is why it is a
-separate later phase rather than folded into the AVX-512F widening. The vector-state
-enablement is already done (Phase 3 turns on `ZMM` state). The `VPDPBUSD` inner step
-is inline `asm!` (EVEX) for the same soft-float reason, validated by the same
-bit-identical-vs-scalar differential harness + self-test. Reachable on the same
-AVX-512 KVM runners as Phase 3 (`detected=avx512-vnni`), so an opportunistic KVM
-proof (assert `active=avx512-vnni` *when* `detected=avx512-vnni`) is feasible; the
-self-test keeps the tier dormant wherever the hardware is absent.
+The throughput jump over Phase 3 on the same 512-bit substrate: a `VPDPBUSD`-based
+kernel (a fused 4×int8 dot-product-accumulate per lane — 64 int8 MACs/step vs. 16),
+selected when `avx512_vnni` is present. No new privileged setup: VNNI reuses the
+`avx512f` `ZMM` state Phase 3 already enables, so the only additions are a `cpuid`
+gate + a self-test + the kernel.
+
+**The two hard parts** (why it is a distinct phase, not a fold-in of the widening):
+
+1. **Unsigned×signed asymmetry.** `VPDPBUSD` multiplies **unsigned** bytes (operand
+   1) by **signed** bytes (operand 2); our operands are both signed int8. So the
+   kernel biases `A` into unsigned range (`au = a + 128`, i.e. `a ^ 0x80` on the
+   byte), accumulates `Σ_k au·b` with `VPDPBUSD`, then subtracts the correction
+   `128·Σ_k B[k][j]` per output column `j`. Per term `au·b − 128·b = a·b` exactly in
+   ℤ, and since every op is `wrapping` (mod 2³²) and `VPDPBUSD` wraps (it is *not*
+   the saturating `VPDPBUSDS`), the whole thing is a ring identity mod 2³² →
+   **bit-identical** to the ascending-`k` scalar `wrapping_add`.
+2. **Packed B panel.** Each `VPDPBUSD` lane needs 4 contiguous K values for its
+   column, so B is packed into a `[⌈k/4⌉][16][4]` panel per 16-column block (the
+   last K-group zero-padded when `k % 4 ≠ 0`; zero padding contributes 0 to both the
+   dot-product and the column-sum correction). The kernel packs one 64-byte panel per
+   (block, K-group) on the **stack** and reuses it across all `m` rows via the
+   in-memory C accumulators — so it stays **alloc-free**. An `n`-tail (`< 16`
+   columns) is handled by the plain signed scalar loop.
+
+The `VPDPBUSD` inner step is inline `asm!` (`vnni_dp16`, EVEX) for the same
+soft-float-codegen reason as the other tiers (hal-tcb.md SM3); the packing and bias
+correction are **safe** Rust. Validated by the same bit-identical-vs-scalar
+differential harness + boot self-test (with a `k` not-÷-4 case added), and the bias
+math was cross-checked standalone against the `VPDPBUSD` intrinsic over 212 shapes on
+an `avx512vnni` host before the asm kernel was written. TCG cannot execute it (drops
+the AVX-512 CPUID bits), so it's dormant there (`active` falls to `avx512f`/`avx2`);
+the KVM boot job accepts `active=avx512-vnni` on runners that expose VNNI.
 
 ## Phase 5 — AMX int8 tier (proposed)
 
@@ -235,16 +255,30 @@ against the scalar reference bit-for-bit, exactly like phase 2.
   (falls to AVX2/scalar) wherever `avx512f` is absent, so nothing computes garbage.
   `asm!` is Miri/Kani-opaque, so SM2's dynamic coverage is the host harness + boot
   self-test.
-- **Phases 4–5 (AVX-512 VNNI, AMX):** same differential-vs-scalar oracle + a
-  self-test, but they can only *execute* where the hardware exists: QEMU 8.2 TCG
-  does not emulate AVX-512/AMX (drops the CPUID bits, like x2APIC). AVX-512 VNNI
-  *is* present on some GitHub KVM runners (observed `detected=avx512-vnni`), so it
-  can be proven opportunistically there; AMX (Sapphire-Rapids+) has not been seen
-  and needs dedicated hardware. The self-test keeps them dormant (scalar fallback)
-  everywhere they can't run, so nothing computes garbage. The
-  XCR0/XFD/tile-config `XSETBV`/MSR writes are inline-asm (Miri/Kani-opaque, like
-  the SMP MSRs) → verified by reasoning + the differential test + hardware boot
-  evidence.
+- **Phase 4 (AVX-512 VNNI, now):** the same differential-vs-scalar oracle, extended
+  to the VNNI kernel — the host harness picks up `avx512vnni` via
+  `is_x86_feature_detected!` and diffs `VPDPBUSD`+bias-correction against scalar over
+  the full shape sweep (`k` not ÷ 4 to exercise K-group padding, `n` not ÷ 16, ±127,
+  the i32-wrap case, and the 300-shape sweep); verified locally on an `avx512vnni`
+  host. Because that hardware differential test **skips** on stock CI runners, the
+  novel part — the unsigned/signed **bias-correction ring identity** — also gets an
+  *always-on, hardware-independent* guard: a pure model (`vnni_cell_bias`, no `asm!`)
+  proven equal to the scalar dot product by a Kani harness (symbolic bytes) and by
+  host tests that run on **every** runner and under Miri (a 2000-shape sweep + a
+  wrap case). TCG cannot execute the kernel, so the always-on Kernel CI shows
+  `active=avx2`; the KVM boot job asserts `active=avx512-vnni` + `int8 GEMM ok` on
+  runners that expose VNNI — **observed** on the tier's first CI run (serial log
+  archived), which also confirms the AVX-512 `XCR0` enablement + the AVX-512F self-
+  test at CPL-0. The boot self-test keeps the tier dormant wherever `avx512_vnni` is
+  absent. The `asm!` step is Miri/Kani-opaque, so SM3's dynamic coverage is the host
+  harness + boot self-test + the always-on bias guard.
+- **Phase 5 (AMX, proposed):** same differential-vs-scalar oracle + a self-test, but
+  it can only *execute* where the hardware exists: QEMU 8.2 TCG does not emulate AMX
+  (drops the CPUID bits, like x2APIC); AMX (Sapphire-Rapids+) has not been seen on
+  the KVM runner fleet and needs dedicated hardware. The self-test keeps it dormant
+  (scalar fallback) everywhere it can't run, so nothing computes garbage. The
+  XCR0/XFD/tile-config `XSETBV`/MSR writes are inline-asm (Miri/Kani-opaque, like the
+  SMP MSRs) → verified by reasoning + the differential test + hardware boot evidence.
 
 ## Open questions
 

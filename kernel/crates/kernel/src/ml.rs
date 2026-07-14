@@ -10,10 +10,10 @@
 //! This is entirely **safe** Rust (the crate is `#![forbid(unsafe_code)]`): the
 //! scalar reference and the dispatch only read the existing safe
 //! [`hal::cpuid::info`] and compute; the vector kernels live behind safe wrappers
-//! in the `hal` TCB. The **AVX2** and **AVX-512 Foundation** tiers are implemented
-//! ([`hal::simd`], `XCR0`-gated inline `asm!`); the **AVX-512 VNNI** (`VPDPBUSD`)
-//! and **AMX** (`XFD`/tile-config) throughput tiers are detected but not yet
-//! implemented — designed later phases. Every vector tier is validated
+//! in the `hal` TCB. The **AVX2**, **AVX-512 Foundation**, and **AVX-512 VNNI**
+//! (`VPDPBUSD`) tiers are implemented ([`hal::simd`], `XCR0`-gated inline `asm!`);
+//! the **AMX** (`XFD`/tile-config) throughput tier is detected but not yet
+//! implemented — a designed later phase. Every vector tier is validated
 //! **bit-for-bit** against the scalar reference here, since the int8→i32 GEMM is
 //! exact. See `docs/specs/2026-07-14-aiml-inference-compute-design.md`.
 
@@ -33,7 +33,8 @@ pub enum Tier {
     /// `avx512f`. Distinct from [`Tier::Avx512Vnni`]: this uses the foundation
     /// `VPMULLD`/`VPADDD` ops, not the fused `VPDPBUSD` dot-product.
     Avx512F,
-    /// AVX-512 VNNI (`VPDPBUSD`, 64×int8 per step). Detected via `avx512_vnni`.
+    /// AVX-512 VNNI (`VPDPBUSD`, fused unsigned×signed 4×int8 dot-product, 64×int8
+    /// per step) — implemented (`hal::simd`). Detected via `avx512_vnni`.
     Avx512Vnni,
     /// AMX int8 tiles (`TDPBSSD`). Detected via `amx_int8` + `amx_tile`.
     Amx,
@@ -102,16 +103,19 @@ pub fn detected_capability(info: &CpuInfo) -> Tier {
 
 /// The best tier actually *implemented and runnable* right now.
 ///
-/// **AVX-512F** and **AVX2** are implemented ([`hal::simd`]); each is selected when
-/// the CPU advertises it *and* its vector state is enabled and the boot self-test
-/// passed ([`hal::simd::avx512_ready`] / [`hal::simd::avx2_ready`]), best first,
-/// else scalar. AVX-512 VNNI and AMX are detected but not yet implemented, so they
-/// never become active (they fall back through [`gemm_i8`] to the AVX-512F/AVX2/
-/// scalar kernels). [`gemm_i8`] dispatches to this, so the result is always correct
-/// and never claims a tier it does not run.
+/// **AVX-512 VNNI**, **AVX-512F**, and **AVX2** are implemented ([`hal::simd`]);
+/// each is selected when the CPU advertises it *and* its vector state is enabled and
+/// the boot self-test passed ([`hal::simd::avx512vnni_ready`] /
+/// [`hal::simd::avx512_ready`] / [`hal::simd::avx2_ready`]), best first, else scalar.
+/// AMX is detected but not yet implemented, so it never becomes active (it falls
+/// back through [`gemm_i8`] to the VNNI/AVX-512F/AVX2/scalar kernels). [`gemm_i8`]
+/// dispatches to this, so the result is always correct and never claims a tier it
+/// does not run.
 #[must_use]
 pub fn active_tier() -> Tier {
-    if hal::simd::avx512_ready() {
+    if hal::simd::avx512vnni_ready() {
+        Tier::Avx512Vnni
+    } else if hal::simd::avx512_ready() {
         Tier::Avx512F
     } else if hal::simd::avx2_ready() {
         Tier::Avx2
@@ -220,13 +224,17 @@ pub fn gemm_i8_scalar(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: 
 
 /// Public int8 GEMM entry — dispatches to the best *implemented* kernel.
 ///
-/// Tries the AVX-512F vector kernel ([`hal::simd::gemm_i8_avx512`]) first, then the
-/// AVX2 one ([`hal::simd::gemm_i8_avx2`]); each self-checks its feature + enabled
-/// vector state and returns `false` when unavailable (or on bad dims), so we fall
-/// through to the next tier and finally the scalar reference. All three produce
-/// bit-identical results. The AVX-512 VNNI and AMX kernels slot in here (tried
-/// before AVX-512F) once implemented (design doc phases 4/5).
+/// Tries the AVX-512 VNNI kernel ([`hal::simd::gemm_i8_avx512vnni`]) first, then
+/// AVX-512F ([`hal::simd::gemm_i8_avx512`]), then AVX2
+/// ([`hal::simd::gemm_i8_avx2`]); each self-checks its feature + enabled vector
+/// state and returns `false` when unavailable (or on bad dims), so we fall through
+/// to the next tier and finally the scalar reference. All four produce bit-identical
+/// results. The AMX kernel slots in here (tried first) once implemented (design doc
+/// phase 5).
 pub fn gemm_i8(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) {
+    if hal::simd::gemm_i8_avx512vnni(a, b, c, m, k, n) {
+        return;
+    }
     if hal::simd::gemm_i8_avx512(a, b, c, m, k, n) {
         return;
     }

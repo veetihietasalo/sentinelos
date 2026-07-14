@@ -70,15 +70,18 @@ pub fn kmain() -> ! {
     // run before `ml::prove()` below (and any other AVX use). See the SIMD design
     // doc + hal-tcb.md.
     if hal::simd::enable() {
-        if hal::simd::avx2_ready() {
-            hal::println!(
-                "[simd] AVX enabled; AVX2 int8 GEMM self-test PASSED (vector tier active)"
-            );
-        } else {
-            hal::println!(
-                "[simd] AVX enabled; AVX2 unavailable or self-test failed — ML on scalar tier"
-            );
-        }
+        // Report each vector tier's boot self-test result (fmt-free — integer/format
+        // `println!` faults on this target; see `memory.rs`). `ok` means the tier's
+        // hand-written `asm!` kernel matched the scalar reference bit-for-bit on this
+        // core and is live; `no` means absent or self-test-failed → it falls back.
+        let yn = |ready: bool| if ready { "ok" } else { "no" };
+        hal::serial::write_str("[simd] vector state enabled; int8 GEMM self-test: avx2=");
+        hal::serial::write_str(yn(hal::simd::avx2_ready()));
+        hal::serial::write_str(" avx512f=");
+        hal::serial::write_str(yn(hal::simd::avx512_ready()));
+        hal::serial::write_str(" avx512-vnni=");
+        hal::serial::write_str(yn(hal::simd::avx512vnni_ready()));
+        hal::serial::write_str("\n");
     } else {
         hal::println!("[simd] AVX not advertised; ML compute stays on the scalar tier");
     }

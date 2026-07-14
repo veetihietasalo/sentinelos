@@ -1,48 +1,53 @@
-//! SIMD acceleration — AVX vector-state enablement + an AVX2 int8 GEMM kernel.
+//! SIMD acceleration — AVX/AVX-512 vector-state enablement + tiered int8 GEMM.
 //!
 //! This is the first vector code in the TCB. It has two responsibilities:
 //!
-//! 1. [`enable`] — turn on AVX (`YMM`) state so `avx`/`avx2` instructions do not
-//!    `#UD`: set `CR4.OSXSAVE`, then OR the x87|SSE|AVX component bits into `XCR0`
-//!    via `xsetbv`. Gated on `cpuid` (`xsave` + `avx`), idempotent, called once at
+//! 1. [`enable`] — turn on vector state so `avx`/`avx2`/`avx512*` instructions do
+//!    not `#UD`: set `CR4.OSXSAVE`, then OR the x87|SSE|AVX component bits into
+//!    `XCR0` via `xsetbv` (plus the three AVX-512 component bits where `avx512f` is
+//!    advertised). Gated on `cpuid` (`xsave` + `avx`), idempotent, called once at
 //!    boot. Mirrors [`crate::cpu_security::enable`] in shape and safety argument.
-//! 2. [`gemm_i8_avx2`] — a **safe** wrapper over an int8·int8 → i32 matrix multiply
-//!    whose 256-bit inner step is hand-written inline `asm!` (VEX). It only runs the
-//!    vector kernel when the boot-time self-test has verified it usable
-//!    ([`avx2_ready`]), returning `false` otherwise so the caller falls back to its
-//!    scalar reference. So it can never `#UD`, and the `kernel` crate stays
-//!    `#![forbid(unsafe_code)]`.
+//! 2. Three **safe** wrappers over an int8·int8 → i32 matrix multiply, best-to-worst
+//!    throughput: [`gemm_i8_avx512vnni`] (512-bit fused `VPDPBUSD`),
+//!    [`gemm_i8_avx512`] (512-bit `VPMULLD` broadcast), and [`gemm_i8_avx2`]
+//!    (256-bit). Each inner step is hand-written inline `asm!` (VEX/EVEX) and only
+//!    runs once the boot-time self-test has verified it usable
+//!    ([`avx512vnni_ready`]/[`avx512_ready`]/[`avx2_ready`]), returning `false`
+//!    otherwise so the caller falls back to a narrower tier / its scalar reference.
+//!    So none can ever `#UD`, and the `kernel` crate stays `#![forbid(unsafe_code)]`.
 //!
 //! **Why `asm!`, not `core::arch` intrinsics.** The target `x86_64-unknown-none`
 //! has SSE/AVX disabled in its baseline (soft-float). On it, the SIMD *intrinsics*
-//! do **not** codegen to VEX instructions — a debug build emits them as calls that
-//! never lower to `vpmulld`, and passing `__m256i` across that call on the
-//! soft-float ABI corrupts the vector values (the kernel then computes wrong
+//! do **not** codegen to VEX/EVEX instructions — a debug build emits them as calls
+//! that never lower to `vpmulld`, and passing `__m256i`/`__m512i` across that call
+//! on the soft-float ABI corrupts the vector values (the kernel then computes wrong
 //! results on real hardware, which the self-test caught during bring-up). Inline
 //! `asm!` emits the exact instructions unconditionally, and the vectors live
 //! entirely inside each `asm!` block (only `i32`/pointers cross the call boundary),
 //! so there is no vector-ABI dependency. See [`avx2_madd8`].
 //!
-//! **Correctness contract.** The AVX2 kernel is **bit-identical** to a scalar
-//! `wrapping_add` accumulation: for each output cell it sums the products over the
-//! K dimension in ascending order (integer `wrapping_add` is associative + mod-2³²,
-//! so the SIMD-over-columns reordering cannot change any result). Asserted by the
-//! host differential test below (AVX2 vs. scalar over many shapes — non-multiples
-//! of 8, negatives, ±127 extremes, and a large-`k` accumulator-wrap case) and
-//! re-checked at every boot by the [`enable`] self-test.
+//! **Correctness contract.** Every tier is **bit-identical** to a scalar
+//! `wrapping_add` accumulation over the K dimension: integer `wrapping_add` is
+//! associative + mod-2³², so the SIMD-over-columns reordering cannot change any
+//! result. The VNNI tier additionally uses an unsigned/signed **bias correction**
+//! (`Σ (a+128)·b − 128·Σ b = Σ a·b`, a ring identity mod 2³²) to drive the
+//! unsigned×signed `VPDPBUSD`; see [`gemm_i8_avx512vnni`]. All are asserted by the
+//! host differential test below (each vector kernel vs. scalar over many shapes —
+//! non-multiples of the step width, negatives, ±127 extremes, `k` not ÷ 4, and a
+//! large-`k` accumulator-wrap case) and re-checked at every boot by [`enable`].
 //!
 //! **Interrupt precondition (hard).** The interrupt stubs ([`crate::idt`]) save
-//! only the general-purpose registers, **not** `XMM`/`YMM`. So [`gemm_i8_avx2`]
-//! must run with interrupts **disabled** until `XSAVE`-based save/restore lands: an
-//! IRQ landing mid-kernel whose handler the compiler emitted any `XMM` use into (a
-//! `memcpy`/struct copy suffices) would clobber the in-flight accumulators →
-//! silently wrong output. Both current callers run in the interrupts-off boot
-//! window; see [`gemm_i8_avx2`].
+//! only the general-purpose registers, **not** `XMM`/`YMM`/`ZMM`. So the GEMM
+//! wrappers must run with interrupts **disabled** until `XSAVE`-based save/restore
+//! lands: an IRQ landing mid-kernel whose handler the compiler emitted any vector
+//! use into (a `memcpy`/struct copy suffices) would clobber the in-flight
+//! accumulators → silently wrong output. Both current callers run in the
+//! interrupts-off boot window; see [`gemm_i8_avx2`].
 //!
-//! **SMP note.** AVX state (`CR4.OSXSAVE` + `XCR0`) is **per-core**; [`enable`] must
-//! run on each AP before any GEMM on that AP once SMP lands (the [`avx2_ready`]
-//! flag is global, so an AP must not run the kernel on the BSP's flag before
-//! enabling its own AVX state).
+//! **SMP note.** Vector state (`CR4.OSXSAVE` + `XCR0`) is **per-core**; [`enable`]
+//! must run on each AP before any GEMM on that AP once SMP lands (the `*_ready`
+//! flags are global, so an AP must not run a kernel on the BSP's flag before
+//! enabling its own vector state).
 
 use crate::cpu;
 use crate::cpuid;
@@ -76,6 +81,9 @@ const CPUID_EBX7_AVX2: u32 = 1 << 5;
 /// `cpuid` leaf 7 sub-leaf 0 EBX bit 16 — AVX-512 Foundation (the 512-bit `ZMM`
 /// integer ops `VPMOVSXBD`/`VPMULLD`/`VPADDD`/`VPBROADCASTD` this tier uses).
 const CPUID_EBX7_AVX512F: u32 = 1 << 16;
+/// `cpuid` leaf 7 sub-leaf 0 ECX bit 11 — AVX-512 VNNI (`VPDPBUSD`, the fused
+/// unsigned×signed 4×int8 dot-product-accumulate the throughput tier uses).
+const CPUID_ECX7_AVX512VNNI: u32 = 1 << 11;
 
 /// Cached AVX2 usability: `0` = unverified / unavailable, `1` = verified usable.
 /// Set to `1` by [`enable`] **only** after the boot-time self-test passes; read by
@@ -87,6 +95,12 @@ static AVX2_STATUS: AtomicU8 = AtomicU8::new(0);
 /// Cached AVX-512F usability, same contract as [`AVX2_STATUS`] but for the 512-bit
 /// `ZMM` kernel: set by [`enable`] only after the AVX-512 self-test passes.
 static AVX512_STATUS: AtomicU8 = AtomicU8::new(0);
+
+/// Cached AVX-512 VNNI usability, same contract as [`AVX2_STATUS`] but for the
+/// `VPDPBUSD` kernel: set by [`enable`] only after the VNNI self-test passes. VNNI
+/// reuses the AVX-512 `ZMM` vector state (`XCR0`) already enabled for `avx512f`, so
+/// no extra privileged setup is needed — only a `cpuid` gate + the self-test.
+static AVX512VNNI_STATUS: AtomicU8 = AtomicU8::new(0);
 
 /// Enable AVX (`YMM`, and — where present — AVX-512 `ZMM`) vector state on this
 /// core and **self-test** each vector kernel before trusting it. Returns `true` if
@@ -134,6 +148,13 @@ pub fn enable() -> bool {
     if want_avx512 && self_test(gemm_i8_avx512_impl) {
         AVX512_STATUS.store(1, Ordering::Relaxed);
     }
+    // VNNI (`VPDPBUSD`) runs on the same `ZMM` state as `avx512f`, so it needs no
+    // extra `XCR0` setup — only that state is on (`want_avx512`) and the op is
+    // advertised. `avx512_vnni` implies `avx512f`, so `want_avx512` is already true
+    // here; the explicit conjunction documents the ZMM-state dependency.
+    if want_avx512 && avx512vnni_advertised() && self_test(gemm_i8_avx512vnni_impl) {
+        AVX512VNNI_STATUS.store(1, Ordering::Relaxed);
+    }
     true
 }
 
@@ -164,6 +185,19 @@ pub fn avx512_ready() -> bool {
     AVX512_STATUS.load(Ordering::Relaxed) == 1
 }
 
+/// Whether `cpuid` advertises AVX-512 VNNI (leaf 7 ECX bit 11).
+fn avx512vnni_advertised() -> bool {
+    cpuid::max_standard_leaf() >= 7 && cpuid::raw(7, 0).ecx & CPUID_ECX7_AVX512VNNI != 0
+}
+
+/// Whether the AVX-512 VNNI int8 GEMM is **verified usable** on this core — AVX-512
+/// state enabled *and* the boot-time [`self_test`] passed. Same contract and
+/// cheapness as [`avx2_ready`]; the sole gate [`gemm_i8_avx512vnni`] consults.
+#[must_use]
+pub fn avx512vnni_ready() -> bool {
+    AVX512VNNI_STATUS.load(Ordering::Relaxed) == 1
+}
+
 /// A vector int8 GEMM kernel signature (AVX2 or AVX-512) for the self-test and the
 /// host differential harness. `unsafe`: the CPU must support the tier and its
 /// vector state must be enabled (both ensured by [`enable`] before it is called).
@@ -171,19 +205,22 @@ type Kernel = unsafe fn(&[i8], &[i8], &mut [i32], usize, usize, usize);
 
 /// Boot-time differential self-test of a vector `kernel`: run several fixed GEMMs
 /// through both it and an inline scalar loop, returning whether they agree
-/// bit-for-bit. The cases cover the paths a broken vector unit could affect for
-/// both the 8-wide (AVX2) and 16-wide (AVX-512) step: a single sub-block with mixed
-/// signs + a zero, a shape with a scalar tail at the **±127** extremes, and a
-/// **multi-block** shape (`n = 33`). Called by [`enable`] only after the tier's
+/// bit-for-bit. The cases cover the paths a broken vector unit could affect for the
+/// 8-wide (AVX2), 16-wide (AVX-512F), and VNNI (`VPDPBUSD`, 4-wide-K) steps: a
+/// single sub-block with mixed signs + a zero, a shape with a scalar tail at the
+/// **±127** extremes, a **multi-block** shape (`n = 33`), and a **`k` not a multiple
+/// of 4** shape (`k = 6`) that exercises VNNI's K-group zero-padding + its
+/// unsigned/signed bias correction. Called by [`enable`] only after the tier's
 /// vector state is on and it is `cpuid`-advertised, so the instructions are legal.
 ///
 /// An i32-accumulator *wrap* would need `k > 133k` with int8 operands — far too
-/// large for a boot check — so `VPADDD == wrapping_add` over a wrapping `k` is
-/// confirmed in the host differential test instead, not here.
+/// large for a boot check — so `VPADDD`/`VPDPBUSD == wrapping_add` over a wrapping
+/// `k` is confirmed in the host differential test instead, not here.
 fn self_test(kernel: Kernel) -> bool {
     self_test_case(kernel, 2, 8, 8, false)
         && self_test_case(kernel, 3, 8, 17, true)
         && self_test_case(kernel, 2, 8, 33, false)
+        && self_test_case(kernel, 2, 6, 17, false)
 }
 
 /// One self-test case: fill `A`/`B` deterministically (`extremes` ⇒ a ±127
@@ -468,12 +505,213 @@ unsafe fn avx512_madd16(a_ip: i32, b: *const i8, c: *mut i32) {
     }
 }
 
+/// AVX-512 **VNNI** int8 GEMM: `C[m×n] = A[m×k] · B[k×n]`, **bit-identical** to the
+/// scalar reference — the throughput tier, using `VPDPBUSD` (a fused
+/// unsigned×signed 4×int8 dot-product-accumulate, 64 int8 MACs per 512-bit step).
+/// Returns `true` if it ran, or `false` (→ caller falls back to a narrower tier)
+/// when VNNI is not verified usable ([`avx512vnni_ready`]) or the dims are
+/// inconsistent. Never `#UD`s, never panics. Same hard **interrupts-disabled**
+/// precondition as [`gemm_i8_avx2`].
+///
+/// # The unsigned/signed bias correction (why this is bit-exact)
+///
+/// `VPDPBUSD` multiplies **unsigned** bytes (operand 1) by **signed** bytes
+/// (operand 2). Our operands are both *signed* int8. So we bias `A` into unsigned
+/// range — `au = a + 128` (a `^ 0x80` on the byte) — accumulate `Σ_k au·b` with
+/// `VPDPBUSD`, then subtract the correction `128·Σ_k B[k][j]` (per output column
+/// `j`). Per term `au·b − 128·b = (a+128−128)·b = a·b` exactly in ℤ; since every op
+/// is `wrapping` (mod 2³²) and `VPDPBUSD` wraps (it is *not* the saturating
+/// `VPDPBUSDS`), the whole reordering is a ring identity mod 2³² → bit-identical to
+/// the ascending-`k` scalar `wrapping_add`. Verified against the scalar reference in
+/// the host differential test (incl. `k` not ÷ 4, `n` not ÷ 16, ±127, and an i32
+/// wrap) and re-checked at every boot by the [`enable`] self-test.
+#[must_use]
+pub fn gemm_i8_avx512vnni(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) -> bool {
+    let (Some(mk), Some(kn), Some(mn)) = (m.checked_mul(k), k.checked_mul(n), m.checked_mul(n))
+    else {
+        return false;
+    };
+    if a.len() != mk || b.len() != kn || c.len() != mn {
+        return false;
+    }
+    if !avx512vnni_ready() {
+        return false;
+    }
+    // SAFETY: `avx512vnni_ready()` is `true` only after `enable` turned on AVX-512
+    // (`ZMM`) state AND the self-test executed this kernel correctly on this core, so
+    // the `VPDPBUSD` instruction is legal (no `#UD`). The lengths were validated
+    // above (overflow-checked), so every in-kernel load/store stays within
+    // `a`/`b`/`c`; `a`/`b` shared, `c` exclusive; caller runs with interrupts off.
+    unsafe {
+        gemm_i8_avx512vnni_impl(a, b, c, m, k, n);
+    }
+    true
+}
+
+/// The AVX-512 VNNI kernel. Processes 16 output columns per block; within a block,
+/// accumulates over `⌈k/4⌉` groups of four K values via `VPDPBUSD` (broadcasting the
+/// biased 4-byte `A` group across all 16 lanes and reading a packed 16×4 `B` panel),
+/// then applies the `−128·Σ_k B[k][j]` bias correction; a scalar tail handles the
+/// final `< 16` columns. All scratch is stack-resident (a 64-byte `B` panel + a
+/// 16-lane column-sum), so the kernel allocates nothing.
+///
+/// # Safety
+///
+/// The CPU must support `avx512_vnni` and the OS must have enabled AVX-512 (`ZMM`)
+/// state (both ensured by [`gemm_i8_avx512vnni`] via [`avx512vnni_ready`]), and the
+/// slice lengths must match `m`/`k`/`n` (so the internal bounded accesses are valid).
+unsafe fn gemm_i8_avx512vnni_impl(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) {
+    let kgroups = k.div_ceil(4); // 4-wide K groups; the last is zero-padded if k%4≠0
+    let mut jb = 0usize;
+    while jb + 16 <= n {
+        // Per-column bias correction term: colsum[cc] = Σ_k B[k][jb+cc] (real k only).
+        let mut colsum = [0i32; 16];
+        for p in 0..k {
+            let brow = &b[p * n + jb..p * n + jb + 16];
+            for (cc, &bv) in brow.iter().enumerate() {
+                colsum[cc] = colsum[cc].wrapping_add(bv as i32);
+            }
+        }
+        // Zero the 16-column accumulator region for every row (VPDPBUSD accumulates).
+        for i in 0..m {
+            for v in &mut c[i * n + jb..i * n + jb + 16] {
+                *v = 0;
+            }
+        }
+        for g in 0..kgroups {
+            // Pack the B panel: lane cc holds the 4 bytes B[4g..4g+4][jb+cc], zero
+            // where 4g+r ≥ k (that padding contributes 0 to both VPDPBUSD and colsum).
+            let mut panel = [0u8; 64];
+            for r in 0..4 {
+                let kk = 4 * g + r;
+                if kk >= k {
+                    break;
+                }
+                let brow = &b[kk * n + jb..kk * n + jb + 16];
+                for (cc, &bv) in brow.iter().enumerate() {
+                    panel[cc * 4 + r] = bv as u8;
+                }
+            }
+            for i in 0..m {
+                // Biased A dword: au = a ^ 0x80 (= a + 128, unsigned); pad 0 past k.
+                let mut ad = [0u8; 4];
+                for (r, slot) in ad.iter_mut().enumerate() {
+                    let kk = 4 * g + r;
+                    if kk < k {
+                        *slot = (a[i * k + kk] as u8) ^ 0x80;
+                    }
+                }
+                let a_dword = u32::from_le_bytes(ad);
+                // SAFETY: `jb + 16 <= n`, so `c[i*n+jb .. +16]` (16×i32) is in bounds;
+                // `panel` is 64 valid bytes; `vnni_dp16`'s VPDPBUSD is legal (fn
+                // precondition: avx512_vnni + ZMM state on).
+                unsafe {
+                    vnni_dp16(a_dword, panel.as_ptr(), c[i * n + jb..].as_mut_ptr());
+                }
+            }
+        }
+        // Apply the bias correction: C[i][jb+cc] -= 128 · colsum[cc].
+        for i in 0..m {
+            let crow = &mut c[i * n + jb..i * n + jb + 16];
+            for (cc, v) in crow.iter_mut().enumerate() {
+                *v = v.wrapping_sub(128i32.wrapping_mul(colsum[cc]));
+            }
+        }
+        jb += 16;
+    }
+    // Scalar tail for the remaining < 16 columns (plain signed int8, no VNNI).
+    while jb < n {
+        for i in 0..m {
+            let mut acc: i32 = 0;
+            for p in 0..k {
+                acc = acc.wrapping_add(a[i * k + p] as i32 * b[p * n + jb] as i32);
+            }
+            c[i * n + jb] = acc;
+        }
+        jb += 1;
+    }
+}
+
+/// `c[0..16] += VPDPBUSD(broadcast(a_dword), b_panel[0..64])` — one 512-bit VNNI
+/// step: for each of 16 int32 lanes, add the 4-int8 dot product of the biased
+/// (unsigned) `A` group against the packed (signed) `B` panel column. Inline `asm!`
+/// (EVEX) for the same soft-float-target codegen reason as [`avx2_madd8`].
+///
+/// # Safety
+///
+/// The CPU must support `avx512_vnni` and the OS must have enabled AVX-512 (`ZMM`)
+/// state (both ensured by [`gemm_i8_avx512vnni`] via [`avx512vnni_ready`]); `b` must
+/// point at ≥ 64 valid bytes (the packed panel) and `c` at ≥ 16 valid `i32` (ensured
+/// by the `j + 16 <= n` bound in the sole caller). `c` is read and written; `b` read.
+#[inline]
+unsafe fn vnni_dp16(a_dword: u32, b: *const u8, c: *mut i32) {
+    // SAFETY: preconditions per the doc — avx512_vnni + ZMM state enabled make the
+    // EVEX instruction legal; `b` addresses 64 packed bytes, `c` the 16 i32 lanes.
+    // `zmm0`/`zmm1` are declared clobbered; the block reads `[b]` and read-writes
+    // `[c]` (so no `nomem`); it uses no stack and sets no flags. VPDPBUSD wraps (not
+    // the saturating VPDPBUSDS), matching the scalar `wrapping_add`.
+    unsafe {
+        core::arch::asm!(
+            "vmovd xmm0, {a:e}",                        // xmm0.lo = biased A dword
+            "vpbroadcastd zmm0, xmm0",                 // zmm0 = A dword × 16 (unsigned)
+            "vmovdqu32 zmm1, zmmword ptr [{c}]",       // zmm1 = c[0..16] accumulators
+            "vpdpbusd zmm1, zmm0, zmmword ptr [{b}]",  // zmm1 += u8(zmm0)·i8(panel)
+            "vmovdqu32 zmmword ptr [{c}], zmm1",       // c[0..16] = zmm1
+            a = in(reg) a_dword,
+            b = in(reg) b,
+            c = in(reg) c,
+            out("zmm0") _,
+            out("zmm1") _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Pure arithmetic **model** of what [`gemm_i8_avx512vnni_impl`] computes for one
+/// output cell: the unsigned/signed bias-corrected dot product `Σ_p (au_p · b_p) −
+/// 128·Σ_p b_p`, where `au_p = a_p + 128` (the `^ 0x80` unsigned bias), everything
+/// `wrapping` mod 2³² — exactly the `VPDPBUSD` accumulation (`au` unsigned × `b`
+/// signed, wrapping, *not* saturating) plus the column-sum correction, but with **no
+/// `asm!`**. Extracted so the **ring identity** that makes it equal the signed scalar
+/// dot product — `Σ (a+128)·b − 128·Σ b = Σ a·b` (mod 2³²) — can be checked
+/// exhaustively/independently of any AVX-512 hardware: by the Kani proof
+/// [`proofs::vnni_bias_correction_is_exact`] (symbolic bytes) and the always-on host
+/// test [`tests::vnni_bias_model_matches_scalar`] (both run on **any** CPU, unlike
+/// the hardware differential tests which need `avx512vnni`). This is a re-derivation
+/// of the kernel's arithmetic, not the code path itself; the hardware differential
+/// test guards the `asm!`/packing against this model drifting from reality.
+#[cfg(any(test, kani))]
+fn vnni_cell_bias(a: &[i8], b: &[i8]) -> i32 {
+    let mut acc: i32 = 0; // VPDPBUSD accumulation of au·b
+    let mut colsum: i32 = 0; // Σ b, for the −128·Σb correction
+    for (&av, &bv) in a.iter().zip(b) {
+        let au = ((av as u8) ^ 0x80) as i32; // a + 128, unsigned byte in 0..=255
+        acc = acc.wrapping_add(au * (bv as i32));
+        colsum = colsum.wrapping_add(bv as i32);
+    }
+    acc.wrapping_sub(128i32.wrapping_mul(colsum))
+}
+
+/// The signed scalar dot product `Σ_p a_p·b_p` (i32 `wrapping_add`) — the oracle
+/// [`vnni_cell_bias`] must equal bit-for-bit.
+#[cfg(any(test, kani))]
+fn scalar_cell(a: &[i8], b: &[i8]) -> i32 {
+    let mut acc: i32 = 0;
+    for (&av, &bv) in a.iter().zip(b) {
+        acc = acc.wrapping_add((av as i32) * (bv as i32));
+    }
+    acc
+}
+
 // ── unit tests (host) ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use super::{gemm_i8_avx2_impl, gemm_i8_avx512_impl, Kernel};
+    use super::{
+        gemm_i8_avx2_impl, gemm_i8_avx512_impl, gemm_i8_avx512vnni_impl, scalar_cell,
+        vnni_cell_bias, Kernel,
+    };
     use std::vec;
     use std::vec::Vec;
 
@@ -492,16 +730,22 @@ mod tests {
         let mut ks: Vec<(&'static str, Kernel)> = Vec::new();
         let avx2 = std::is_x86_feature_detected!("avx2");
         let avx512f = std::is_x86_feature_detected!("avx512f");
+        let avx512vnni = std::is_x86_feature_detected!("avx512vnni");
         if avx2 {
             ks.push(("avx2", gemm_i8_avx2_impl as Kernel));
         }
         if avx512f {
             ks.push(("avx512f", gemm_i8_avx512_impl as Kernel));
         }
+        if avx512vnni {
+            ks.push(("avx512vnni", gemm_i8_avx512vnni_impl as Kernel));
+        }
+        let show = |present: bool| if present { "RAN" } else { "skipped (absent)" };
         std::eprintln!(
-            "[simd host-diff] avx2: {}  avx512f: {}",
-            if avx2 { "RAN" } else { "skipped (absent)" },
-            if avx512f { "RAN" } else { "skipped (absent)" },
+            "[simd host-diff] avx2: {}  avx512f: {}  avx512vnni: {}",
+            show(avx2),
+            show(avx512f),
+            show(avx512vnni),
         );
         ks
     }
@@ -665,5 +909,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    // The bias-correction identity is what makes VNNI harder than a direct widening
+    // (SM1/SM2). The two tests below check it on the **pure model** (`vnni_cell_bias`,
+    // no `asm!`), so they run on **every** host — including Miri and non-`avx512vnni`
+    // CI runners where the hardware differential tests skip the VNNI kernel — giving
+    // the ring identity an always-on, hardware-independent regression guard. (The
+    // Kani proof `proofs::vnni_bias_correction_is_exact` covers it exhaustively over
+    // symbolic bytes.)
+
+    #[test]
+    fn vnni_bias_model_matches_scalar() {
+        // A deterministic LCG drives many random `k` and full-range i8 values through
+        // both the bias model and the signed scalar dot product; any divergence is a
+        // bug in the unsigned/signed correction (wrong bias, colsum, or sign handling).
+        let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for _ in 0..2000 {
+            let k = (next() % 64) as usize; // 0..=63, incl. empty and k%4≠0
+            let a: Vec<i8> = (0..k).map(|_| next() as i8).collect();
+            let b: Vec<i8> = (0..k).map(|_| next() as i8).collect();
+            assert_eq!(
+                vnni_cell_bias(&a, &b),
+                scalar_cell(&a, &b),
+                "VNNI bias model != scalar for k={k}, a={a:?}, b={b:?}"
+            );
+        }
+    }
+
+    // The one thing the small-`k` cases can't reach: a 32-bit accumulator wrap. Uses
+    // a large `k`, so it is skipped under Miri (which would interpret the whole loop
+    // far too slowly) — native `cargo test` covers it, and Kani proves the identity
+    // symbolically for the non-wrapping regime.
+    #[test]
+    #[cfg(not(miri))]
+    fn vnni_bias_model_wraps_like_scalar() {
+        // 127*127 per term, ~150k terms wraps well past i32::MAX; the correction
+        // 128*colsum also wraps. The model must still match the scalar reference.
+        let k = 150_000usize;
+        let a = vec![127i8; k];
+        let b = vec![127i8; k];
+        let s = scalar_cell(&a, &b);
+        assert!(s < 0, "test did not exercise a wrap");
+        assert_eq!(
+            vnni_cell_bias(&a, &b),
+            s,
+            "VNNI bias model != scalar across a wrap"
+        );
+    }
+}
+
+/// Kani proof — the VNNI bias-correction model ([`vnni_cell_bias`]) computes the
+/// signed scalar dot product ([`scalar_cell`]) bit-for-bit for **all** int8 inputs:
+/// the ring identity `Σ (a+128)·b − 128·Σ b = Σ a·b` (mod 2³²). This is the one part
+/// of the VNNI tier not covered by a direct widening of a proven kernel, so it gets
+/// an exhaustive, hardware-independent proof here. Symbolic over the full byte space
+/// for a fixed `k` (the identity is a per-term equality plus a linear `wrapping_add`
+/// reduction, so a small `k` witnesses the general case); the large-`k` accumulator-
+/// wrap regime is covered by the host test [`tests::vnni_bias_model_wraps_like_scalar`].
+/// Compiled only under `cargo kani -p hal`; excluded from the stable build and tests.
+#[cfg(kani)]
+mod proofs {
+    use super::{scalar_cell, vnni_cell_bias};
+
+    #[kani::proof]
+    fn vnni_bias_correction_is_exact() {
+        const K: usize = 4;
+        let a: [i8; K] = kani::any();
+        let b: [i8; K] = kani::any();
+        assert_eq!(vnni_cell_bias(&a, &b), scalar_cell(&a, &b));
     }
 }

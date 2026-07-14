@@ -368,14 +368,19 @@ const SMP_ENABLED_MARKER: &str = "[smp] x2APIC enabled";
 const SMP_TIMER_LIVE_MARKER: &str = "timer live";
 /// The `[ml]` `active=` values that mean a *vector* tier is live — a real SIMD
 /// int8-GEMM kernel runs (its boot self-test passed), not the scalar fallback. We
-/// accept **either** implemented tier because the runner fleet is heterogeneous:
-/// TCG (`-cpu Haswell`) and older KVM hosts run the 256-bit `avx2` kernel, while
-/// KVM hosts that expose AVX-512 run the wider 512-bit `avx512f` kernel. We do NOT
-/// assert the `detected=…` field: it is the best tier the CPU *advertises* and
-/// legitimately varies further (up to `avx512-vnni`/`amx-int8` on newer silicon),
-/// whereas `active` is the best *implemented* tier. Both vector tiers are proven
-/// bit-identical to scalar (boot self-test + host differential tests).
-const ML_VECTOR_ACTIVE: [&str; 2] = [", active=avx2;", ", active=avx512f;"];
+/// accept **any** implemented vector tier because the runner fleet is heterogeneous:
+/// TCG (`-cpu Haswell`) and older KVM hosts run the 256-bit `avx2` kernel, KVM hosts
+/// that expose AVX-512 run the 512-bit `avx512f` kernel, and those that also expose
+/// VNNI run the fused `avx512-vnni` (`VPDPBUSD`) kernel. We do NOT assert the
+/// `detected=…` field: it is the best tier the CPU *advertises* and legitimately
+/// varies further (up to `amx-int8` on newer silicon), whereas `active` is the best
+/// *implemented* tier. All three vector tiers are proven bit-identical to scalar
+/// (boot self-test + host differential tests).
+const ML_VECTOR_ACTIVE: [&str; 3] = [
+    ", active=avx2;",
+    ", active=avx512f;",
+    ", active=avx512-vnni;",
+];
 /// The boot-proof result substring: the live-dispatch `identity·B == B` int8 GEMM
 /// computed the right answer end-to-end (see `kernel::ml::prove`). Asserting it
 /// alongside a vector `active=` tier proves the vector kernel not only was selected
@@ -534,9 +539,9 @@ fn boot_test(kvm: bool) -> ExitCode {
     // A vector int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is a
     // real SIMD kernel — proving the hand-written `asm!` kernels execute and compute
     // correctly. `-cpu Haswell` (TCG) exposes avx2; `-cpu host` (KVM) exposes avx2
-    // and, on AVX-512 silicon, avx512f — so `active=` is `avx2` or `avx512f`, never
-    // scalar. A scalar fallback here means a vector kernel is wrong or avx2 is
-    // unexpectedly absent.
+    // and, on AVX-512 silicon, avx512f (+ avx512-vnni where present) — so `active=`
+    // is one of avx2/avx512f/avx512-vnni, never scalar. A scalar fallback here means
+    // a vector kernel is wrong or avx2 is unexpectedly absent.
     let Some(active_tier) = ML_VECTOR_ACTIVE.iter().find(|m| log.contains(**m)) else {
         eprintln!(
             "TEST FAILED: expected one of {:?} in the [ml] line (a vector self-test \
