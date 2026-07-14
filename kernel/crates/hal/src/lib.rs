@@ -91,6 +91,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod apic;
 pub mod ata;
 pub mod cpu;
 pub mod cpu_security;

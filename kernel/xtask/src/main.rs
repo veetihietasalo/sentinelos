@@ -314,10 +314,16 @@ fn do_run() -> ExitCode {
     cmd.args([
         "-M",
         "q35",
-        // Advertise SMEP/SMAP/UMIP (Haswell base + explicit flags) so the kernel
-        // actually enables them; see cpu_security + the design doc.
+        // SMEP/SMAP/UMIP (Haswell base + explicit flags) so cpu_security enables
+        // them; `-smp 4` gives the guest four logical CPUs for the SMP path.
+        // x2APIC is intentionally NOT requested: QEMU's TCG (software) APIC cannot
+        // emulate it, so the kernel takes its documented no-op fallback here; the
+        // x2APIC enable path activates under KVM / on real hardware. See
+        // docs/specs/2026-07-14-smp-x2apic-design.md.
         "-cpu",
         "Haswell,+smep,+smap,+umip",
+        "-smp",
+        "4",
         "-m",
         "256M",
         "-cdrom",
@@ -344,6 +350,11 @@ fn do_run() -> ExitCode {
 const END_MARKER: &str = "boot-bringup-ok";
 /// Full banner line we require to be present as well.
 const BANNER_LINE: &str = "SentinelOS \u{2014} boot bring-up OK";
+/// Marker proving the SMP (x2APIC) bring-up branch actually executed. Both the
+/// enable line (`[smp] x2APIC enabled …`) and the graceful "not advertised"
+/// fallback share this prefix, so it positively confirms the path ran regardless
+/// of whether the host (KVM/hardware vs. TCG) advertises x2APIC.
+const SMP_MARKER: &str = "[smp]";
 /// Seconds to wait for the boot end-marker before giving up. Generous because
 /// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
 /// the full bring-up — networking, then seeding + writing the 16 MiB disk image
@@ -377,10 +388,15 @@ fn do_test() -> ExitCode {
         .args([
             "-M",
             "q35",
-            // Advertise SMEP/SMAP/UMIP so the kernel enables them (see the
-            // cpu_security module + the design doc).
+            // SMEP/SMAP/UMIP so cpu_security enables them; `-smp 4` gives the guest
+            // four logical CPUs for the SMP path. x2APIC is intentionally NOT
+            // requested: TCG cannot emulate it, so the kernel takes its no-op
+            // fallback (the enable path activates under KVM / real hardware). See
+            // docs/specs/2026-07-14-smp-x2apic-design.md.
             "-cpu",
             "Haswell,+smep,+smap,+umip",
+            "-smp",
+            "4",
             "-m",
             "256M",
             "-cdrom",
@@ -436,8 +452,16 @@ fn do_test() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    if !log.contains(SMP_MARKER) {
+        eprintln!(
+            "TEST FAILED: end-marker present but SMP bring-up line '{}' missing.",
+            SMP_MARKER
+        );
+        return ExitCode::FAILURE;
+    }
+
     println!(
-        "TEST PASSED: full banner and end-marker '{}' confirmed in serial output.",
+        "TEST PASSED: full banner, SMP bring-up line, and end-marker '{}' confirmed in serial output.",
         END_MARKER
     );
     ExitCode::SUCCESS
@@ -545,10 +569,15 @@ fn do_screenshot() -> ExitCode {
         .args([
             "-M",
             "q35",
-            // Advertise SMEP/SMAP/UMIP so the kernel enables them (see the
-            // cpu_security module + the design doc).
+            // SMEP/SMAP/UMIP so cpu_security enables them; `-smp 4` gives the guest
+            // four logical CPUs for the SMP path. x2APIC is intentionally NOT
+            // requested: TCG cannot emulate it, so the kernel takes its no-op
+            // fallback (the enable path activates under KVM / real hardware). See
+            // docs/specs/2026-07-14-smp-x2apic-design.md.
             "-cpu",
             "Haswell,+smep,+smap,+umip",
+            "-smp",
+            "4",
             "-m",
             "256M",
             "-cdrom",

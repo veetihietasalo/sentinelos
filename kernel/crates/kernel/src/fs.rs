@@ -619,6 +619,20 @@ mod disk {
         None
     }
 
+    /// Test stub: no disk on the host. `probe()` returns `None` under `cfg(test)`
+    /// so `load` is never actually reached, but it must exist for the crate to
+    /// compile in a test build (the `Some(geometry)` arm is still type-checked).
+    #[cfg(test)]
+    pub(super) fn load(_geo: Geometry) -> Option<Node> {
+        None
+    }
+
+    /// Test stub: disk persistence is a no-op in host unit tests (no port I/O).
+    #[cfg(test)]
+    pub(super) fn save(_root: &Node) -> Result<(), ()> {
+        Ok(())
+    }
+
     /// Load and deserialise the saved tree from disk. Returns the root [`Node`] on
     /// success, or `None` if the disk has no valid SentinelOS image (blank, bad
     /// magic, bad CRC, a malformed payload, or a payload that would require reading

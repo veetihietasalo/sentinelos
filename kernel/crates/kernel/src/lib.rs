@@ -24,6 +24,7 @@ pub mod fs;
 pub mod input;
 pub mod interrupts;
 pub mod memory;
+pub mod ml;
 pub mod net;
 pub mod shell;
 pub mod wm;
@@ -68,6 +69,42 @@ pub fn kmain() -> ! {
     // ~100 Hz, and unmask IRQ0. Interrupts stay DISABLED until `sti` below — we
     // only enable them once every handler is registered.
     interrupts::init_timer();
+
+    // Enable the BSP's Local APIC in x2APIC mode (virtual-wire: the 8259 PIC still
+    // delivers through LINT0=ExtINT) — the first step toward SMP. Then briefly open
+    // the interrupt window to PROVE the PIT timer still ticks across the switch: a
+    // broken virtual wire would stall here and fail the boot test, rather than
+    // silently stopping the clock. See docs/specs/2026-07-14-smp-x2apic-design.md.
+    match hal::apic::enable_bsp() {
+        Some(apic_id) => {
+            let start = hal::pit::ticks();
+            hal::cpu::enable_interrupts();
+            while hal::pit::ticks() < start + 3 {
+                hal::cpu::halt();
+            }
+            hal::cpu::disable_interrupts();
+            // Build the line with the fmt-free serial helpers: `println!("{}", n)`
+            // faults on this target for INTEGER args (the GOT-relative vtable calls
+            // `core::fmt` emits need `.got`/`.rela` the linker script discards; see
+            // memory.rs / hal-tcb.md §5e). String-literal `println!` is fine, but
+            // the dynamic apic id / cpu count / tick count must go through write_dec.
+            hal::serial::write_str("[smp] x2APIC enabled; BSP apic id=");
+            hal::serial::write_dec(apic_id as u64);
+            hal::serial::write_str("; ");
+            hal::serial::write_dec(hal::apic::logical_cpu_count() as u64);
+            hal::serial::write_str(" logical CPU(s); timer live (");
+            hal::serial::write_dec(hal::pit::ticks());
+            hal::serial::write_str(" ticks)\n");
+        }
+        None => hal::println!("[smp] x2APIC not advertised; staying on legacy xAPIC/PIC"),
+    }
+
+    // Bring up the AI/ML COMPUTE path: turn the C1 cpuid detection (AMX / AVX-512)
+    // into an actual quantized-inference primitive. Reports the detected hardware
+    // tier vs. the active (implemented) tier and runs a real int8 GEMM as an
+    // end-to-end proof. Pure safe Rust; the SIMD/AMX kernels are later phases.
+    // See docs/specs/2026-07-14-aiml-inference-compute-design.md.
+    ml::prove();
 
     // Bring up NETWORKING: find + init the e1000 NIC (heap is ready), read its
     // MAC, set up RX/TX rings, then start the minimal ARP/IPv4/ICMP stack and
