@@ -58,6 +58,14 @@ const XCR0_X87: u64 = 1 << 0;
 const XCR0_SSE: u64 = 1 << 1;
 /// `XCR0` bit 2 — AVX (`YMM` high halves) state — what `avx`/`avx2` needs.
 const XCR0_AVX: u64 = 1 << 2;
+/// `XCR0` bit 5 — AVX-512 opmask (`k0`–`k7`) state.
+const XCR0_OPMASK: u64 = 1 << 5;
+/// `XCR0` bit 6 — AVX-512 `ZMM_Hi256` (upper 256 bits of `ZMM0`–`ZMM15`).
+const XCR0_ZMM_HI256: u64 = 1 << 6;
+/// `XCR0` bit 7 — AVX-512 `Hi16_ZMM` (`ZMM16`–`ZMM31`).
+const XCR0_HI16_ZMM: u64 = 1 << 7;
+/// The three AVX-512 component bits, enabled together (all or nothing).
+const XCR0_AVX512: u64 = XCR0_OPMASK | XCR0_ZMM_HI256 | XCR0_HI16_ZMM;
 
 /// `cpuid` leaf 1 ECX bit 26 — `XSAVE`/`XRSTOR` + the `XCR` registers.
 const CPUID_ECX_XSAVE: u32 = 1 << 26;
@@ -65,6 +73,9 @@ const CPUID_ECX_XSAVE: u32 = 1 << 26;
 const CPUID_ECX_AVX: u32 = 1 << 28;
 /// `cpuid` leaf 7 sub-leaf 0 EBX bit 5 — AVX2 integer instructions.
 const CPUID_EBX7_AVX2: u32 = 1 << 5;
+/// `cpuid` leaf 7 sub-leaf 0 EBX bit 16 — AVX-512 Foundation (the 512-bit `ZMM`
+/// integer ops `VPMOVSXBD`/`VPMULLD`/`VPADDD`/`VPBROADCASTD` this tier uses).
+const CPUID_EBX7_AVX512F: u32 = 1 << 16;
 
 /// Cached AVX2 usability: `0` = unverified / unavailable, `1` = verified usable.
 /// Set to `1` by [`enable`] **only** after the boot-time self-test passes; read by
@@ -73,41 +84,55 @@ const CPUID_EBX7_AVX2: u32 = 1 << 5;
 /// the kernel — it must not act on the BSP-set flag with its own AVX state off.
 static AVX2_STATUS: AtomicU8 = AtomicU8::new(0);
 
-/// Enable AVX (`YMM`) vector state on this core and, if `avx2` is advertised,
-/// **self-test** the AVX2 kernel before trusting it. Returns `true` if AVX state
-/// was enabled (`false` on a CPU without `xsave`+`avx`).
+/// Cached AVX-512F usability, same contract as [`AVX2_STATUS`] but for the 512-bit
+/// `ZMM` kernel: set by [`enable`] only after the AVX-512 self-test passes.
+static AVX512_STATUS: AtomicU8 = AtomicU8::new(0);
+
+/// Enable AVX (`YMM`, and — where present — AVX-512 `ZMM`) vector state on this
+/// core and **self-test** each vector kernel before trusting it. Returns `true` if
+/// AVX state was enabled (`false` on a CPU without `xsave`+`avx`).
 ///
-/// The self-test ([`self_test`]) runs the AVX2 int8 GEMM on fixed input and
-/// compares it against a scalar computation; [`avx2_ready`] reports the tier usable
-/// **only** if they match bit-for-bit. This makes the ML path robust to a vector
-/// unit that computes incorrectly — during bring-up it caught the soft-float-target
-/// codegen problem (see the module docs) before the inline-`asm!` fix, falling back
-/// to scalar rather than shipping garbage; it also backstops any future
-/// CPU/emulator/toolchain regression. Detection-gated on `xsave` + `avx`.
-/// Idempotent (per core — see [`AVX2_STATUS`]).
+/// The self-test ([`self_test`]) runs a vector int8 GEMM on fixed input and
+/// compares it against a scalar computation; [`avx2_ready`] / [`avx512_ready`]
+/// report a tier usable **only** if they match bit-for-bit. This makes the ML path
+/// robust to a vector unit that computes incorrectly — during bring-up it caught a
+/// soft-float-target codegen problem (see the module docs) before the inline-`asm!`
+/// fix, falling back rather than shipping garbage; it also backstops any future
+/// CPU/emulator/toolchain regression. Detection-gated (`xsave`+`avx` for AVX,
+/// plus `avx512f` for the 512-bit tier). Idempotent (per core — see [`AVX2_STATUS`]).
 #[must_use]
 pub fn enable() -> bool {
     let ecx1 = cpuid::raw(1, 0).ecx;
     if ecx1 & CPUID_ECX_XSAVE == 0 || ecx1 & CPUID_ECX_AVX == 0 {
         return false;
     }
+    let want_avx512 = avx512f_advertised();
     // SAFETY: `xsave` + `avx` are confirmed present via cpuid above. Setting
     // `CR4.OSXSAVE` only enables `xgetbv`/`xsetbv` and OS XSAVE management (it
     // preserves every other CR4 bit — read-modify-write). After it, `xgetbv(0)` is
     // legal; we OR the x87|SSE|AVX component bits (all architectural on any
-    // avx-capable CPU, so `xsetbv` cannot `#GP`; AVX requires SSE, both set) into
-    // XCR0. Enabling vector state only makes `YMM` usable/saveable — it cannot
+    // avx-capable CPU, so `xsetbv` cannot `#GP`; AVX requires SSE, both set), and —
+    // only when `avx512f` is advertised — the three AVX-512 component bits (opmask +
+    // ZMM_Hi256 + Hi16_ZMM, all supported iff avx512f, enabled together) into XCR0.
+    // Enabling vector state only makes the registers usable/saveable — it cannot
     // alias or corrupt Rust-managed memory. Registered in hal-tcb.md.
     unsafe {
         let cr4 = cpu::read_cr4();
         cpu::write_cr4(cr4 | CR4_OSXSAVE);
         let xcr0 = cpu::xgetbv(0);
-        cpu::xsetbv(0, xcr0 | XCR0_X87 | XCR0_SSE | XCR0_AVX);
+        let mut new = xcr0 | XCR0_X87 | XCR0_SSE | XCR0_AVX;
+        if want_avx512 {
+            new |= XCR0_AVX512;
+        }
+        cpu::xsetbv(0, new);
     }
-    // AVX state is on. Enable the AVX2 tier only if the CPU advertises avx2 AND the
+    // Vector state is on. Enable each tier only if the CPU advertises it AND the
     // kernel passes its differential self-test on this (possibly emulated) core.
-    if avx2_advertised() && self_test() {
+    if avx2_advertised() && self_test(gemm_i8_avx2_impl) {
         AVX2_STATUS.store(1, Ordering::Relaxed);
+    }
+    if want_avx512 && self_test(gemm_i8_avx512_impl) {
+        AVX512_STATUS.store(1, Ordering::Relaxed);
     }
     true
 }
@@ -126,30 +151,49 @@ pub fn avx2_ready() -> bool {
     AVX2_STATUS.load(Ordering::Relaxed) == 1
 }
 
-/// Boot-time differential self-test of the AVX2 kernel: run several fixed GEMMs
-/// through both the AVX2 kernel and an inline scalar loop, returning whether they
-/// agree bit-for-bit. Two cases cover the code paths a broken vector unit could
-/// affect: a single 256-bit block with mixed signs + a zero, and a **multi-block**
-/// shape (`n = 17` → two `VPMULLD`/`VPADDD` steps + a scalar tail) at the **±127**
-/// magnitude extremes (largest int8 products, `VPMOVSXBD` high-magnitude sign
-/// extension). Called by [`enable`] only after AVX state is on and `avx2` is
-/// advertised, so the kernel's instructions are legal to execute.
+/// Whether `cpuid` advertises AVX-512 Foundation (leaf 7 EBX bit 16).
+fn avx512f_advertised() -> bool {
+    cpuid::max_standard_leaf() >= 7 && cpuid::raw(7, 0).ebx & CPUID_EBX7_AVX512F != 0
+}
+
+/// Whether the AVX-512F int8 GEMM is **verified usable** on this core — AVX-512
+/// state enabled *and* the boot-time [`self_test`] passed. Same contract and
+/// cheapness as [`avx2_ready`]; the sole gate [`gemm_i8_avx512`] consults.
+#[must_use]
+pub fn avx512_ready() -> bool {
+    AVX512_STATUS.load(Ordering::Relaxed) == 1
+}
+
+/// A vector int8 GEMM kernel signature (AVX2 or AVX-512) for the self-test and the
+/// host differential harness. `unsafe`: the CPU must support the tier and its
+/// vector state must be enabled (both ensured by [`enable`] before it is called).
+type Kernel = unsafe fn(&[i8], &[i8], &mut [i32], usize, usize, usize);
+
+/// Boot-time differential self-test of a vector `kernel`: run several fixed GEMMs
+/// through both it and an inline scalar loop, returning whether they agree
+/// bit-for-bit. The cases cover the paths a broken vector unit could affect for
+/// both the 8-wide (AVX2) and 16-wide (AVX-512) step: a single sub-block with mixed
+/// signs + a zero, a shape with a scalar tail at the **±127** extremes, and a
+/// **multi-block** shape (`n = 33`). Called by [`enable`] only after the tier's
+/// vector state is on and it is `cpuid`-advertised, so the instructions are legal.
 ///
 /// An i32-accumulator *wrap* would need `k > 133k` with int8 operands — far too
 /// large for a boot check — so `VPADDD == wrapping_add` over a wrapping `k` is
 /// confirmed in the host differential test instead, not here.
-fn self_test() -> bool {
-    self_test_case(2, 8, 8, false) && self_test_case(3, 8, 17, true)
+fn self_test(kernel: Kernel) -> bool {
+    self_test_case(kernel, 2, 8, 8, false)
+        && self_test_case(kernel, 3, 8, 17, true)
+        && self_test_case(kernel, 2, 8, 33, false)
 }
 
 /// One self-test case: fill `A`/`B` deterministically (`extremes` ⇒ a ±127
-/// pattern, else a mixed-sign hash), compute `C = A·B` via the AVX2 kernel and a
-/// scalar loop into fixed max-size stack buffers, and compare. Sized for the cases
-/// [`self_test`] uses (`m*k ≤ 24`, `k*n ≤ 136`, `m*n ≤ 51`).
-fn self_test_case(m: usize, k: usize, n: usize, extremes: bool) -> bool {
+/// pattern, else a mixed-sign hash), compute `C = A·B` via `kernel` and a scalar
+/// loop into fixed max-size stack buffers, and compare. Sized for the cases
+/// [`self_test`] uses (`m*k ≤ 24`, `k*n ≤ 264`, `m*n ≤ 99`).
+fn self_test_case(kernel: Kernel, m: usize, k: usize, n: usize, extremes: bool) -> bool {
     const A_MAX: usize = 3 * 8;
-    const B_MAX: usize = 8 * 17;
-    const C_MAX: usize = 3 * 17;
+    const B_MAX: usize = 8 * 33;
+    const C_MAX: usize = 3 * 33;
     let mut a_buf = [0i8; A_MAX];
     let mut b_buf = [0i8; B_MAX];
     for (t, x) in a_buf[..m * k].iter_mut().enumerate() {
@@ -189,11 +233,11 @@ fn self_test_case(m: usize, k: usize, n: usize, extremes: bool) -> bool {
             cr[i * n + j] = acc;
         }
     }
-    // SAFETY: reached only from `enable` after AVX state is enabled and with `avx2`
-    // advertised, so the kernel's VEX instructions are legal; the sub-slice lengths
-    // are exactly `m*k` / `k*n` / `m*n`.
+    // SAFETY: reached only from `enable` after the tier's vector state is enabled
+    // and it is cpuid-advertised, so `kernel`'s instructions are legal; the
+    // sub-slice lengths are exactly `m*k` / `k*n` / `m*n`.
     unsafe {
-        gemm_i8_avx2_impl(a, b, ca, m, k, n);
+        kernel(a, b, ca, m, k, n);
     }
     ca == cr
 }
@@ -327,16 +371,154 @@ unsafe fn avx2_madd8(a_ip: i32, b: *const i8, c: *mut i32) {
     }
 }
 
+/// AVX-512F int8 GEMM: `C[m×n] = A[m×k] · B[k×n]`, **bit-identical** to the scalar
+/// reference — the 512-bit sibling of [`gemm_i8_avx2`] (same broadcast scheme, 16
+/// int32 columns per `ZMM` step). Returns `true` if it ran, or `false` (→ caller
+/// falls back to a narrower tier / scalar) when AVX-512 is not verified usable
+/// ([`avx512_ready`]) or the dims are inconsistent. Never `#UD`s, never panics.
+/// Same hard **interrupts-disabled** precondition as [`gemm_i8_avx2`].
+#[must_use]
+pub fn gemm_i8_avx512(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) -> bool {
+    let (Some(mk), Some(kn), Some(mn)) = (m.checked_mul(k), k.checked_mul(n), m.checked_mul(n))
+    else {
+        return false;
+    };
+    if a.len() != mk || b.len() != kn || c.len() != mn {
+        return false;
+    }
+    if !avx512_ready() {
+        return false;
+    }
+    // SAFETY: `avx512_ready()` is `true` only after `enable` turned on AVX-512
+    // (`ZMM`) state AND the self-test executed this kernel correctly on this core,
+    // so the EVEX instructions are legal (no `#UD`). The lengths were validated
+    // above (overflow-checked), so every in-kernel load/store stays within
+    // `a`/`b`/`c`; `a`/`b` shared, `c` exclusive; caller runs with interrupts off.
+    unsafe {
+        gemm_i8_avx512_impl(a, b, c, m, k, n);
+    }
+    true
+}
+
+/// The AVX-512F kernel — the 16-columns-per-step analogue of [`gemm_i8_avx2_impl`].
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`, the OS must have enabled AVX-512 (`ZMM`) state
+/// (both ensured by [`gemm_i8_avx512`] via [`avx512_ready`]), and the slice lengths
+/// must match `m`/`k`/`n` (so the internal bounded pointer accesses are valid).
+unsafe fn gemm_i8_avx512_impl(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) {
+    for i in 0..m {
+        let crow = &mut c[i * n..i * n + n];
+        for v in crow.iter_mut() {
+            *v = 0;
+        }
+        for p in 0..k {
+            let a_ip = a[i * k + p] as i32;
+            let brow = &b[p * n..p * n + n];
+            let mut j = 0usize;
+            while j + 16 <= n {
+                // SAFETY: `j + 16 <= n`, so `brow[j..j+16]` (16 bytes) and
+                // `crow[j..j+16]` (16×i32) are in-bounds; `avx512_madd16`'s AVX-512F
+                // instructions are legal (fn precondition: avx512f + ZMM state on).
+                unsafe {
+                    avx512_madd16(a_ip, brow.as_ptr().add(j), crow.as_mut_ptr().add(j));
+                }
+                j += 16;
+            }
+            while j < n {
+                crow[j] = crow[j].wrapping_add(a_ip * brow[j] as i32);
+                j += 1;
+            }
+        }
+    }
+}
+
+/// `c[0..16] += a_ip * sign_extend(b[0..16])` — one 512-bit AVX-512F multiply-
+/// accumulate of sixteen int32 columns, inline `asm!` (EVEX) for the same
+/// soft-float-target codegen reason as [`avx2_madd8`].
+///
+/// # Safety
+///
+/// The CPU must support `avx512f` and the OS must have enabled AVX-512 (`ZMM`)
+/// state (both ensured by [`gemm_i8_avx512`] via [`avx512_ready`]), and `b`/`c`
+/// must point at ≥ 16 valid int8 / ≥ 16 valid `i32` (ensured by the `j + 16 <= n`
+/// bound in the sole caller). `c` is read and written; `b` is read.
+#[inline]
+unsafe fn avx512_madd16(a_ip: i32, b: *const i8, c: *mut i32) {
+    // SAFETY: preconditions per the doc — avx512f + ZMM state enabled make the EVEX
+    // instructions legal; `b`/`c` address the required 16 int8 / 16 i32. `zmm0`/
+    // `zmm1` are declared clobbered; the block reads `[b]` and read-writes `[c]`
+    // (so no `nomem`); it uses no stack and sets no flags.
+    unsafe {
+        core::arch::asm!(
+            "vmovd xmm0, {a:e}",                       // xmm0.lo = a_ip
+            "vpbroadcastd zmm0, xmm0",                // zmm0 = a_ip × 16
+            "vpmovsxbd zmm1, xmmword ptr [{b}]",      // zmm1 = sext(b[0..16]) → 16×i32
+            "vpmulld zmm1, zmm1, zmm0",               // zmm1 = a_ip * b
+            "vpaddd zmm1, zmm1, zmmword ptr [{c}]",   // zmm1 += c[0..16]
+            "vmovdqu32 zmmword ptr [{c}], zmm1",      // c[0..16] = zmm1
+            a = in(reg) a_ip,
+            b = in(reg) b,
+            c = in(reg) c,
+            out("zmm0") _,
+            out("zmm1") _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 // ── unit tests (host) ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use super::gemm_i8_avx2_impl;
+    use super::{gemm_i8_avx2_impl, gemm_i8_avx512_impl, Kernel};
     use std::vec;
     use std::vec::Vec;
 
-    /// Scalar reference with the exact `wrapping_add` semantics the AVX2 kernel
+    /// The vector kernels this host CPU can actually execute, each labelled. A tier
+    /// whose feature is absent is skipped (not failed) — CI hosts vary, and both
+    /// kernels are proven identically against the scalar reference below, so running
+    /// whichever the host supports still exercises the differential contract.
+    ///
+    /// Emits a per-tier ran/skipped line to stderr (visible under
+    /// `cargo test -- --nocapture`) so a green run distinguishes "the AVX-512 kernel
+    /// was verified here" from "the host lacks avx512f and it was silently skipped" —
+    /// the two look identical from an exit code otherwise. Standard GitHub runners
+    /// often lack `avx512f`, so the ZMM kernel's coverage must be confirmed on an
+    /// avx512f host (see the design doc's Phase 3 testing note), not assumed from CI.
+    fn host_kernels() -> Vec<(&'static str, Kernel)> {
+        let mut ks: Vec<(&'static str, Kernel)> = Vec::new();
+        let avx2 = std::is_x86_feature_detected!("avx2");
+        let avx512f = std::is_x86_feature_detected!("avx512f");
+        if avx2 {
+            ks.push(("avx2", gemm_i8_avx2_impl as Kernel));
+        }
+        if avx512f {
+            ks.push(("avx512f", gemm_i8_avx512_impl as Kernel));
+        }
+        std::eprintln!(
+            "[simd host-diff] avx2: {}  avx512f: {}",
+            if avx2 { "RAN" } else { "skipped (absent)" },
+            if avx512f { "RAN" } else { "skipped (absent)" },
+        );
+        ks
+    }
+
+    /// Run `kernel` into a fresh `C` buffer and return it.
+    ///
+    /// # Safety
+    /// The caller must have confirmed the host supports `kernel`'s tier (via
+    /// [`host_kernels`]); `m`/`k`/`n` must match the `a`/`b` lengths.
+    unsafe fn run(kernel: Kernel, a: &[i8], b: &[i8], m: usize, k: usize, n: usize) -> Vec<i32> {
+        let mut c = vec![0i32; m * n];
+        // SAFETY: tier confirmed by the caller; dims match the slices.
+        unsafe { kernel(a, b, &mut c, m, k, n) };
+        c
+    }
+
+    /// Scalar reference with the exact `wrapping_add` semantics both vector kernels
     /// must reproduce bit-for-bit.
     fn scalar_ref(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) {
         for i in 0..m {
@@ -358,14 +540,15 @@ mod tests {
     }
 
     #[test]
-    fn avx2_matches_scalar_bit_for_bit() {
-        if !std::is_x86_feature_detected!("avx2") {
-            std::eprintln!("host lacks AVX2 — skipping the AVX2 differential test");
+    fn kernels_match_scalar_bit_for_bit() {
+        let kernels = host_kernels();
+        if kernels.is_empty() {
+            std::eprintln!("host lacks AVX2/AVX-512 — skipping the differential test");
             return;
         }
-        // Shapes chosen to cover: 1×1, non-square, exact multiples of 8, and
-        // several with n NOT a multiple of 8 (exercising the scalar tail), plus
-        // k=1 and large-ish k.
+        // Shapes chosen to cover: 1×1, non-square, exact multiples of 8 and 16, and
+        // several with n NOT a multiple of the step (exercising each kernel's scalar
+        // tail), plus k=1, large-ish k, and n spanning multiple 16-wide ZMM blocks.
         let shapes = [
             (1usize, 1usize, 1usize),
             (2, 3, 4),
@@ -377,70 +560,85 @@ mod tests {
             (4, 1, 8),
             (6, 7, 8),
             (2, 2, 23),
+            (3, 5, 32),
+            (2, 4, 40),
         ];
         for (idx, &(m, k, n)) in shapes.iter().enumerate() {
             let a: Vec<i8> = (0..m * k).map(|t| fill(t + idx * 7)).collect();
             let b: Vec<i8> = (0..k * n).map(|t| fill(t * 3 + idx * 5 + 1)).collect();
             let mut c_scalar = vec![0i32; m * n];
-            let mut c_avx2 = vec![0i32; m * n];
             scalar_ref(&a, &b, &mut c_scalar, m, k, n);
-            // SAFETY: host AVX2 confirmed above; dims are internally consistent.
-            unsafe { gemm_i8_avx2_impl(&a, &b, &mut c_avx2, m, k, n) };
-            assert_eq!(c_scalar, c_avx2, "AVX2 != scalar for shape {:?}", (m, k, n));
+            for &(name, kernel) in &kernels {
+                // SAFETY: `host_kernels` confirmed this tier; dims match the buffers.
+                let c_vec = unsafe { run(kernel, &a, &b, m, k, n) };
+                assert_eq!(
+                    c_scalar,
+                    c_vec,
+                    "{name} != scalar for shape {:?}",
+                    (m, k, n)
+                );
+            }
         }
     }
 
     #[test]
-    fn avx2_extremes_do_not_diverge() {
-        if !std::is_x86_feature_detected!("avx2") {
+    fn kernels_extremes_do_not_diverge() {
+        let kernels = host_kernels();
+        if kernels.is_empty() {
             return;
         }
-        // All -127 and all 127 over a wide K — large magnitudes, both signs.
-        let (m, k, n) = (3usize, 40usize, 11usize);
+        // All -127 and all 127 over a wide K — large magnitudes, both signs; n spans
+        // both a 16-wide block and a tail so each kernel's vector and scalar paths run.
+        let (m, k, n) = (3usize, 40usize, 27usize);
         for &val in &[-127i8, 127i8, -1, 1] {
             let a = vec![val; m * k];
             let b = vec![val; k * n];
             let mut c_scalar = vec![0i32; m * n];
-            let mut c_avx2 = vec![0i32; m * n];
             scalar_ref(&a, &b, &mut c_scalar, m, k, n);
-            // SAFETY: host AVX2 confirmed; dims consistent.
-            unsafe { gemm_i8_avx2_impl(&a, &b, &mut c_avx2, m, k, n) };
-            assert_eq!(c_scalar, c_avx2, "mismatch for uniform value {val}");
+            for &(name, kernel) in &kernels {
+                // SAFETY: tier confirmed by `host_kernels`; dims consistent.
+                let c_vec = unsafe { run(kernel, &a, &b, m, k, n) };
+                assert_eq!(c_scalar, c_vec, "{name} mismatch for uniform value {val}");
+            }
         }
     }
 
     #[test]
-    fn avx2_i32_accumulator_wraps_like_scalar() {
-        if !std::is_x86_feature_detected!("avx2") {
+    fn kernels_i32_accumulator_wraps_like_scalar() {
+        let kernels = host_kernels();
+        if kernels.is_empty() {
             return;
         }
         // K large enough that the ascending int32 sum overflows 2^31: 127*127 =
         // 16129 per term, so ~150k terms wraps well past i32::MAX. This is the one
         // case that stresses VPADDD == wrapping_add across the 32-bit boundary
-        // (impractical in the boot self-test, hence covered here). n=8 → pure
-        // vector path; the result must still match the scalar wrapping reference.
-        let (m, k, n) = (1usize, 150_000usize, 8usize);
+        // (impractical in the boot self-test, hence covered here). n=16 → a pure
+        // vector step for both kernels (two 8-wide for AVX2, one 16-wide for
+        // AVX-512); the result must still match the scalar wrapping reference.
+        let (m, k, n) = (1usize, 150_000usize, 16usize);
         let a = vec![127i8; m * k];
         let b = vec![127i8; k * n];
         let mut c_scalar = vec![0i32; m * n];
-        let mut c_avx2 = vec![0i32; m * n];
         scalar_ref(&a, &b, &mut c_scalar, m, k, n);
-        // SAFETY: host AVX2 confirmed; dims consistent.
-        unsafe { gemm_i8_avx2_impl(&a, &b, &mut c_avx2, m, k, n) };
         // Sanity: the reference actually wrapped into negative territory.
         assert!(c_scalar[0] < 0, "test did not exercise a wrap");
-        assert_eq!(c_scalar, c_avx2, "AVX2 != scalar across an i32 wrap");
+        for &(name, kernel) in &kernels {
+            // SAFETY: tier confirmed by `host_kernels`; dims consistent.
+            let c_vec = unsafe { run(kernel, &a, &b, m, k, n) };
+            assert_eq!(c_scalar, c_vec, "{name} != scalar across an i32 wrap");
+        }
     }
 
     #[test]
-    fn avx2_matches_scalar_over_pseudo_random_sweep() {
-        if !std::is_x86_feature_detected!("avx2") {
+    fn kernels_match_scalar_over_pseudo_random_sweep() {
+        let kernels = host_kernels();
+        if kernels.is_empty() {
             return;
         }
         // A lightweight fuzz substitute (no rng dependency): a deterministic LCG
-        // drives many random (m,k,n) shapes and full-range i8 values, diffing the
-        // AVX2 kernel against the scalar reference. Broad coverage of the bounded
-        // vector/tail pointer arithmetic and sign handling.
+        // drives many random (m,k,n) shapes and full-range i8 values, diffing each
+        // available kernel against the scalar reference. Broad coverage of the
+        // bounded vector/tail pointer arithmetic and sign handling.
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = || {
             state = state
@@ -455,16 +653,17 @@ mod tests {
             let a: Vec<i8> = (0..m * k).map(|_| next() as i8).collect();
             let b: Vec<i8> = (0..k * n).map(|_| next() as i8).collect();
             let mut c_scalar = vec![0i32; m * n];
-            let mut c_avx2 = vec![0i32; m * n];
             scalar_ref(&a, &b, &mut c_scalar, m, k, n);
-            // SAFETY: host AVX2 confirmed; dims consistent with the buffers.
-            unsafe { gemm_i8_avx2_impl(&a, &b, &mut c_avx2, m, k, n) };
-            assert_eq!(
-                c_scalar,
-                c_avx2,
-                "AVX2 != scalar for random shape {:?}",
-                (m, k, n)
-            );
+            for &(name, kernel) in &kernels {
+                // SAFETY: tier confirmed by `host_kernels`; dims match the buffers.
+                let c_vec = unsafe { run(kernel, &a, &b, m, k, n) };
+                assert_eq!(
+                    c_scalar,
+                    c_vec,
+                    "{name} != scalar for random shape {:?}",
+                    (m, k, n)
+                );
+            }
         }
     }
 }

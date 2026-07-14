@@ -1,13 +1,15 @@
 # AI/ML Inference Compute Path — Design
 
-Status: **phase 1 (scalar tier) implemented, SIMD/AMX tiers proposed** · Track C
-(AI/ML compute), step 1 · Author: kernel / compute track
+Status: **scalar + AVX2 + AVX-512F tiers implemented; AVX-512 VNNI / AMX tiers
+proposed** · Track C (AI/ML compute), step 1 · Author: kernel / compute track
 Depends on: `hal::cpuid` AMX + AVX-512 **detection** (C1, shipped — `Feature`
-flags `amx_tile`/`amx_int8`/`amx_bf16`/`avx512_vnni`/`avx512_bf16`).
-Escalation: the scalar tier is pure **safe** Rust (no TCB change). The AVX-512 and
-AMX tiers add `core::arch` SIMD intrinsics + XSAVE/XCR0/XFD/tile-config
-enablement (new TCB) → those phases require kernel-reviewer + verification-engineer
-sign-off (charter invariants #2/#6), same gate as the SMP MSR path.
+flags `amx_tile`/`amx_int8`/`amx_bf16`/`avx512f`/`avx512_vnni`/`avx512_bf16`).
+Escalation: the scalar tier is pure **safe** Rust (no TCB change). The AVX2 and
+AVX-512F tiers add inline-`asm!` vector kernels + `CR4.OSXSAVE`/`XCR0` enablement
+(new TCB, shipped — hal-tcb.md §2j, SM1/SM2 + C11/C12); the VNNI and AMX tiers add
+`XFD`/tile-config on top. Each TCB-touching phase requires kernel-reviewer +
+verification-engineer sign-off (charter invariants #2/#6), same gate as the SMP
+MSR path.
 
 ## Goal
 
@@ -50,14 +52,23 @@ scalar reference (a differential test, not a tolerance).
 |---|---|---|---|
 | **Scalar** | plain `i32 += i8*i8` loop | always | **implemented** — the reference |
 | **AVX2** | `VPMULLD`/`VPADDD` (256-bit, broadcast-A × 8 cols/step) | `avx2` | **implemented** (`hal::simd`) |
-| **AVX-512 VNNI** | `VPDPBUSD` (512-bit, 64×int8/step) | `avx512_vnni` (+`avx512f`/`bw`/`vl`) | proposed |
+| **AVX-512F** | `VPMULLD`/`VPADDD` (512-bit, broadcast-A × 16 cols/step) | `avx512f` | **implemented** (`hal::simd`) |
+| **AVX-512 VNNI** | `VPDPBUSD` (512-bit, fused 4×int8 dot-product/lane) | `avx512_vnni` (+`avx512f`/`bw`/`vl`) | proposed |
 | **AMX int8** | `TDPBSSD` on tile registers | `amx_int8` + `amx_tile` | proposed |
 
+Note the AVX-512F tier is the **same broadcast scheme** as AVX2, just 512-bit (16
+columns/step) — it uses the foundation `VPMULLD`/`VPADDD` ops, distinct from the
+proposed VNNI tier's fused `VPDPBUSD` dot-product (which needs a packed B-panel
+layout). It is a genuine throughput step (2× the columns/step of AVX2) that ships
+now because it reuses the proven kernel structure verbatim.
+
 `detected_capability()` reports the best tier the CPU *advertises*; `active_tier()`
-reports the best tier actually *implemented and verified* — AVX2 when present and
-its self-test passes (see Phase 2), else Scalar. `gemm_i8` dispatches to it, so the
-result is always correct and never claims a tier it does not run. The boot proof
-prints both so the gap is visible, not hidden.
+reports the best tier actually *implemented and verified* — AVX-512F when present
+and its self-test passes, else AVX2 when present and its self-test passes (see
+Phases 2–3), else Scalar. `gemm_i8` dispatches best-first (AVX-512F → AVX2 →
+scalar), so the result is always correct and never claims a tier it does not run.
+The boot proof prints both `detected` and `active` so the gap is visible, not
+hidden.
 
 ## Phase 1 — scalar reference + dispatch (**implemented**)
 
@@ -128,23 +139,59 @@ the `active=avx2` boot assertions (TCG + KVM). Inline `asm!` is Miri/Kani-opaque
 (like the rest of the HAL), so those tools do not cover SM1; the host differential
 harness + boot self-test are its dynamic coverage.
 
-## Phase 3 — AVX-512 VNNI tier (proposed)
+## Phase 3 — AVX-512F tier (**implemented**)
 
-Add a `VPDPBUSD`-based kernel behind the same `gemm_i8` entry, selected when
-`avx512_vnni` is present. Mechanics: AVX-512 needs `XCR0[7:5]` (opmask + ZMM
-hi256 + ZMM16-31) enabled via `XSETBV` after `CR4.OSXSAVE` — extending the
-`hal::simd::enable` state setup, cpuid-gated. The `VPDPBUSD` inner step is written
-in inline `asm!` (VEX/EVEX) for the same reason as AVX2 — the soft-float target
-won't codegen the `core::arch` intrinsics — and validated by the same
-bit-identical-vs-scalar differential harness + a self-test. TCG cannot execute it
-(it drops the AVX-512 CPUID bits), but GitHub's KVM runner fleet is heterogeneous
-and **some runners *do* advertise `avx512-vnni` under `-cpu host`** (observed: a
-`detected=avx512-vnni` boot). Runner assignment is non-deterministic, so CI can't
-*rely* on landing AVX-512 hardware — but it is reachable, so an opportunistic KVM
-proof (assert AVX-512 VNNI active *when* `detected=avx512-vnni`) is feasible. The
+A 512-bit widening of the proven AVX2 kernel, selected when `avx512f` is present.
+Chosen as the next tier because it reuses the Phase-2 broadcast scheme **verbatim**
+(only the vector width changes) yet doubles the columns/step, and the AVX-512
+vector-state enablement it requires is the same `XCR0` extension the future VNNI
+tier needs — so it lands the AVX-512 substrate at low risk.
+
+**Kernel** (`hal::simd::gemm_i8_avx512`): identical structure to `gemm_i8_avx2`,
+sixteen int32 columns per 512-bit `ZMM` step (`VPMOVSXBD` sign-extend m128 →
+`VPMULLD` → `VPADDD`), scalar tail for the remaining `< 16`. Same associative
+`wrapping_add`, so **bit-identical** to the scalar loop and to the AVX2 kernel. The
+inner step is inline `asm!` (`avx512_madd16`, EVEX) for the same soft-float-codegen
+reason as AVX2; `asm!` accepts the explicit `zmm` operands on this target with no
+`#[target_feature]`.
+
+**Vector-state enablement** (extends `hal::simd::enable`, already-registered TCB):
+when `cpuid` advertises `avx512f`, `enable` additionally ORs `XCR0[7:5]` (opmask +
+`ZMM_Hi256` + `Hi16_ZMM`) into the `XSETBV` write — all supported together iff
+`avx512f`, so no `#GP`. On a non-AVX-512 host those bits are never set and the tier
+stays dormant. No new `hal::cpu` primitive is needed (the `xgetbv`/`xsetbv` from
+Phase 2 already back it); the only new raw op is the kernel's `ZMM` load/store
+(hal-tcb.md **SM2**).
+
+**Self-test + verification.** `enable` runs the AVX-512F kernel through the same
+multi-shape self-test as AVX2 (now including an `n=33` multi-block case) and marks
+`avx512_ready` **only** on a bit-exact scalar match. The host differential harness
+runs *both* kernels against scalar over the same shape sweep (i32-wrap case + a
+300-shape pseudo-random sweep), gated on `is_x86_feature_detected!` so each runs
+only where the host supports it — verified locally on an `avx512f`/`vnni` host. TCG
+cannot execute it (it drops the AVX-512 CPUID bits, so `avx512_ready` stays false
+and the tier is skipped — `active` falls to `avx2`), but GitHub's KVM runner fleet
+is heterogeneous and **some runners advertise AVX-512 under `-cpu host`** (observed:
+a `detected=avx512-vnni` boot). The KVM boot job accepts `active=avx2` **or**
+`active=avx512f` (plus `int8 GEMM ok`), so it proves whichever tier the assigned
+runner's silicon supports without a flaky dependency on landing AVX-512 hardware.
+
+## Phase 4 — AVX-512 VNNI tier (proposed)
+
+A throughput upgrade over Phase 3 on the same 512-bit substrate: replace the
+`VPMULLD`+`VPADDD` broadcast with a `VPDPBUSD`-based kernel (a fused 4×int8
+dot-product-accumulate per lane), selected when `avx512_vnni` is present. Unlike
+Phase 3, `VPDPBUSD` needs the B operand **packed** into a `[k/4][n][4]` layout so
+each lane sees 4 contiguous K values — a real restructuring, which is why it is a
+separate later phase rather than folded into the AVX-512F widening. The vector-state
+enablement is already done (Phase 3 turns on `ZMM` state). The `VPDPBUSD` inner step
+is inline `asm!` (EVEX) for the same soft-float reason, validated by the same
+bit-identical-vs-scalar differential harness + self-test. Reachable on the same
+AVX-512 KVM runners as Phase 3 (`detected=avx512-vnni`), so an opportunistic KVM
+proof (assert `active=avx512-vnni` *when* `detected=avx512-vnni`) is feasible; the
 self-test keeps the tier dormant wherever the hardware is absent.
 
-## Phase 4 — AMX int8 tier (proposed)
+## Phase 5 — AMX int8 tier (proposed)
 
 The big one. AMX adds 8 tile registers + `TILECFG`, gated behind **XFD** (extended
 feature disable) on modern CPUs: the OS must clear `IA32_XFD.TILEDATA` and enable
@@ -177,7 +224,18 @@ against the scalar reference bit-for-bit, exactly like phase 2.
   the kernel falls back to scalar (`active=scalar`, correct checksum) rather than
   shipping garbage. `asm!` is Miri/Kani-opaque, so SM1's dynamic coverage is the
   host harness + boot self-test, not Miri.
-- **Phases 3–4 (AVX-512 VNNI, AMX):** same differential-vs-scalar oracle + a
+- **Phase 3 (AVX-512F, now):** the same differential-vs-scalar oracle, extended to
+  run **both** vector kernels — the host harness picks up `avx512f` via
+  `is_x86_feature_detected!` and diffs the `ZMM` kernel against scalar over the full
+  shape sweep (multi-16-block shapes, ±127 extremes, the i32-wrap case at `n=16`,
+  and the 300-shape pseudo-random sweep); verified locally on an `avx512f` host. TCG
+  cannot execute it, so the always-on Kernel CI still shows `active=avx2`; the KVM
+  boot job accepts `active=avx2` **or** `active=avx512f` (plus `int8 GEMM ok`),
+  proving whichever the runner supports. The self-test keeps the tier dormant
+  (falls to AVX2/scalar) wherever `avx512f` is absent, so nothing computes garbage.
+  `asm!` is Miri/Kani-opaque, so SM2's dynamic coverage is the host harness + boot
+  self-test.
+- **Phases 4–5 (AVX-512 VNNI, AMX):** same differential-vs-scalar oracle + a
   self-test, but they can only *execute* where the hardware exists: QEMU 8.2 TCG
   does not emulate AVX-512/AMX (drops the CPUID bits, like x2APIC). AVX-512 VNNI
   *is* present on some GitHub KVM runners (observed `detected=avx512-vnni`), so it

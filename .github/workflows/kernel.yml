@@ -91,6 +91,23 @@ jobs:
         working-directory: kernel
         run: cargo build --target x86_64-unknown-none
 
+      # ── 8b. Host unit tests (differential SIMD harness + ml) ──────────────
+      # The primary dynamic coverage for the inline-`asm!` int8-GEMM kernels
+      # (hal-tcb SM1/SM2): `hal::simd`'s differential harness diffs each vector
+      # kernel bit-for-bit against the scalar reference. These run on the HOST
+      # target — they need `std`, which the bare-metal `x86_64-unknown-none`
+      # target lacks — so `--target x86_64-unknown-linux-gnu` overrides the
+      # workspace's bare-metal `build.target`. `--nocapture` surfaces the
+      # per-tier ran/skipped line, so a green run distinguishes "AVX-512 kernel
+      # exercised" (avx512f-capable runner) from "skipped" (the common case on
+      # stock runners; the AVX2 kernel always runs). `-p kernel` is filtered to
+      # `ml::` because some unrelated fs/wm host tests are not host-safe yet.
+      - name: cargo test (host differential SIMD + ml)
+        working-directory: kernel
+        run: |
+          cargo test -p hal --target x86_64-unknown-linux-gnu -- --nocapture
+          cargo test -p kernel --lib --target x86_64-unknown-linux-gnu ml:: -- --nocapture
+
       # ── 9. Boot test (deterministic QEMU serial-output check) ─────────────
       # `make test` (host-detecting wrapper over xtask — works on this Linux
       # runner and on macOS) builds the ISO, boots QEMU headless, captures serial
