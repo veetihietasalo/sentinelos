@@ -69,6 +69,29 @@ pub fn kmain() -> ! {
     // only enable them once every handler is registered.
     interrupts::init_timer();
 
+    // Enable the BSP's Local APIC in x2APIC mode (virtual-wire: the 8259 PIC still
+    // delivers through LINT0=ExtINT) — the first step toward SMP. Then briefly open
+    // the interrupt window to PROVE the PIT timer still ticks across the switch: a
+    // broken virtual wire would stall here and fail the boot test, rather than
+    // silently stopping the clock. See docs/specs/2026-07-14-smp-x2apic-design.md.
+    match hal::apic::enable_bsp() {
+        Some(apic_id) => {
+            let start = hal::pit::ticks();
+            hal::cpu::enable_interrupts();
+            while hal::pit::ticks() < start + 3 {
+                hal::cpu::halt();
+            }
+            hal::cpu::disable_interrupts();
+            hal::println!(
+                "[smp] x2APIC enabled; BSP apic id={}; {} logical CPU(s); timer live ({} ticks)",
+                apic_id,
+                hal::apic::logical_cpu_count(),
+                hal::pit::ticks(),
+            );
+        }
+        None => hal::println!("[smp] x2APIC not advertised; staying on legacy xAPIC/PIC"),
+    }
+
     // Bring up NETWORKING: find + init the e1000 NIC (heap is ready), read its
     // MAC, set up RX/TX rings, then start the minimal ARP/IPv4/ICMP stack and
     // fire an ARP request + ICMP echo at the gateway as a TX proof. Degrades

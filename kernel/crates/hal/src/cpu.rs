@@ -153,8 +153,11 @@ pub(crate) unsafe fn write_cr4(value: u64) {
 /// # Safety
 ///
 /// `msr` must name an MSR the CPU implements; `rdmsr` on an unimplemented MSR
-/// raises `#GP`. `pub(crate)`; callers pass only known-present MSRs (e.g.
-/// `IA32_EFER`, which every long-mode CPU implements).
+/// raises `#GP`. `pub(crate)`; callers pass only known-present MSRs: `IA32_EFER`
+/// (every long-mode CPU), and — from [`crate::apic`] — `IA32_APIC_BASE` plus the
+/// x2APIC register MSRs (`0x800..=0x8FF`), which are only read after
+/// [`crate::apic::enable_bsp`] has switched the LAPIC into x2APIC mode (reading
+/// them in xAPIC mode `#GP`s, so the mode switch is a precondition).
 #[inline]
 #[must_use]
 pub(crate) unsafe fn read_msr(msr: u32) -> u64 {
@@ -177,15 +180,20 @@ pub(crate) unsafe fn read_msr(msr: u32) -> u64 {
 ///
 /// `msr` must name a writable, implemented MSR and `value` must be
 /// architecturally valid for it — otherwise `wrmsr` raises `#GP` (or worse,
-/// reconfigures the CPU). `pub(crate)`; driven only by
-/// [`crate::cpu_security::enable`] writing a validated `IA32_EFER`.
+/// reconfigures the CPU). `pub(crate)`; driven by [`crate::cpu_security::enable`]
+/// writing a validated `IA32_EFER`, and by [`crate::apic::enable_bsp`] writing
+/// `IA32_APIC_BASE` (EN|EXTD) and the x2APIC LVT/SVR MSRs (`0x800..=0x8FF`) as a
+/// fixed architectural LAPIC bring-up sequence — each MSR checked present via
+/// `cpuid` before the write.
 #[inline]
 pub(crate) unsafe fn write_msr(msr: u32, value: u64) {
     let lo = value as u32;
     let hi = (value >> 32) as u32;
     // SAFETY: the caller guarantees `msr` is a writable implemented MSR and
-    // `value` is valid for it (here: IA32_EFER with NXE OR-ed into its current
-    // value). `wrmsr` writes `edx:eax` to the MSR named by `ecx`. We omit
+    // `value` is valid for it (IA32_EFER with NXE OR-ed into its current value,
+    // or — from apic::enable_bsp — IA32_APIC_BASE with EN|EXTD or an x2APIC
+    // LVT/SVR register, each present on the checked-x2APIC-capable CPU). `wrmsr`
+    // writes `edx:eax` to the MSR named by `ecx`. We omit
     // `nomem` (an EFER write changes NX paging semantics, so it acts as a
     // conservative barrier); it uses no stack and preserves RFLAGS.
     unsafe {

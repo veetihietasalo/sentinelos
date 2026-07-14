@@ -314,10 +314,16 @@ fn do_run() -> ExitCode {
     cmd.args([
         "-M",
         "q35",
-        // Advertise SMEP/SMAP/UMIP (Haswell base + explicit flags) so the kernel
-        // actually enables them; see cpu_security + the design doc.
+        // SMEP/SMAP/UMIP (Haswell base + explicit flags) so cpu_security enables
+        // them; `-smp 4` gives the guest four logical CPUs for the SMP path.
+        // x2APIC is intentionally NOT requested: QEMU's TCG (software) APIC cannot
+        // emulate it, so the kernel takes its documented no-op fallback here; the
+        // x2APIC enable path activates under KVM / on real hardware. See
+        // docs/specs/2026-07-14-smp-x2apic-design.md.
         "-cpu",
         "Haswell,+smep,+smap,+umip",
+        "-smp",
+        "4",
         "-m",
         "256M",
         "-cdrom",
@@ -377,10 +383,15 @@ fn do_test() -> ExitCode {
         .args([
             "-M",
             "q35",
-            // Advertise SMEP/SMAP/UMIP so the kernel enables them (see the
-            // cpu_security module + the design doc).
+            // SMEP/SMAP/UMIP so cpu_security enables them; `-smp 4` gives the guest
+            // four logical CPUs for the SMP path. x2APIC is intentionally NOT
+            // requested: TCG cannot emulate it, so the kernel takes its no-op
+            // fallback (the enable path activates under KVM / real hardware). See
+            // docs/specs/2026-07-14-smp-x2apic-design.md.
             "-cpu",
             "Haswell,+smep,+smap,+umip",
+            "-smp",
+            "4",
             "-m",
             "256M",
             "-cdrom",
@@ -545,10 +556,15 @@ fn do_screenshot() -> ExitCode {
         .args([
             "-M",
             "q35",
-            // Advertise SMEP/SMAP/UMIP so the kernel enables them (see the
-            // cpu_security module + the design doc).
+            // SMEP/SMAP/UMIP so cpu_security enables them; `-smp 4` gives the guest
+            // four logical CPUs for the SMP path. x2APIC is intentionally NOT
+            // requested: TCG cannot emulate it, so the kernel takes its no-op
+            // fallback (the enable path activates under KVM / real hardware). See
+            // docs/specs/2026-07-14-smp-x2apic-design.md.
             "-cpu",
             "Haswell,+smep,+smap,+umip",
+            "-smp",
+            "4",
             "-m",
             "256M",
             "-cdrom",

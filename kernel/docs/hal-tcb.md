@@ -22,7 +22,9 @@ sound, and its formal-verification status.
   sub-project #7 (storage) — the legacy ATA (IDE) PIO disk driver (`hal::ata`,
   §7) backing `kernel::fs` on-disk persistence;
   hardware report — the `cpuid` CPU-identification wrapper (`hal::cpuid`, §8)
-  behind the shell's `cpuinfo`/`devices` commands
+  behind the shell's `cpuinfo`/`devices` commands;
+  SMP (phase 1) — the Local APIC in x2APIC / virtual-wire mode (`hal::apic`, §2i),
+  the first step toward multi-core
 - **Crate lints:** `#![deny(unsafe_op_in_unsafe_fn)]`,
   `#![warn(clippy::undocumented_unsafe_blocks)]` — every `unsafe` block is
   forced to carry a `// SAFETY:` comment.
@@ -90,11 +92,13 @@ at bring-up).
 | C9 | `cpu.rs` · `read_msr()` (`pub(crate) unsafe`) | `rdmsr` (edx:eax ← MSR[ecx]) | Read `IA32_EFER` before setting NXE | Caller passes only known-present MSRs (`IA32_EFER`, implemented on every long-mode CPU) so `rdmsr` cannot #GP; pure read into `edx:eax`; `nomem`/`nostack`/`preserves_flags`. Cannot create UB. | Reasoned + QEMU |
 | C10 | `cpu.rs` · `write_msr()` (`pub(crate) unsafe`) | `wrmsr` (MSR[ecx] ← edx:eax) | Set `IA32_EFER.NXE` (enable NX) via `cpu_security::enable` | Driven only by `cpu_security::enable` writing `IA32_EFER` with NXE OR-ed into its current value (preserving LME/LMA/SCE). NXE makes PTE bit 63 effective — which the kernel's page flags already set and Limine already enables — so it is idempotent and can only make an errant instruction fetch fault, never corrupt memory. `nostack`/`preserves_flags`; `nomem` omitted as a barrier. | Reasoned + QEMU (`[cpu-sec] enabled: nx …`) |
 
-`cpu_security::enable` (safe) is the sole driver of C8/C10: it gates every bit on
-`cpuid` detection (never sets an unsupported bit → no #GP) and only *adds*
-protection on the audited supervisor-only address space, so its two `unsafe`
-blocks (the C8/C10 call sites) cannot create UB. See
-`docs/specs/2026-07-14-cpu-security-features-design.md`.
+`cpu_security::enable` (safe) drives C8 and the `IA32_EFER` path of C9/C10: it
+gates every bit on `cpuid` detection (never sets an unsupported bit → no #GP) and
+only *adds* protection on the audited supervisor-only address space, so those
+`unsafe` blocks cannot create UB. See
+`docs/specs/2026-07-14-cpu-security-features-design.md`. The **x2APIC** path of
+C9/C10 (`IA32_APIC_BASE` + the `0x800`-range registers) is driven by `hal::apic`
+(§2i), likewise `cpuid`-gated so no unimplemented MSR is ever touched.
 
 ---
 
@@ -282,6 +286,35 @@ co-located host unit tests.
 > cursor model, screen clamping, and hit-test click-to-focus live in `kernel::wm`
 > under `#![forbid(unsafe_code)]`, so the privileged surface stays tiny (read a
 > byte, reassemble, EOI). The dual-PIC EOI itself is `hal::pic` (P5).
+
+## 2i. `hal::apic` — Local APIC in x2APIC mode (SMP, phase 1)
+
+Enables the BSP's Local APIC in **x2APIC** mode as the first step toward SMP, in
+**virtual-wire** configuration so the existing 8259 PIC / PIT / keyboard / mouse /
+NIC IRQ path keeps working unchanged: LVT LINT0 is programmed as `ExtINT` (the
+PIC's INTR passes straight through — the CPU's INTA cycle still fetches the vector
+from the PIC, and the existing handlers still EOI the *PIC*, never the LAPIC) and
+LINT1 as `NMI`. The public surface (`enable_bsp`, `id`, `logical_cpu_count`) is
+**safe** and returns plain integers / `Option<u32>`; `logical_cpu_count` and the
+private `has_x2apic` are pure `cpuid` reads (via §8's `raw`, Q1) and add **no**
+new privileged op. The only new `unsafe` is the MSR access, reusing the
+already-documented `cpu::read_msr` / `cpu::write_msr` primitives (C9/C10) — so this
+module adds two new *call sites*, not new raw instructions. `enable_bsp` runs once
+on the BSP at boot, after the PIC/PIT are programmed and with interrupts disabled;
+the `kmain` caller then opens the interrupt window briefly and asserts the PIT
+still ticks across the switch (a broken virtual wire fails the boot test instead
+of silently stopping the clock).
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| AP1 | `apic.rs` · `enable_bsp()` | `cpu::write_msr` ×4: `IA32_APIC_BASE` \|= EN\|EXTD, then `SVR` / `LVT LINT0` / `LVT LINT1` | Switch the LAPIC to x2APIC mode and program virtual-wire routing | Guarded by `has_x2apic()` (cpuid leaf 1 ECX bit 21) ⇒ every MSR is implemented, no `#GP`. `IA32_APIC_BASE` is read-modify-written, only OR-ing in EN\|EXTD (never clearing the base address); EN is already set out of reset and xAPIC(EN)→x2APIC(EN\|EXTD) is a valid transition, after which the `0x800`-range registers are accessible. `SVR` = software-enable \| vector `0xFF`; `LINT0` = ExtINT (front-ends the already-configured PIC), `LINT1` = NMI. Reconfigures interrupt *routing* only — cannot alias or corrupt Rust-managed memory. | Reasoned. **The write sequence runs only where x2APIC is present (KVM / real hardware).** QEMU **TCG** (CI/sandbox) cannot advertise x2APIC under any CPU model (QEMU 8.2), so the boot test exercises the `has_x2apic()`-gated **fallback** (`[smp] x2APIC not advertised…`) and confirms no regression — the enable path itself is verified by reasoning + on KVM/hardware. See the design-doc Testing note. |
+| AP2 | `apic.rs` · `id()` | `cpu::read_msr(0x802)` (x2APIC ID) | Report the BSP's x2APIC ID in the bring-up line | Called only after `enable_bsp` has entered x2APIC mode (reading `0x802` in xAPIC mode `#GP`s), so the MSR is accessible; a pure read-only register access with no side effect — cannot corrupt memory. | Reasoned (same env caveat as AP1 — the `id()` read runs only on the x2APIC-present path, not under TCG). |
+
+> **Migrating device IRQs to the IOAPIC, AP bring-up (INIT-SIPI-SIPI), and
+> per-CPU state are later, designed phases** — see
+> `docs/specs/2026-07-14-smp-x2apic-design.md`. This slice deliberately changes
+> *only* the BSP's LAPIC mode + virtual-wire LVTs, preserving the single-core IRQ
+> path so it can be verified in isolation by the existing boot test.
 
 ---
 
@@ -541,7 +574,7 @@ types) is **entirely safe**, so the `kernel` crate formats the report without an
 | Tool | Applicable to | Status |
 |------|---------------|--------|
 | Manual review + adversarial review (kernel-reviewer) | all entries | scheduled (build sequence step 6) |
-| QEMU boot evidence | S1–S5, C3–C4 (serial output + clean halt); F1–F2 (framebuffer plotted in QEMU once the boot screen renders); **M1–M14 (`cargo xtask test` boots, maps the heap, and allocates: `[mem] heap ok: allocated NNN bytes` — `Box`/`Vec` through the global allocator — before the banner + `boot-bringup-ok`)**; **A1–A4 (`cargo xtask test` attaches a persistent IDE disk; `kernel::fs` logs `[fs] loaded filesystem from disk` / `[fs] no valid image on disk; seeding + saving` proving IDENTIFY + sector read/write; reboot-persistence demonstrated by writing a file then re-launching QEMU on the same image)** | via `cargo xtask test` (test-engineer) |
+| QEMU boot evidence | S1–S5, C3–C4 (serial output + clean halt); F1–F2 (framebuffer plotted in QEMU once the boot screen renders); **M1–M14 (`cargo xtask test` boots, maps the heap, and allocates: `[mem] heap ok: allocated NNN bytes` — `Box`/`Vec` through the global allocator — before the banner + `boot-bringup-ok`)**; **A1–A4 (`cargo xtask test` attaches a persistent IDE disk; `kernel::fs` logs `[fs] loaded filesystem from disk` / `[fs] no valid image on disk; seeding + saving` proving IDENTIFY + sector read/write; reboot-persistence demonstrated by writing a file then re-launching QEMU on the same image)**; **AP1–AP2 (`cargo xtask test` boots the guest with `-smp 4`; because QEMU 8.2 TCG cannot advertise x2APIC, `kernel` logs the `has_x2apic()`-gated fallback `[smp] x2APIC not advertised; staying on legacy xAPIC/PIC` and still reaches the banner + `boot-bringup-ok` — proving graceful degradation + no regression. The x2APIC *enable* path (`[smp] x2APIC enabled …; timer live (N ticks)`) runs on KVM / real hardware)** | via `cargo xtask test` (test-engineer) |
 | QEMU **fault tests** (the #2a evidence) | G1–G5, I1–I5, X1 — `int3` → `EXCEPTION: BREAKPOINT`, deliberate #PF → `EXCEPTION: PAGE FAULT` + no reset loop, forced #DF on the IST stack → `EXCEPTION: DOUBLE FAULT` | via `cargo xtask test-faults` (test-engineer, build sequence step 4) — **this is the primary correctness check for the ISR/asm + descriptor-table loads** |
 | Miri | pure logic helpers only (cannot model port I/O / `hlt`/`cli`/`sti` / descriptor loads / ISR stubs / CR3 / `invlpg` / raw page-table writes / inline `asm!` such as `cpuid`/`rdmsr`/`wrmsr`) | **live** — `.github/workflows/verify.yml` runs `cargo +nightly miri test -p hal` on every kernel change (22 tests, 0 UB); covers new test-exercised paths automatically as they are added |
 | Kani (bounded model checking) | bit-level helpers (e.g. IF/LSR masks, newline translation, gate/TSS descriptor bit-packing, RFLAGS/error-code decoders, **framebuffer `pack_rgb` channel packing + `byte_offset`/`fill_rect` bounds/clip arithmetic**, **`mm` address-index decomposition `VirtAddr::table_indices`, frame-align math, `PageFlags` bit-packing, and `align_up`/free-block split arithmetic**) | **harnesses live** — `#[cfg(kani)]` proofs: `cpuid::FamilyModelStepping::from_eax` (total + bounded over all 2³² inputs) and `ata::validate` (the read/write safety gate — proves no unsafe request is accepted). Run with `cargo kani -p hal`; a dedicated CI job is deferred until the Kani toolchain is confirmed on a runner. More harnesses per the list at left to follow |
