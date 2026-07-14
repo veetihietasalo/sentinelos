@@ -15,7 +15,10 @@
 //!
 //! - [`serial`] — a 16550 UART driver on COM1 (`0x3F8`) with a global console
 //!   and the [`print!`] / [`println!`] macros.
-//! - [`cpu`] — safe wrappers over `hlt`, `cli`, `sti`, and the `CR2` read.
+//! - [`cpu`] — safe wrappers over `hlt`, `cli`, `sti`, the `CR2`/`CR4` reads,
+//!   and the privileged `CR4`/MSR writers used by [`cpu_security`].
+//! - [`cpu_security`] — enable hardware W^X + user/kernel isolation
+//!   (`NX`/`SMEP`/`SMAP`/`UMIP`) via [`cpu_security::enable`], gated on `cpuid`.
 //! - [`cpuid`] — a safe wrapper over the `cpuid` instruction returning the CPU
 //!   vendor/brand strings, family/model/stepping, and feature flags
 //!   ([`cpuid::info`]) for the shell's `cpuinfo` command.
@@ -90,6 +93,7 @@
 
 pub mod ata;
 pub mod cpu;
+pub mod cpu_security;
 pub mod cpuid;
 pub mod e1000;
 pub mod framebuffer;

@@ -103,6 +103,97 @@ pub fn read_cr2() -> u64 {
     value
 }
 
+/// Read the `CR4` control register (the feature-enable flags: SMEP, SMAP, UMIP,
+/// PAE, PGE, …).
+///
+/// A pure register read with no memory effect; exposed **safe** so higher-level
+/// safe code (and the `cpuinfo`-style reporting) can inspect which hardware
+/// protections are active without `unsafe`.
+#[inline]
+#[must_use]
+pub fn read_cr4() -> u64 {
+    let value: u64;
+    // SAFETY: `mov {}, cr4` copies the 64-bit CR4 control register into a GP
+    // register. CR4 is readable at CPL 0 (the kernel always runs ring 0); the
+    // read accesses no program memory (`nomem`), uses no stack (`nostack`), and
+    // leaves RFLAGS untouched (`preserves_flags`). Observing a control register
+    // cannot create UB or affect memory validity/aliasing.
+    unsafe {
+        asm!("mov {}, cr4", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// Write the `CR4` control register.
+///
+/// # Safety
+///
+/// The written value must keep the system sound: it must preserve every bit the
+/// active configuration depends on (e.g. `PAE`, `PGE`) and must only *set*
+/// feature bits the CPU actually implements — writing a reserved or unsupported
+/// bit raises `#GP`. Enabling paging-relevant protections (SMEP/SMAP) is only
+/// safe if no kernel-executed/accessed page is user-accessible. This primitive
+/// is `pub(crate)` and is driven exclusively by [`crate::cpu_security::enable`],
+/// which read-modify-writes (setting only detected, audited-safe bits).
+#[inline]
+pub(crate) unsafe fn write_cr4(value: u64) {
+    // SAFETY: the caller (`cpu_security::enable`) guarantees `value` is the
+    // current CR4 with only supported, memory-safety-preserving feature bits
+    // OR-ed in. `mov cr4, {}` is a privileged move legal at CPL 0. We omit
+    // `nomem` deliberately — a CR4 write can change paging-related semantics, so
+    // it acts as a conservative compiler barrier around memory accesses; it uses
+    // no stack (`nostack`) and does not modify RFLAGS (`preserves_flags`).
+    unsafe {
+        asm!("mov cr4, {}", in(reg) value, options(nostack, preserves_flags));
+    }
+}
+
+/// Read a model-specific register via `rdmsr`, returning `edx:eax` as one `u64`.
+///
+/// # Safety
+///
+/// `msr` must name an MSR the CPU implements; `rdmsr` on an unimplemented MSR
+/// raises `#GP`. `pub(crate)`; callers pass only known-present MSRs (e.g.
+/// `IA32_EFER`, which every long-mode CPU implements).
+#[inline]
+#[must_use]
+pub(crate) unsafe fn read_msr(msr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: the caller guarantees `msr` is implemented, so `rdmsr` cannot
+    // `#GP`. It reads the MSR selected by `ecx` into `edx:eax`, touching no
+    // program memory (`nomem`), no stack (`nostack`), and no RFLAGS
+    // (`preserves_flags`). A pure MSR read cannot create UB.
+    unsafe {
+        asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi,
+             options(nomem, nostack, preserves_flags));
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Write a model-specific register via `wrmsr` (`value` split across `edx:eax`).
+///
+/// # Safety
+///
+/// `msr` must name a writable, implemented MSR and `value` must be
+/// architecturally valid for it — otherwise `wrmsr` raises `#GP` (or worse,
+/// reconfigures the CPU). `pub(crate)`; driven only by
+/// [`crate::cpu_security::enable`] writing a validated `IA32_EFER`.
+#[inline]
+pub(crate) unsafe fn write_msr(msr: u32, value: u64) {
+    let lo = value as u32;
+    let hi = (value >> 32) as u32;
+    // SAFETY: the caller guarantees `msr` is a writable implemented MSR and
+    // `value` is valid for it (here: IA32_EFER with NXE OR-ed into its current
+    // value). `wrmsr` writes `edx:eax` to the MSR named by `ecx`. We omit
+    // `nomem` (an EFER write changes NX paging semantics, so it acts as a
+    // conservative barrier); it uses no stack and preserves RFLAGS.
+    unsafe {
+        asm!("wrmsr", in("ecx") msr, in("eax") lo, in("edx") hi,
+             options(nostack, preserves_flags));
+    }
+}
+
 /// Halt the CPU until the next interrupt (`hlt`) — executed exactly once.
 ///
 /// If interrupts are disabled this parks the core until an NMI or reset.

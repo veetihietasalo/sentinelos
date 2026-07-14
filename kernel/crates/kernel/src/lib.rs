@@ -48,6 +48,21 @@ pub fn kmain() -> ! {
     // banner/draw so the heap is ready for everything that follows.
     memory::init_and_prove();
 
+    // Enable hardware W^X + user/kernel isolation (NX / SMEP / SMAP / UMIP) on
+    // this CPU, gated on what it advertises via cpuid. Safe at this point: no
+    // kernel page is user-accessible and no ring-3 code runs yet, so these add
+    // faults only for accesses that never occur today. Done after paging/heap so
+    // cpuid detection can allocate nothing and the write is on a live address
+    // space. See docs/specs/2026-07-14-cpu-security-features-design.md.
+    let sec = hal::cpu_security::enable();
+    hal::println!(
+        "[cpu-sec] enabled:{}{}{}{}",
+        if sec.nx { " nx" } else { "" },
+        if sec.smep { " smep" } else { "" },
+        if sec.smap { " smap" } else { "" },
+        if sec.umip { " umip" } else { "" },
+    );
+
     // Bring up the hardware-interrupt foundation: remap the 8259 PIC pair to
     // vectors 32–47, register the vector-32 timer handler, program the PIT to
     // ~100 Hz, and unmask IRQ0. Interrupts stay DISABLED until `sti` below — we
