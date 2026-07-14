@@ -6,14 +6,20 @@ Bare-metal x86-64 kernel crate.  Workspace root: `kernel/`.
 
 ```
 kernel/
+  Makefile               # portable runner: make build|run|test|screenshot
   .cargo/config.toml     # workspace-wide: build.target = x86_64-unknown-none + linker flags
-  rust-toolchain.toml    # nightly (required by the limine 0.6.x crate)
-  Cargo.toml             # workspace members: crates/hal, crates/kernel
+  rust-toolchain.toml    # stable (no nightly) + x86_64-unknown-none, rustfmt/clippy/llvm-tools
+  Cargo.toml             # workspace members: crates/{hal, kernel, boot, ui}
   xtask/                 # host-side build driver (standalone workspace — see below)
+  limine/                # Limine bootloader binaries + host tool (fetched, gitignored)
   crates/
-    hal/                 # hardware abstraction layer (no_std)
-    kernel/              # kernel binary (no_std)
+    hal/                 # hardware abstraction layer — the unsafe TCB (no_std)
+    kernel/              # kernel logic: shell, drivers, net stack — forbid(unsafe_code) (no_std)
+    boot/                # boot entry (_start) + Limine handoff → the `sentinelos` ELF (no_std)
+    ui/                  # framebuffer + compositor rendering — forbid(unsafe_code) (no_std)
 ```
+
+Uses the `limine` crate `0.5.x`, which builds on stable Rust — no nightly.
 
 ## Build commands
 
@@ -64,37 +70,37 @@ hard-codes `--target aarch64-apple-darwin`; prefer `make` for a portable build.
 
 ---
 
-## QEMU / Limine — pending installation
+## QEMU / Limine setup
 
-`make run` and `make test` require:
+`make run` / `make test` / `make screenshot` need `qemu-system-x86_64`, `xorriso`,
+and the Limine bootloader checked out at `kernel/limine/`:
 
-| Tool | Install |
-|------|---------|
-| `qemu-system-x86_64` | `brew install qemu` |
-| `xorriso` | `brew install xorriso` |
-| `limine` binary | see below |
+| Tool | macOS | Debian/Ubuntu |
+|------|-------|---------------|
+| `qemu-system-x86_64` | `brew install qemu` | `sudo apt install qemu-system-x86` |
+| `xorriso` | `brew install xorriso` | `sudo apt install xorriso` |
 
-### Fetching a pinned Limine release
+### Limine (pinned to match CI)
 
-```sh
-LIMINE_VER=8.0.4
-curl -Lo /usr/local/bin/limine \
-  "https://github.com/limine-bootloader/limine/releases/download/v${LIMINE_VER}/limine-$(uname -m)-unknown-linux"
-chmod +x /usr/local/bin/limine
-```
-
-Once both `qemu-system-x86_64` and `limine` are on `$PATH`, implement the TODO stubs
-in `xtask/src/main.rs` (`run()` and `test_kernel()`) using the QEMU invocation:
+Clone the pinned tag and build the host tool — the same `v11.4.1-binary` the CI
+workflow (`.github/workflows/kernel.yml`) uses, so local and CI builds agree:
 
 ```sh
-qemu-system-x86_64 \
-  -serial stdio \
-  -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-  -display none \
-  -no-reboot \
-  -cdrom target/sentinelos.iso
+git clone --branch v11.4.1-binary --depth 1 \
+  https://github.com/limine-bootloader/limine.git kernel/limine
+make -C kernel/limine
 ```
 
-Exit code interpretation for `isa-debug-exit`:
-- `33` (0x21 = `0x10 << 1 | 1`) → tests passed
-- anything else → tests failed
+`kernel/limine/` is gitignored (fetched, not tracked).
+
+> **Claude Code on the web:** the `SessionStart` hook
+> (`.claude/hooks/session-setup.sh`) adds the bare-metal target and best-effort
+> installs QEMU + xorriso and builds Limine automatically, so a fresh session can
+> `make test` without manual setup.
+
+### What `make test` checks
+
+`make test` builds the ISO, boots it headless in QEMU (COM1 serial →
+`target/serial.log`), and polls that log for the `SentinelOS — boot bring-up OK`
+banner and the `boot-bringup-ok` end-marker (up to 60 s). It prints `TEST PASSED`
+and exits `0` on success, or dumps the serial log and exits non-zero otherwise.
