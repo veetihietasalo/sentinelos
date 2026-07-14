@@ -366,6 +366,15 @@ const SMP_ENABLED_MARKER: &str = "[smp] x2APIC enabled";
 /// The timer-liveness substring the enable line carries — its presence with a
 /// non-empty tick count proves the PIT kept ticking through LINT0=ExtINT.
 const SMP_TIMER_LIVE_MARKER: &str = "timer live";
+/// Proof that the **AVX2** vector tier is *active* — i.e. the boot-time AVX2
+/// int8-GEMM self-test passed and the hand-written `asm!` kernel is what runs. We
+/// match only `active=avx2`, NOT the `detected=…` field: `detected` is the best
+/// tier the CPU *advertises* and legitimately varies across a heterogeneous runner
+/// fleet (`avx2` on Haswell/TCG, `avx512-vnni` or `amx-int8` on newer silicon),
+/// whereas `active` is the best *implemented* tier and is `avx2` on any avx2-capable
+/// host — which is every x86-64 CPU since 2013. Asserting this proves the vector
+/// inference path executes and computes correctly, not just the scalar fallback.
+const ML_AVX2_ACTIVE: &str = ", active=avx2;";
 /// Seconds to wait for the boot end-marker before giving up. Generous because
 /// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
 /// the full bring-up — networking, then seeding + writing the 16 MiB disk image
@@ -516,15 +525,31 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // The AVX2 int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is
+    // the AVX2 vector kernel — proving the hand-written `asm!` kernel executes and
+    // computes correctly. `-cpu Haswell` (TCG) and `-cpu host` (KVM) both expose
+    // avx2, so this holds in either mode; a scalar fallback here means the vector
+    // kernel is wrong or avx2 is unexpectedly absent.
+    if !log.contains(ML_AVX2_ACTIVE) {
+        eprintln!(
+            "TEST FAILED: expected '{}' in the [ml] line (the AVX2 self-test should \
+             pass where avx2 is exposed — did the vector kernel regress?).",
+            ML_AVX2_ACTIVE
+        );
+        return ExitCode::FAILURE;
+    }
+
     if kvm {
         println!(
-            "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' confirmed \
-             (verification C1 evidence), plus banner + end-marker '{}'.",
-            SMP_ENABLED_MARKER, SMP_TIMER_LIVE_MARKER, END_MARKER
+            "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' — and the \
+             AVX2 int8-GEMM tier verified active ('{}' in the [ml] line), plus banner \
+             + end-marker '{}'.",
+            SMP_ENABLED_MARKER, SMP_TIMER_LIVE_MARKER, ML_AVX2_ACTIVE, END_MARKER
         );
     } else {
         println!(
-            "TEST PASSED: full banner, SMP bring-up line, and end-marker '{}' confirmed in serial output.",
+            "TEST PASSED: full banner, SMP bring-up line, AVX2 tier active, and \
+             end-marker '{}' confirmed in serial output.",
             END_MARKER
         );
     }

@@ -64,6 +64,25 @@ pub fn kmain() -> ! {
         if sec.umip { " umip" } else { "" },
     );
 
+    // Enable AVX (YMM) vector state so the AI/ML compute path can use the AVX2
+    // int8 GEMM kernel (gated on cpuid + this enablement). A no-op on a CPU without
+    // xsave+avx, in which case the ml dispatch stays on the scalar reference. Must
+    // run before `ml::prove()` below (and any other AVX use). See the SIMD design
+    // doc + hal-tcb.md.
+    if hal::simd::enable() {
+        if hal::simd::avx2_ready() {
+            hal::println!(
+                "[simd] AVX enabled; AVX2 int8 GEMM self-test PASSED (vector tier active)"
+            );
+        } else {
+            hal::println!(
+                "[simd] AVX enabled; AVX2 unavailable or self-test failed — ML on scalar tier"
+            );
+        }
+    } else {
+        hal::println!("[simd] AVX not advertised; ML compute stays on the scalar tier");
+    }
+
     // Bring up the hardware-interrupt foundation: remap the 8259 PIC pair to
     // vectors 32–47, register the vector-32 timer handler, program the PIT to
     // ~100 Hz, and unmask IRQ0. Interrupts stay DISABLED until `sti` below — we
