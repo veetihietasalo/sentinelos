@@ -202,6 +202,60 @@ pub(crate) unsafe fn write_msr(msr: u32, value: u64) {
     }
 }
 
+/// Read an extended control register (`xgetbv`), returning `edx:eax` as one `u64`.
+///
+/// Used to read `XCR0` (the enabled XSAVE state-component mask) when bringing up
+/// AVX vector state.
+///
+/// # Safety
+///
+/// `xgetbv` `#UD`s unless `CR4.OSXSAVE` is already set, and `#GP`s for a reserved
+/// `xcr` index. `pub(crate)`; the sole caller ([`crate::simd`]) reads only `XCR0`
+/// (index 0) and only after it has set `CR4.OSXSAVE` (or confirmed it set).
+#[inline]
+#[must_use]
+pub(crate) unsafe fn xgetbv(xcr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: the caller guarantees `CR4.OSXSAVE` is set and `xcr` is a valid index
+    // (0 = XCR0), so `xgetbv` neither `#UD`s nor `#GP`s. It reads the XCR selected
+    // by `ecx` into `edx:eax`, touching no memory (`nomem`), no stack (`nostack`),
+    // and no RFLAGS (`preserves_flags`). A pure control-register read cannot create
+    // UB.
+    unsafe {
+        asm!("xgetbv", in("ecx") xcr, out("eax") lo, out("edx") hi,
+             options(nomem, nostack, preserves_flags));
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Write an extended control register (`xsetbv`), `value` split across `edx:eax`.
+///
+/// Used to enable AVX (`YMM`) state in `XCR0` so `avx`/`avx2` instructions do not
+/// `#UD`.
+///
+/// # Safety
+///
+/// `xsetbv` `#UD`s unless `CR4.OSXSAVE` is set, and `#GP`s if `value` sets a
+/// state-component bit the CPU does not support or an invalid combination (e.g.
+/// AVX without SSE). `pub(crate)`; the sole caller ([`crate::simd::enable`]) sets
+/// `CR4.OSXSAVE` first and writes only `XCR0` with the x87|SSE|AVX bits, each
+/// confirmed supported via `cpuid` — so the write is always architecturally valid.
+#[inline]
+pub(crate) unsafe fn xsetbv(xcr: u32, value: u64) {
+    let lo = value as u32;
+    let hi = (value >> 32) as u32;
+    // SAFETY: the caller guarantees `CR4.OSXSAVE` is set and `value` is a valid
+    // XCR0 mask for this CPU (x87|SSE|AVX, all cpuid-confirmed), so `xsetbv`
+    // neither `#UD`s nor `#GP`s. Enabling AVX state only makes YMM saveable and
+    // AVX instructions legal; it changes no Rust-visible memory. We omit `nomem`
+    // as a conservative barrier around the state change; no stack, preserves flags.
+    unsafe {
+        asm!("xsetbv", in("ecx") xcr, in("eax") lo, in("edx") hi,
+             options(nostack, preserves_flags));
+    }
+}
+
 /// Halt the CPU until the next interrupt (`hlt`) — executed exactly once.
 ///
 /// If interrupts are disabled this parks the core until an NMI or reset.

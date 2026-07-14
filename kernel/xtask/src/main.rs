@@ -366,6 +366,11 @@ const SMP_ENABLED_MARKER: &str = "[smp] x2APIC enabled";
 /// The timer-liveness substring the enable line carries — its presence with a
 /// non-empty tick count proves the PIT kept ticking through LINT0=ExtINT.
 const SMP_TIMER_LIVE_MARKER: &str = "timer live";
+/// The ML bring-up line proving the **AVX2** vector tier is active. Printed only
+/// where the AVX2 int8-GEMM self-test passes — i.e. real hardware / KVM, never TCG
+/// (which mis-emulates `VPMULLD`, so the kernel there falls back to scalar). Its
+/// presence under KVM is evidence the AVX2 kernel runs correctly on real silicon.
+const ML_AVX2_ACTIVE: &str = "[ml] inference: detected=avx2, active=avx2";
 /// Seconds to wait for the boot end-marker before giving up. Generous because
 /// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
 /// the full bring-up — networking, then seeding + writing the 16 MiB disk image
@@ -516,11 +521,23 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Under KVM (real hardware) the AVX2 int8-GEMM self-test must pass, so the ML
+    // tier is the AVX2 vector kernel — proving it runs correctly on real silicon
+    // (TCG mis-emulates VPMULLD and the kernel there falls back to scalar).
+    if kvm && !log.contains(ML_AVX2_ACTIVE) {
+        eprintln!(
+            "KVM TEST FAILED: expected the ML line '{}' (the AVX2 self-test should \
+             pass on real hardware — is avx2 exposed under `-cpu host`?).",
+            ML_AVX2_ACTIVE
+        );
+        return ExitCode::FAILURE;
+    }
+
     if kvm {
         println!(
-            "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' confirmed \
-             (verification C1 evidence), plus banner + end-marker '{}'.",
-            SMP_ENABLED_MARKER, SMP_TIMER_LIVE_MARKER, END_MARKER
+            "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' — and the \
+             AVX2 int8-GEMM tier verified active ('{}'), plus banner + end-marker '{}'.",
+            SMP_ENABLED_MARKER, SMP_TIMER_LIVE_MARKER, ML_AVX2_ACTIVE, END_MARKER
         );
     } else {
         println!(
