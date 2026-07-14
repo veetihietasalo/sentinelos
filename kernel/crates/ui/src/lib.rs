@@ -411,10 +411,26 @@ fn draw_glass_card(fb: &Framebuffer, gradient: &Gradient, w: usize, h: usize) {
 
     // Glass fill (~12 % white over the gradient) + brighter ~1px border.
     raster::fill_rounded_rect_alpha(
-        fb, gradient, card_x, card_y, card_w, card_h, radius, GLASS_WHITE, GLASS_FILL_ALPHA,
+        fb,
+        gradient,
+        card_x,
+        card_y,
+        card_w,
+        card_h,
+        radius,
+        GLASS_WHITE,
+        GLASS_FILL_ALPHA,
     );
     raster::stroke_rounded_rect_alpha(
-        fb, gradient, card_x, card_y, card_w, card_h, radius, GLASS_WHITE, GLASS_BORDER_ALPHA,
+        fb,
+        gradient,
+        card_x,
+        card_y,
+        card_w,
+        card_h,
+        radius,
+        GLASS_WHITE,
+        GLASS_BORDER_ALPHA,
     );
 
     // Inner top highlight (token: `inset 0 1px 0 rgba(255,255,255,.3)`) — a
@@ -446,7 +462,14 @@ fn draw_glass_card(fb: &Framebuffer, gradient: &Gradient, w: usize, h: usize) {
     let wm_y = card_y + card_h / 6;
     // A subtle pink "glow" pass behind the white wordmark: same text drawn 1px
     // offset in accent pink, then white on top — cheap emphasis without a blur.
-    font::draw_text(fb, wm_x + 1, wm_y + 1, wordmark, wm_scale, ACCENT_PINK.pack(fb));
+    font::draw_text(
+        fb,
+        wm_x + 1,
+        wm_y + 1,
+        wordmark,
+        wm_scale,
+        ACCENT_PINK.pack(fb),
+    );
     font::draw_text(fb, wm_x, wm_y, wordmark, wm_scale, TEXT_PRIMARY.pack(fb));
 
     // --- Tagline -----------------------------------------------------------
@@ -455,7 +478,14 @@ fn draw_glass_card(fb: &Framebuffer, gradient: &Gradient, w: usize, h: usize) {
     let tag_w = font::text_width(tagline, tag_scale);
     let tag_x = cx.saturating_sub(tag_w / 2);
     let tag_y = wm_y + font::GLYPH_SIZE * wm_scale + card_h / 12;
-    font::draw_text(fb, tag_x, tag_y, tagline, tag_scale, TEXT_SECONDARY.pack(fb));
+    font::draw_text(
+        fb,
+        tag_x,
+        tag_y,
+        tagline,
+        tag_scale,
+        TEXT_SECONDARY.pack(fb),
+    );
 
     // --- Unlock pill -------------------------------------------------------
     let pill_label = UNLOCK_PILL_LABEL;
@@ -471,14 +501,37 @@ fn draw_glass_card(fb: &Framebuffer, gradient: &Gradient, w: usize, h: usize) {
     let pill_radius = pill_h / 2; // full pill
 
     raster::fill_rounded_rect_alpha(
-        fb, gradient, pill_x, pill_y, pill_w, pill_h, pill_radius, GLASS_WHITE, PILL_FILL_ALPHA,
+        fb,
+        gradient,
+        pill_x,
+        pill_y,
+        pill_w,
+        pill_h,
+        pill_radius,
+        GLASS_WHITE,
+        PILL_FILL_ALPHA,
     );
     raster::stroke_rounded_rect_alpha(
-        fb, gradient, pill_x, pill_y, pill_w, pill_h, pill_radius, ACCENT_CYAN, GLASS_BORDER_ALPHA,
+        fb,
+        gradient,
+        pill_x,
+        pill_y,
+        pill_w,
+        pill_h,
+        pill_radius,
+        ACCENT_CYAN,
+        GLASS_BORDER_ALPHA,
     );
     let label_x = cx.saturating_sub(label_w / 2);
     let label_y = pill_y + pad_y;
-    font::draw_text(fb, label_x, label_y, pill_label, pill_text_scale, TEXT_PRIMARY.pack(fb));
+    font::draw_text(
+        fb,
+        label_x,
+        label_y,
+        pill_label,
+        pill_text_scale,
+        TEXT_PRIMARY.pack(fb),
+    );
 }
 
 /// A bottom dock of four glossy gradient rounded-square tiles.
@@ -628,7 +681,7 @@ pub fn draw_unlock_frame(fb: &Framebuffer, p: u8) {
     if (p as u16) < SPLIT {
         // ── Phase 1: cyan→pink swipe across the pill ───────────────────────
         let prog = p as usize; // 0..SPLIT
-        // The leading edge of the fill, in pill-local pixels.
+                               // The leading edge of the fill, in pill-local pixels.
         let edge = lay.pill_w * prog / SPLIT as usize;
         // A soft feather so the edge isn't a hard vertical line.
         let feather = (lay.pill_w / 12).max(4);
@@ -737,7 +790,15 @@ pub fn draw_desktop(fb: &Framebuffer) {
     // Slim translucent status bar across the top.
     let bar_h = (h / STATUS_BAR_H_DIV).clamp(24, 56);
     raster::fill_rounded_rect_alpha(
-        fb, &gradient, 0, 0, w, bar_h, 0, Rgb::hex(0x10_08_20), STATUS_BAR_ALPHA,
+        fb,
+        &gradient,
+        0,
+        0,
+        w,
+        bar_h,
+        0,
+        Rgb::hex(0x10_08_20),
+        STATUS_BAR_ALPHA,
     );
 
     // Left: the SentinelOS wordmark in the bar.
@@ -746,7 +807,14 @@ pub fn draw_desktop(fb: &Framebuffer) {
     let pad = w / 64;
     let label_y = (bar_h.saturating_sub(font::GLYPH_SIZE * label_scale)) / 2;
     // Subtle pink under-glow then white, mirroring the lock-screen wordmark.
-    font::draw_text(fb, pad + 1, label_y + 1, label, label_scale, ACCENT_PINK.pack(fb));
+    font::draw_text(
+        fb,
+        pad + 1,
+        label_y + 1,
+        label,
+        label_scale,
+        ACCENT_PINK.pack(fb),
+    );
     font::draw_text(fb, pad, label_y, label, label_scale, TEXT_PRIMARY.pack(fb));
 
     // Centered "Welcome" greeting on the desktop canvas.
@@ -755,8 +823,22 @@ pub fn draw_desktop(fb: &Framebuffer) {
     let greet_w = font::text_width(greet, greet_scale);
     let greet_x = (w / 2).saturating_sub(greet_w / 2);
     let greet_y = h / 2 - font::GLYPH_SIZE * greet_scale / 2;
-    font::draw_text(fb, greet_x + 1, greet_y + 1, greet, greet_scale, ACCENT_PINK.pack(fb));
-    font::draw_text(fb, greet_x, greet_y, greet, greet_scale, TEXT_PRIMARY.pack(fb));
+    font::draw_text(
+        fb,
+        greet_x + 1,
+        greet_y + 1,
+        greet,
+        greet_scale,
+        ACCENT_PINK.pack(fb),
+    );
+    font::draw_text(
+        fb,
+        greet_x,
+        greet_y,
+        greet,
+        greet_scale,
+        TEXT_PRIMARY.pack(fb),
+    );
 
     let sub = "SentinelOS desktop";
     let sub_scale = 2usize;

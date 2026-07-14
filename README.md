@@ -93,12 +93,13 @@ rustup target add x86_64-unknown-none
 
 ```bash
 cd kernel
-cargo xtask build        # builds the bootable ISO (Limine + xorriso)
-cargo xtask test         # boots headless in QEMU, asserts the boot bring-up
-cargo xtask screenshot   # boots and captures a PNG of the framebuffer
+make build        # cross-compiles the boot ELF for x86_64-unknown-none
+make test         # builds the ISO, boots headless in QEMU, asserts the boot bring-up
+make screenshot   # boots and captures a PNG of the framebuffer
 ```
 
-`cargo xtask test` should finish with `TEST PASSED` and a serial log ending in `boot-bringup-ok`.
+`make` detects your host triple so these work on Linux and macOS alike. `make test`
+should finish with `TEST PASSED` and a serial log ending in `boot-bringup-ok`.
 
 ---
 

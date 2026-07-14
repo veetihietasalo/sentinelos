@@ -17,70 +17,56 @@ kernel/
 
 ## Build commands
 
-All commands run from `kernel/`.
-
-### Cross-compile the kernel (bare-metal, x86_64-unknown-none)
-
-```sh
-cargo build
-```
-
-Produces `target/x86_64-unknown-none/debug/kernel`.
-
-### Build via xtask (recommended — mirrors CI)
+All commands run from `kernel/`. Use the **Makefile** — it detects the host
+triple (`rustc -vV`) so the same commands work on Linux (CI / Claude Code on the
+web) and macOS alike:
 
 ```sh
-cargo xtask build
+make build        # cross-compile the boot ELF for x86_64-unknown-none
+make run          # build ISO + launch QEMU (serial on stdout)
+make test         # build ISO + boot headless in QEMU, assert the banner
+make screenshot   # build ISO + capture a framebuffer PNG via QMP
 ```
 
-### Run under QEMU (pending deps — see below)
+`make build` produces `target/x86_64-unknown-none/debug/sentinelos`. The
+`run` / `test` / `screenshot` targets additionally need `qemu-system-x86_64`,
+`xorriso`, and `kernel/limine/` (see below).
 
-```sh
-cargo xtask run
-```
-
-### Run tests under QEMU (pending deps — see below)
-
-```sh
-cargo xtask test
-```
+To type-check the kernel crates without booting, `cargo build` also works — it
+picks up `build.target = x86_64-unknown-none` from `.cargo/config.toml`.
 
 ---
 
-## Why xtask is a standalone workspace
+## Why xtask is a standalone workspace (and needs the Makefile)
 
 `kernel/.cargo/config.toml` sets `build.target = "x86_64-unknown-none"` for the entire
-kernel workspace.  If `xtask` were a workspace member, Cargo would compile it for the
+kernel workspace. If `xtask` were a workspace member, Cargo would compile it for the
 bare-metal target too, causing `can't find crate for 'std'`.
 
-The fix has two parts:
+Two things keep xtask building for the host:
 
-1. `xtask/` is NOT listed in `kernel/Cargo.toml`'s `members` list — it is its own
-   standalone workspace (`xtask/Cargo.toml` contains `[workspace]`).
-2. The `cargo xtask` alias in `kernel/.cargo/config.toml` passes
-   `--target aarch64-apple-darwin` explicitly, overriding the workspace default for
-   that one invocation.
-
-On CI with an x86_64-Linux runner, override the alias target:
-
-```sh
-CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu cargo xtask build
-```
-
-Or invoke directly:
+1. `xtask/` is NOT in `kernel/Cargo.toml`'s `members` — it is its own standalone
+   workspace (`xtask/Cargo.toml` contains `[workspace]`).
+2. xtask must still be told to build for the **host**, because Cargo reads config from
+   the current working directory (`kernel/`), where `build.target` is the bare-metal
+   target. A cargo alias cannot expand the host triple, so the Makefile detects it and
+   passes it explicitly:
 
 ```sh
 cargo run --manifest-path xtask/Cargo.toml \
-          --target x86_64-unknown-linux-gnu \
+          --target "$(rustc -vV | sed -n 's/^host: //p')" \
           --target-dir target/xtask \
           -- build
 ```
+
+The `cargo xtask` alias in `kernel/.cargo/config.toml` is a macOS-only shortcut that
+hard-codes `--target aarch64-apple-darwin`; prefer `make` for a portable build.
 
 ---
 
 ## QEMU / Limine — pending installation
 
-`cargo xtask run` and `cargo xtask test` require:
+`make run` and `make test` require:
 
 | Tool | Install |
 |------|---------|

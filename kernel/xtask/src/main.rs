@@ -6,11 +6,15 @@
 //!
 //! # Usage (run from kernel/)
 //!
+//! Drive it through the host-detecting Makefile — portable across Linux (CI /
+//! Claude Code on the web) and macOS. The `cargo xtask` alias in
+//! `.cargo/config.toml` is a macOS-only shortcut; both invoke this same binary.
+//!
 //! ```sh
-//! cargo xtask build      # cross-compile the boot binary for x86_64-unknown-none
-//! cargo xtask run        # build ISO, launch QEMU with serial output on stdout
-//! cargo xtask test       # build ISO, run QEMU ~8s, assert banner in serial.log
-//! cargo xtask screenshot # build ISO, boot in headless QEMU, capture PNG via QMP
+//! make build       # cross-compile the boot binary for x86_64-unknown-none
+//! make run         # build ISO, launch QEMU with serial output on stdout
+//! make test        # build ISO, boot headless in QEMU, assert banner in serial.log
+//! make screenshot  # build ISO, boot in headless QEMU, capture PNG via QMP
 //! ```
 //!
 //! # Dependencies
@@ -108,7 +112,10 @@ fn disk_args() -> Vec<String> {
                 img.display(),
                 DISK_IMG_BYTES / (1024 * 1024)
             ),
-            Err(e) => eprintln!("WARNING: could not create disk image {}: {e}", img.display()),
+            Err(e) => eprintln!(
+                "WARNING: could not create disk image {}: {e}",
+                img.display()
+            ),
         }
     } else {
         println!("Using existing disk image: {}", img.display());
@@ -156,7 +163,13 @@ fn build_kernel() -> Option<PathBuf> {
     println!("Building kernel for x86_64-unknown-none ...");
     let ok = run_cmd(
         Command::new("cargo")
-            .args(["build", "--package", "boot", "--target", "x86_64-unknown-none"])
+            .args([
+                "build",
+                "--package",
+                "boot",
+                "--target",
+                "x86_64-unknown-none",
+            ])
             .current_dir(&root),
     );
     if !ok {
@@ -202,15 +215,17 @@ fn build_iso(kernel_elf: &Path) -> Option<PathBuf> {
     fs::create_dir_all(&efi_boot).expect("create iso_root/EFI/BOOT");
 
     // Copy kernel ELF.
-    fs::copy(kernel_elf, iso_root.join("sentinelos.elf"))
-        .expect("copy kernel ELF into iso_root");
+    fs::copy(kernel_elf, iso_root.join("sentinelos.elf")).expect("copy kernel ELF into iso_root");
 
     // Copy limine config.
-    fs::copy(&limine_conf, iso_root.join("limine.conf"))
-        .expect("copy limine.conf into iso_root");
+    fs::copy(&limine_conf, iso_root.join("limine.conf")).expect("copy limine.conf into iso_root");
 
     // Copy Limine BIOS artifacts.
-    for name in &["limine-bios.sys", "limine-bios-cd.bin", "limine-uefi-cd.bin"] {
+    for name in &[
+        "limine-bios.sys",
+        "limine-bios-cd.bin",
+        "limine-uefi-cd.bin",
+    ] {
         let src = limine_dir.join(name);
         if !src.exists() {
             eprintln!("Missing Limine artifact: {}", src.display());
@@ -225,27 +240,34 @@ fn build_iso(kernel_elf: &Path) -> Option<PathBuf> {
         eprintln!("Missing BOOTX64.EFI in {}", limine_dir.display());
         return None;
     }
-    fs::copy(&bootx64_src, efi_boot.join("BOOTX64.EFI"))
-        .expect("copy BOOTX64.EFI");
+    fs::copy(&bootx64_src, efi_boot.join("BOOTX64.EFI")).expect("copy BOOTX64.EFI");
 
     // Build the ISO with xorriso (standard Limine El-Torito BIOS+UEFI incantation).
     // Flags match the official Limine USAGE.md recipe exactly.
     println!("Building ISO with xorriso ...");
     let ok = run_cmd(Command::new("xorriso").args([
-        "-as", "mkisofs",
-        "-R", "-r", "-J",
-        "-b", "limine-bios-cd.bin",
+        "-as",
+        "mkisofs",
+        "-R",
+        "-r",
+        "-J",
+        "-b",
+        "limine-bios-cd.bin",
         "-no-emul-boot",
-        "-boot-load-size", "4",
+        "-boot-load-size",
+        "4",
         "-boot-info-table",
         "-hfsplus",
-        "-apm-block-size", "2048",
-        "--efi-boot", "limine-uefi-cd.bin",
+        "-apm-block-size",
+        "2048",
+        "--efi-boot",
+        "limine-uefi-cd.bin",
         "-efi-boot-part",
         "--efi-boot-image",
         "--protective-msdos-label",
         iso_root.to_str().unwrap(),
-        "-o", iso_path.to_str().unwrap(),
+        "-o",
+        iso_path.to_str().unwrap(),
     ]));
     if !ok {
         return None;
@@ -253,10 +275,7 @@ fn build_iso(kernel_elf: &Path) -> Option<PathBuf> {
 
     // Install Limine BIOS boot sectors into the ISO.
     println!("Installing Limine BIOS sectors ...");
-    let ok = run_cmd(Command::new(&limine_bin).args([
-        "bios-install",
-        iso_path.to_str().unwrap(),
-    ]));
+    let ok = run_cmd(Command::new(&limine_bin).args(["bios-install", iso_path.to_str().unwrap()]));
     if !ok {
         return None;
     }
@@ -293,11 +312,16 @@ fn do_run() -> ExitCode {
     println!("NIC: e1000 on SLIRP; frames captured to {}", pcap.display());
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args([
-        "-M", "q35",
-        "-m", "256M",
-        "-cdrom", iso.to_str().unwrap(),
-        "-serial", "stdio",
-        "-display", "none",
+        "-M",
+        "q35",
+        "-m",
+        "256M",
+        "-cdrom",
+        iso.to_str().unwrap(),
+        "-serial",
+        "stdio",
+        "-display",
+        "none",
         "-no-reboot",
     ])
     .args(e1000_args(pcap.to_str().unwrap()))
@@ -305,13 +329,24 @@ fn do_run() -> ExitCode {
     println!("Disk: persistent IDE image attached (filesystem survives reboot).");
     let ok = run_cmd(&mut cmd);
 
-    if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 /// End-marker written by `kmain` after the full banner has been flushed.
 const END_MARKER: &str = "boot-bringup-ok";
 /// Full banner line we require to be present as well.
 const BANNER_LINE: &str = "SentinelOS \u{2014} boot bring-up OK";
+/// Seconds to wait for the boot end-marker before giving up. Generous because
+/// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
+/// the full bring-up — networking, then seeding + writing the 16 MiB disk image
+/// through the PIO ATA driver — can take well over 20 s before the marker prints.
+/// The poll below exits the instant the marker appears, so a larger cap only
+/// affects the timeout path and never slows a healthy boot.
+const BOOT_TIMEOUT_SECS: u64 = 60;
 
 fn do_test() -> ExitCode {
     let Some(elf) = build_kernel() else {
@@ -336,11 +371,16 @@ fn do_test() -> ExitCode {
     // brings up and frames cross the wire (inspect target/net.pcap).
     let mut child = Command::new("qemu-system-x86_64")
         .args([
-            "-M", "q35",
-            "-m", "256M",
-            "-cdrom", iso.to_str().unwrap(),
-            "-serial", &format!("file:{}", serial_log.display()),
-            "-display", "none",
+            "-M",
+            "q35",
+            "-m",
+            "256M",
+            "-cdrom",
+            iso.to_str().unwrap(),
+            "-serial",
+            &format!("file:{}", serial_log.display()),
+            "-display",
+            "none",
             "-no-reboot",
         ])
         .args(e1000_args(pcap.to_str().unwrap()))
@@ -348,8 +388,8 @@ fn do_test() -> ExitCode {
         .spawn()
         .expect("failed to spawn qemu-system-x86_64");
 
-    // Poll every 200 ms for up to 20 s (safety cap) until the end-marker appears.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Poll every 200 ms up to BOOT_TIMEOUT_SECS (safety cap) until the marker appears.
+    let deadline = Instant::now() + Duration::from_secs(BOOT_TIMEOUT_SECS);
     let poll_interval = Duration::from_millis(200);
     let mut found = false;
 
@@ -374,8 +414,8 @@ fn do_test() -> ExitCode {
 
     if !found {
         eprintln!(
-            "TEST FAILED: end-marker '{}' not found within 20 s.",
-            END_MARKER
+            "TEST FAILED: end-marker '{}' not found within {} s.",
+            END_MARKER, BOOT_TIMEOUT_SECS
         );
         return ExitCode::FAILURE;
     }
@@ -495,13 +535,19 @@ fn do_screenshot() -> ExitCode {
     let _ = fs::remove_file(&pcap);
     let mut child = Command::new("qemu-system-x86_64")
         .args([
-            "-M", "q35",
-            "-m", "256M",
-            "-cdrom", iso.to_str().unwrap(),
-            "-display", "none",
+            "-M",
+            "q35",
+            "-m",
+            "256M",
+            "-cdrom",
+            iso.to_str().unwrap(),
+            "-display",
+            "none",
             "-no-reboot",
-            "-serial", &format!("file:{}", serial_log.display()),
-            "-qmp", &format!("unix:{},server,nowait", qmp_sock.display()),
+            "-serial",
+            &format!("file:{}", serial_log.display()),
+            "-qmp",
+            &format!("unix:{},server,nowait", qmp_sock.display()),
         ])
         .args(e1000_args(pcap.to_str().unwrap()))
         .args(disk_args())
@@ -510,7 +556,7 @@ fn do_screenshot() -> ExitCode {
 
     // ── Step 1: wait for boot-bringup-ok in serial log (up to 20 s) ──────────
     println!("Waiting for '{}' in serial log ...", END_MARKER);
-    let boot_deadline = Instant::now() + Duration::from_secs(20);
+    let boot_deadline = Instant::now() + Duration::from_secs(BOOT_TIMEOUT_SECS);
     let mut boot_found = false;
     while Instant::now() < boot_deadline {
         std::thread::sleep(Duration::from_millis(200));
@@ -523,7 +569,10 @@ fn do_screenshot() -> ExitCode {
     }
 
     if !boot_found {
-        eprintln!("Timed out waiting for boot marker '{}' (20 s).", END_MARKER);
+        eprintln!(
+            "Timed out waiting for boot marker '{}' ({} s).",
+            END_MARKER, BOOT_TIMEOUT_SECS
+        );
         let log = fs::read_to_string(&serial_log).unwrap_or_default();
         eprintln!("--- serial.log so far ---\n{}\n---", log);
         let _ = child.kill();

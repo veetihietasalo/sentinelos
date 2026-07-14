@@ -71,7 +71,11 @@ impl<'a> Ipv4Header<'a> {
         let dst = Ipv4Addr::from_bytes([buf[16], buf[17], buf[18], buf[19]]);
         // Payload runs from the end of the header to total_len (bounded by buf).
         let end = (total_len as usize).min(buf.len());
-        let payload = if end > ihl { &buf[ihl..end] } else { &buf[ihl..ihl] };
+        let payload = if end > ihl {
+            &buf[ihl..end]
+        } else {
+            &buf[ihl..ihl]
+        };
         Some(Self {
             src,
             dst,

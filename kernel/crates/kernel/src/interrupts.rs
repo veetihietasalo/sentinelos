@@ -345,6 +345,9 @@ mod tests {
     #[test]
     fn pf_reserved_bit() {
         // RSVD=1 overrides all other bits
-        assert_eq!(decode_pf_error(0b0_1000), "reserved-bit set in page table entry");
+        assert_eq!(
+            decode_pf_error(0b0_1000),
+            "reserved-bit set in page table entry"
+        );
     }
 }

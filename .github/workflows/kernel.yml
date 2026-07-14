@@ -56,8 +56,13 @@ jobs:
             ${{ runner.os }}-cargo-
 
       # ── 4. System dependencies ────────────────────────────────────────────
+      # `apt-get update` first: the runner image ships a stale package index, so
+      # a bare `install` can 404 on a superseded transitive dependency (observed
+      # with `ovmf`, pulled in by qemu-system-x86).
       - name: Install QEMU and xorriso
-        run: sudo apt-get install -y qemu-system-x86 xorriso
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 xorriso
 
       # ── 5. Limine (pinned to tag v11.4.1-binary on branch v11.x-binary) ──
       # Clone the exact tag so we get the pre-built BIOS/EFI binaries and the
@@ -87,11 +92,13 @@ jobs:
         run: cargo build --target x86_64-unknown-none
 
       # ── 9. Boot test (deterministic QEMU serial-output check) ─────────────
-      # cargo xtask test builds the ISO, spawns QEMU for 8 s, captures serial
-      # output to target/serial.log, and asserts the "SentinelOS" banner.
-      - name: cargo xtask test
+      # `make test` (host-detecting wrapper over xtask — works on this Linux
+      # runner and on macOS) builds the ISO, boots QEMU headless, captures serial
+      # output to target/serial.log, and asserts the "SentinelOS — boot bring-up
+      # OK" banner plus the boot-bringup-ok end-marker.
+      - name: make test (boot test)
         working-directory: kernel
-        run: cargo xtask test
+        run: make test
 
       # ── 10. Upload serial log on failure ─────────────────────────────────
       - name: Upload serial log (on failure)
