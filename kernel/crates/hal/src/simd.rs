@@ -667,12 +667,51 @@ unsafe fn vnni_dp16(a_dword: u32, b: *const u8, c: *mut i32) {
     }
 }
 
+/// Pure arithmetic **model** of what [`gemm_i8_avx512vnni_impl`] computes for one
+/// output cell: the unsigned/signed bias-corrected dot product `Σ_p (au_p · b_p) −
+/// 128·Σ_p b_p`, where `au_p = a_p + 128` (the `^ 0x80` unsigned bias), everything
+/// `wrapping` mod 2³² — exactly the `VPDPBUSD` accumulation (`au` unsigned × `b`
+/// signed, wrapping, *not* saturating) plus the column-sum correction, but with **no
+/// `asm!`**. Extracted so the **ring identity** that makes it equal the signed scalar
+/// dot product — `Σ (a+128)·b − 128·Σ b = Σ a·b` (mod 2³²) — can be checked
+/// exhaustively/independently of any AVX-512 hardware: by the Kani proof
+/// [`proofs::vnni_bias_correction_is_exact`] (symbolic bytes) and the always-on host
+/// test [`tests::vnni_bias_model_matches_scalar`] (both run on **any** CPU, unlike
+/// the hardware differential tests which need `avx512vnni`). This is a re-derivation
+/// of the kernel's arithmetic, not the code path itself; the hardware differential
+/// test guards the `asm!`/packing against this model drifting from reality.
+#[cfg(any(test, kani))]
+fn vnni_cell_bias(a: &[i8], b: &[i8]) -> i32 {
+    let mut acc: i32 = 0; // VPDPBUSD accumulation of au·b
+    let mut colsum: i32 = 0; // Σ b, for the −128·Σb correction
+    for (&av, &bv) in a.iter().zip(b) {
+        let au = ((av as u8) ^ 0x80) as i32; // a + 128, unsigned byte in 0..=255
+        acc = acc.wrapping_add(au * (bv as i32));
+        colsum = colsum.wrapping_add(bv as i32);
+    }
+    acc.wrapping_sub(128i32.wrapping_mul(colsum))
+}
+
+/// The signed scalar dot product `Σ_p a_p·b_p` (i32 `wrapping_add`) — the oracle
+/// [`vnni_cell_bias`] must equal bit-for-bit.
+#[cfg(any(test, kani))]
+fn scalar_cell(a: &[i8], b: &[i8]) -> i32 {
+    let mut acc: i32 = 0;
+    for (&av, &bv) in a.iter().zip(b) {
+        acc = acc.wrapping_add((av as i32) * (bv as i32));
+    }
+    acc
+}
+
 // ── unit tests (host) ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use super::{gemm_i8_avx2_impl, gemm_i8_avx512_impl, gemm_i8_avx512vnni_impl, Kernel};
+    use super::{
+        gemm_i8_avx2_impl, gemm_i8_avx512_impl, gemm_i8_avx512vnni_impl, scalar_cell,
+        vnni_cell_bias, Kernel,
+    };
     use std::vec;
     use std::vec::Vec;
 
@@ -870,5 +909,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    // The bias-correction identity is what makes VNNI harder than a direct widening
+    // (SM1/SM2). The two tests below check it on the **pure model** (`vnni_cell_bias`,
+    // no `asm!`), so they run on **every** host — including Miri and non-`avx512vnni`
+    // CI runners where the hardware differential tests skip the VNNI kernel — giving
+    // the ring identity an always-on, hardware-independent regression guard. (The
+    // Kani proof `proofs::vnni_bias_correction_is_exact` covers it exhaustively over
+    // symbolic bytes.)
+
+    #[test]
+    fn vnni_bias_model_matches_scalar() {
+        // A deterministic LCG drives many random `k` and full-range i8 values through
+        // both the bias model and the signed scalar dot product; any divergence is a
+        // bug in the unsigned/signed correction (wrong bias, colsum, or sign handling).
+        let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for _ in 0..2000 {
+            let k = (next() % 64) as usize; // 0..=63, incl. empty and k%4≠0
+            let a: Vec<i8> = (0..k).map(|_| next() as i8).collect();
+            let b: Vec<i8> = (0..k).map(|_| next() as i8).collect();
+            assert_eq!(
+                vnni_cell_bias(&a, &b),
+                scalar_cell(&a, &b),
+                "VNNI bias model != scalar for k={k}, a={a:?}, b={b:?}"
+            );
+        }
+    }
+
+    // The one thing the small-`k` cases can't reach: a 32-bit accumulator wrap. Uses
+    // a large `k`, so it is skipped under Miri (which would interpret the whole loop
+    // far too slowly) — native `cargo test` covers it, and Kani proves the identity
+    // symbolically for the non-wrapping regime.
+    #[test]
+    #[cfg(not(miri))]
+    fn vnni_bias_model_wraps_like_scalar() {
+        // 127*127 per term, ~150k terms wraps well past i32::MAX; the correction
+        // 128*colsum also wraps. The model must still match the scalar reference.
+        let k = 150_000usize;
+        let a = vec![127i8; k];
+        let b = vec![127i8; k];
+        let s = scalar_cell(&a, &b);
+        assert!(s < 0, "test did not exercise a wrap");
+        assert_eq!(
+            vnni_cell_bias(&a, &b),
+            s,
+            "VNNI bias model != scalar across a wrap"
+        );
+    }
+}
+
+/// Kani proof — the VNNI bias-correction model ([`vnni_cell_bias`]) computes the
+/// signed scalar dot product ([`scalar_cell`]) bit-for-bit for **all** int8 inputs:
+/// the ring identity `Σ (a+128)·b − 128·Σ b = Σ a·b` (mod 2³²). This is the one part
+/// of the VNNI tier not covered by a direct widening of a proven kernel, so it gets
+/// an exhaustive, hardware-independent proof here. Symbolic over the full byte space
+/// for a fixed `k` (the identity is a per-term equality plus a linear `wrapping_add`
+/// reduction, so a small `k` witnesses the general case); the large-`k` accumulator-
+/// wrap regime is covered by the host test [`tests::vnni_bias_model_wraps_like_scalar`].
+/// Compiled only under `cargo kani -p hal`; excluded from the stable build and tests.
+#[cfg(kani)]
+mod proofs {
+    use super::{scalar_cell, vnni_cell_bias};
+
+    #[kani::proof]
+    fn vnni_bias_correction_is_exact() {
+        const K: usize = 4;
+        let a: [i8; K] = kani::any();
+        let b: [i8; K] = kani::any();
+        assert_eq!(vnni_cell_bias(&a, &b), scalar_cell(&a, &b));
     }
 }

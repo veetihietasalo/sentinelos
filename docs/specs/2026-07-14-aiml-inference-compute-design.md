@@ -260,13 +260,18 @@ against the scalar reference bit-for-bit, exactly like phase 2.
   `is_x86_feature_detected!` and diffs `VPDPBUSD`+bias-correction against scalar over
   the full shape sweep (`k` not ÷ 4 to exercise K-group padding, `n` not ÷ 16, ±127,
   the i32-wrap case, and the 300-shape sweep); verified locally on an `avx512vnni`
-  host. The unsigned/signed bias math was *additionally* cross-checked standalone
-  against the `VPDPBUSD` intrinsic over 212 shapes before the asm kernel existed, to
-  de-risk the ring-identity reasoning. TCG cannot execute it, so the always-on Kernel
-  CI still shows `active=avx2`; the KVM boot job accepts `active=avx512-vnni` (plus
-  `int8 GEMM ok`) on runners that expose VNNI. The self-test keeps the tier dormant
-  wherever `avx512_vnni` is absent. `asm!` is Miri/Kani-opaque, so SM3's dynamic
-  coverage is the host harness + boot self-test.
+  host. Because that hardware differential test **skips** on stock CI runners, the
+  novel part — the unsigned/signed **bias-correction ring identity** — also gets an
+  *always-on, hardware-independent* guard: a pure model (`vnni_cell_bias`, no `asm!`)
+  proven equal to the scalar dot product by a Kani harness (symbolic bytes) and by
+  host tests that run on **every** runner and under Miri (a 2000-shape sweep + a
+  wrap case). TCG cannot execute the kernel, so the always-on Kernel CI shows
+  `active=avx2`; the KVM boot job asserts `active=avx512-vnni` + `int8 GEMM ok` on
+  runners that expose VNNI — **observed** on the tier's first CI run (serial log
+  archived), which also confirms the AVX-512 `XCR0` enablement + the AVX-512F self-
+  test at CPL-0. The boot self-test keeps the tier dormant wherever `avx512_vnni` is
+  absent. The `asm!` step is Miri/Kani-opaque, so SM3's dynamic coverage is the host
+  harness + boot self-test + the always-on bias guard.
 - **Phase 5 (AMX, proposed):** same differential-vs-scalar oracle + a self-test, but
   it can only *execute* where the hardware exists: QEMU 8.2 TCG does not emulate AMX
   (drops the CPUID bits, like x2APIC); AMX (Sapphire-Rapids+) has not been seen on
