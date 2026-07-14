@@ -1,0 +1,113 @@
+name: SMP KVM proof (x2APIC enable path)
+
+# Verification condition C1 for the SMP x2APIC TCB (issue #10): the x2APIC *enable*
+# path (the AP1 MSR write sequence in `hal::apic::enable_bsp`) executes only where
+# x2APIC is actually present. QEMU's software emulation (TCG, used by the main
+# Kernel CI) cannot advertise x2APIC, so that path is never exercised there. This
+# job boots the kernel under **real KVM acceleration** with host-CPU passthrough
+# (`-enable-kvm -cpu host`), where x2APIC IS advertised, and asserts the enable
+# line `[smp] x2APIC enabled … timer live (N ticks)` — the concrete evidence that
+# the write sequence ran and the virtual wire held. The captured serial log is
+# uploaded as an artifact (the C1 record).
+#
+# GitHub-hosted Linux runners expose /dev/kvm (hardware-accelerated virtualization
+# was enabled on standard runners in 2024). If a given runner lacks it, the job
+# skips gracefully with a warning rather than failing — the enable-path proof then
+# has to come from real hardware via `make test-kvm` (see the SMP design doc).
+
+on:
+  push:
+    paths:
+      - "kernel/**"
+      - ".github/workflows/kvm-smp.yml"
+  pull_request:
+    paths:
+      - "kernel/**"
+      - ".github/workflows/kvm-smp.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LIMINE_TAG: v11.4.1-binary
+  LIMINE_REPO: https://github.com/limine-bootloader/limine.git
+
+jobs:
+  kvm-smp:
+    name: KVM boot (x2APIC enable proof)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout SentinelOS
+        uses: actions/checkout@v4
+
+      # Gate the whole proof on KVM availability. If /dev/kvm is absent (a runner
+      # without nested virt), skip the rest with a visible warning instead of a
+      # red failure — the C1 evidence then must come from real hardware.
+      - name: Detect KVM
+        id: kvm
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo "available=yes" >> "$GITHUB_OUTPUT"
+            sudo chmod 666 /dev/kvm || true
+            ls -l /dev/kvm
+            echo "KVM is available on this runner."
+          else
+            echo "available=no" >> "$GITHUB_OUTPUT"
+            echo "::warning title=No KVM::/dev/kvm is not present on this runner; the x2APIC enable-path proof (C1) was not produced. Run 'make test-kvm' on real hardware to capture it (see issue #10)."
+          fi
+
+      - name: Install Rust stable toolchain (from rust-toolchain.toml)
+        if: steps.kvm.outputs.available == 'yes'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy,llvm-tools
+          targets: x86_64-unknown-none
+
+      - name: Cache Cargo registry + build artefacts
+        if: steps.kvm.outputs.available == 'yes'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            kernel/target
+          key: ${{ runner.os }}-cargo-kvm-${{ hashFiles('kernel/Cargo.lock', 'kernel/xtask/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install QEMU and xorriso
+        if: steps.kvm.outputs.available == 'yes'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 xorriso
+
+      - name: Clone Limine ${{ env.LIMINE_TAG }}
+        if: steps.kvm.outputs.available == 'yes'
+        run: |
+          git clone \
+            --branch ${{ env.LIMINE_TAG }} \
+            --depth 1 \
+            ${{ env.LIMINE_REPO }} \
+            kernel/limine
+          make -C kernel/limine
+
+      # Boot under KVM + -cpu host and assert the x2APIC ENABLE line. Fails if the
+      # enable path did not run (e.g. x2APIC somehow not exposed) — that is a real
+      # signal to investigate, not an infra skip.
+      - name: KVM boot test (assert x2APIC enable path)
+        if: steps.kvm.outputs.available == 'yes'
+        working-directory: kernel
+        run: make test-kvm
+
+      # The serial log IS the C1 evidence — upload it whether the assertion passed
+      # or failed so the enable line (or its absence) is inspectable on the run.
+      - name: Upload serial log (C1 evidence)
+        if: steps.kvm.outputs.available == 'yes' && (success() || failure())
+        uses: actions/upload-artifact@v4
+        with:
+          name: smp-x2apic-kvm-serial-log
+          path: kernel/target/serial.log
+          if-no-files-found: warn

@@ -11,7 +11,10 @@
 #
 #   make build       # cross-compile the boot ELF for x86_64-unknown-none
 #   make run         # build ISO + launch QEMU (serial on stdout)
-#   make test        # build ISO + boot headless in QEMU, assert the banner
+#   make test        # build ISO + boot headless in QEMU (TCG), assert the banner
+#   make test-kvm    # build ISO + boot under KVM (-cpu host), assert the x2APIC
+#                    #   ENABLE path ran — the C1 evidence TCG cannot produce.
+#                    #   Requires /dev/kvm (real hardware or a KVM-capable runner).
 #   make screenshot  # build ISO + capture a framebuffer PNG via QMP
 #
 # Requires: qemu-system-x86_64, xorriso, and kernel/limine (see README).
@@ -19,12 +22,14 @@
 HOST := $(shell rustc -vV | sed -n 's/^host: //p')
 XTASK := cargo run --manifest-path xtask/Cargo.toml --target $(HOST) --target-dir target/xtask --
 
-.PHONY: build run test screenshot
+.PHONY: build run test test-kvm screenshot
 build:
 	$(XTASK) build
 run:
 	$(XTASK) run
 test:
 	$(XTASK) test
+test-kvm:
+	$(XTASK) test-kvm
 screenshot:
 	$(XTASK) screenshot
