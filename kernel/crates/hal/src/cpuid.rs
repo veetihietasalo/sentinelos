@@ -283,9 +283,13 @@ impl Leaf7Ebx {
     const SMEP: u32 = 1 << 7;
     const BMI2: u32 = 1 << 8;
     const AVX512F: u32 = 1 << 16;
+    const AVX512DQ: u32 = 1 << 17;
     const RDSEED: u32 = 1 << 18;
     const SMAP: u32 = 1 << 20;
+    const AVX512CD: u32 = 1 << 28;
     const SHA: u32 = 1 << 29;
+    const AVX512BW: u32 = 1 << 30;
+    const AVX512VL: u32 = 1 << 31;
 }
 
 /// Selected leaf-7 sub-leaf-0 `ecx` feature bits (privilege-hardening + newer ISA).
@@ -295,6 +299,9 @@ impl Leaf7Ecx {
     const UMIP: u32 = 1 << 2;
     /// CET shadow stack (control-flow integrity, return-address protection).
     const CET_SS: u32 = 1 << 7;
+    /// AVX-512 Vector Neural Network Instructions — fused int8/int16 dot-product,
+    /// the core op of quantized transformer inference.
+    const AVX512_VNNI: u32 = 1 << 11;
     /// 5-level paging / 57-bit linear addresses.
     const LA57: u32 = 1 << 16;
     const RDPID: u32 = 1 << 22;
@@ -305,6 +312,14 @@ struct Leaf7Edx;
 impl Leaf7Edx {
     /// CET indirect-branch tracking (forward-edge control-flow integrity).
     const CET_IBT: u32 = 1 << 20;
+    /// AMX tiled bf16 matrix multiply (`TDPBF16PS`).
+    const AMX_BF16: u32 = 1 << 22;
+    /// AVX-512 half-precision (fp16) arithmetic.
+    const AVX512_FP16: u32 = 1 << 23;
+    /// AMX tile architecture (`LDTILECFG`/tile registers) — the matrix substrate.
+    const AMX_TILE: u32 = 1 << 24;
+    /// AMX tiled int8 matrix multiply (`TDPBSSD` et al.) — quantized inference.
+    const AMX_INT8: u32 = 1 << 25;
     /// IBRS/IBPB via the `IA32_SPEC_CTRL`/`IA32_PRED_CMD` MSRs (Spectre v2).
     const SPEC_CTRL: u32 = 1 << 26;
     /// Single-Thread Indirect Branch Predictors.
@@ -313,6 +328,15 @@ impl Leaf7Edx {
     const L1D_FLUSH: u32 = 1 << 28;
     /// Speculative Store Bypass Disable (Spectre v4).
     const SSBD: u32 = 1 << 31;
+}
+
+/// Selected leaf-7 **sub-leaf-1** `eax` bits — the newer ML-oriented extensions.
+struct Leaf7Sub1Eax;
+impl Leaf7Sub1Eax {
+    /// AVX (256-bit) VNNI — int8/int16 dot-product without the AVX-512 licence.
+    const AVX_VNNI: u32 = 1 << 4;
+    /// AVX-512 bf16 dot-product (`VDPBF16PS`) — bf16 inference on 512-bit vectors.
+    const AVX512_BF16: u32 = 1 << 5;
 }
 
 /// Selected extended leaf `0x8000_0001` `edx` bits (long mode + NX).
@@ -352,7 +376,7 @@ impl Ext1FEax {
 /// Capacity ceiling for the feature list [`info`] reports (bits inspected across
 /// leaf 1, leaf 7, and the extended leaves below). Callers can size a buffer to
 /// this; the `add` helper never writes past it.
-pub const MAX_FEATURES: usize = 48;
+pub const MAX_FEATURES: usize = 64;
 
 /// A structured, heap-free snapshot of what `cpuid` reports about this CPU.
 ///
@@ -424,12 +448,15 @@ pub fn info() -> CpuInfo {
         (FamilyModelStepping::default(), 0, 0)
     };
 
-    // Leaf 7 sub-leaf 0: extended feature flags (ebx/ecx/edx), when supported.
-    let (ebx7, ecx7, edx7) = if max_std >= 7 {
+    // Leaf 7 sub-leaf 0: extended feature flags (ebx/ecx/edx), when supported. Its
+    // eax reports the max sub-leaf; sub-leaf 1 eax carries the newer ML-oriented
+    // bits (AVX-VNNI, AVX512-BF16), read only when that sub-leaf exists.
+    let (ebx7, ecx7, edx7, eax7_1) = if max_std >= 7 {
         let l = raw(7, 0);
-        (l.ebx, l.ecx, l.edx)
+        let s1 = if l.eax >= 1 { raw(7, 1).eax } else { 0 };
+        (l.ebx, l.ecx, l.edx, s1)
     } else {
-        (0, 0, 0)
+        (0, 0, 0, 0)
     };
 
     // Extended leaves. `0x8000_0001` carries NX / long-mode / AMD-V; `0x8000_001F`
@@ -498,8 +525,19 @@ pub fn info() -> CpuInfo {
     add("rdseed", ebx7, Leaf7Ebx::RDSEED);
     add("smap", ebx7, Leaf7Ebx::SMAP);
     add("sha", ebx7, Leaf7Ebx::SHA);
-    // Wide vectors (leaf 7 ebx) — relevant to CPU-side ML kernels.
+    // Wide vectors + matrix extensions (leaf 7) — the CPU-side ML surface.
     add("avx512f", ebx7, Leaf7Ebx::AVX512F);
+    add("avx512dq", ebx7, Leaf7Ebx::AVX512DQ);
+    add("avx512cd", ebx7, Leaf7Ebx::AVX512CD);
+    add("avx512bw", ebx7, Leaf7Ebx::AVX512BW);
+    add("avx512vl", ebx7, Leaf7Ebx::AVX512VL);
+    add("avx512_vnni", ecx7, Leaf7Ecx::AVX512_VNNI);
+    add("avx512_fp16", edx7, Leaf7Edx::AVX512_FP16);
+    add("avx_vnni", eax7_1, Leaf7Sub1Eax::AVX_VNNI);
+    add("avx512_bf16", eax7_1, Leaf7Sub1Eax::AVX512_BF16);
+    add("amx_tile", edx7, Leaf7Edx::AMX_TILE);
+    add("amx_int8", edx7, Leaf7Edx::AMX_INT8);
+    add("amx_bf16", edx7, Leaf7Edx::AMX_BF16);
     // Privilege & control-flow hardening (leaf 1 ecx, leaf 7 ecx/edx).
     add("pcid", ecx1, Leaf1Ecx::PCID);
     add("umip", ecx7, Leaf7Ecx::UMIP);
