@@ -24,6 +24,7 @@ pub mod fs;
 pub mod input;
 pub mod interrupts;
 pub mod memory;
+pub mod ml;
 pub mod net;
 pub mod shell;
 pub mod wm;
@@ -97,6 +98,13 @@ pub fn kmain() -> ! {
         }
         None => hal::println!("[smp] x2APIC not advertised; staying on legacy xAPIC/PIC"),
     }
+
+    // Bring up the AI/ML COMPUTE path: turn the C1 cpuid detection (AMX / AVX-512)
+    // into an actual quantized-inference primitive. Reports the detected hardware
+    // tier vs. the active (implemented) tier and runs a real int8 GEMM as an
+    // end-to-end proof. Pure safe Rust; the SIMD/AMX kernels are later phases.
+    // See docs/specs/2026-07-14-aiml-inference-compute-design.md.
+    ml::prove();
 
     // Bring up NETWORKING: find + init the e1000 NIC (heap is ready), read its
     // MAC, set up RX/TX rings, then start the minimal ARP/IPv4/ICMP stack and
