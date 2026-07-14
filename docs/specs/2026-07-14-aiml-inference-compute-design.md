@@ -136,10 +136,13 @@ hi256 + ZMM16-31) enabled via `XSETBV` after `CR4.OSXSAVE` — extending the
 `hal::simd::enable` state setup, cpuid-gated. The `VPDPBUSD` inner step is written
 in inline `asm!` (VEX/EVEX) for the same reason as AVX2 — the soft-float target
 won't codegen the `core::arch` intrinsics — and validated by the same
-bit-identical-vs-scalar differential harness + a self-test. Neither TCG (drops
-AVX-512) nor the current KVM runner (no AVX-512 VNNI observed under `-cpu host`) can
-execute it, so it needs AVX-512 hardware to prove — the self-test keeps it dormant
-everywhere else.
+bit-identical-vs-scalar differential harness + a self-test. TCG cannot execute it
+(it drops the AVX-512 CPUID bits), but GitHub's KVM runner fleet is heterogeneous
+and **some runners *do* advertise `avx512-vnni` under `-cpu host`** (observed: a
+`detected=avx512-vnni` boot). Runner assignment is non-deterministic, so CI can't
+*rely* on landing AVX-512 hardware — but it is reachable, so an opportunistic KVM
+proof (assert AVX-512 VNNI active *when* `detected=avx512-vnni`) is feasible. The
+self-test keeps the tier dormant wherever the hardware is absent.
 
 ## Phase 4 — AMX int8 tier (proposed)
 
@@ -176,10 +179,11 @@ against the scalar reference bit-for-bit, exactly like phase 2.
   host harness + boot self-test, not Miri.
 - **Phases 3–4 (AVX-512 VNNI, AMX):** same differential-vs-scalar oracle + a
   self-test, but they can only *execute* where the hardware exists: QEMU 8.2 TCG
-  does not emulate AVX-512/AMX (drops the CPUID bits, like x2APIC) and the current
-  KVM runner shows no AVX-512 VNNI / AMX under `-cpu host`, so they need AVX-512 /
-  Sapphire-Rapids hardware to prove. The self-test keeps them dormant (scalar
-  fallback) everywhere they can't run, so nothing computes garbage. The
+  does not emulate AVX-512/AMX (drops the CPUID bits, like x2APIC). AVX-512 VNNI
+  *is* present on some GitHub KVM runners (observed `detected=avx512-vnni`), so it
+  can be proven opportunistically there; AMX (Sapphire-Rapids+) has not been seen
+  and needs dedicated hardware. The self-test keeps them dormant (scalar fallback)
+  everywhere they can't run, so nothing computes garbage. The
   XCR0/XFD/tile-config `XSETBV`/MSR writes are inline-asm (Miri/Kani-opaque, like
   the SMP MSRs) → verified by reasoning + the differential test + hardware boot
   evidence.
