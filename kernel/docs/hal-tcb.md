@@ -94,7 +94,7 @@ at bring-up).
 | C9 | `cpu.rs` · `read_msr()` (`pub(crate) unsafe`) | `rdmsr` (edx:eax ← MSR[ecx]) | Read `IA32_EFER` before setting NXE | Caller passes only known-present MSRs (`IA32_EFER`, implemented on every long-mode CPU) so `rdmsr` cannot #GP; pure read into `edx:eax`; `nomem`/`nostack`/`preserves_flags`. Cannot create UB. | Reasoned + QEMU |
 | C10 | `cpu.rs` · `write_msr()` (`pub(crate) unsafe`) | `wrmsr` (MSR[ecx] ← edx:eax) | Set `IA32_EFER.NXE` (enable NX) via `cpu_security::enable` | Driven only by `cpu_security::enable` writing `IA32_EFER` with NXE OR-ed into its current value (preserving LME/LMA/SCE). NXE makes PTE bit 63 effective — which the kernel's page flags already set and Limine already enables — so it is idempotent and can only make an errant instruction fetch fault, never corrupt memory. `nostack`/`preserves_flags`; `nomem` omitted as a barrier. | Reasoned + QEMU (`[cpu-sec] enabled: nx …`) |
 | C11 | `cpu.rs` · `xgetbv()` (`pub(crate) unsafe`) | `xgetbv` (edx:eax ← XCR[ecx]) | Read `XCR0` when bringing up AVX vector state | Pure read of the extended control register selected by `ecx`; the sole caller (`simd`) passes `0` (XCR0) and only after `CR4.OSXSAVE` is set, so it cannot `#UD`/`#GP`. `nomem`/`nostack`/`preserves_flags`. Reading a control register cannot create UB. | Reasoned + QEMU (`[simd] AVX enabled …`) |
-| C12 | `cpu.rs` · `xsetbv()` (`pub(crate) unsafe`) | `xsetbv` (XCR[ecx] ← edx:eax) | Enable AVX (`YMM`) state in `XCR0` so `avx`/`avx2` don't `#UD` | Driven only by `simd::enable`, which sets `CR4.OSXSAVE` first (so no `#UD`) and writes `XCR0` with the x87\|SSE\|AVX component bits, each `cpuid`-confirmed supported (so no `#GP`; AVX requires SSE, both set). Enabling vector state only makes `YMM` usable/saveable — it changes no Rust-visible memory. `nostack`/`preserves_flags`; `nomem` omitted as a barrier. | Reasoned + QEMU (`[simd] AVX enabled …`) |
+| C12 | `cpu.rs` · `xsetbv()` (`pub(crate) unsafe`) | `xsetbv` (XCR[ecx] ← edx:eax) | Enable AVX (`YMM`) — and, where present, AVX-512 (`ZMM`) — state in `XCR0` so `avx`/`avx2`/`avx512f` don't `#UD` | Driven only by `simd::enable`, which sets `CR4.OSXSAVE` first (so no `#UD`) and writes `XCR0` with the x87\|SSE\|AVX component bits, plus — **only** when `cpuid` advertises `avx512f` — the `opmask`\|`ZMM_Hi256`\|`Hi16_ZMM` bits. Each bit is `cpuid`-confirmed supported before being set (so no `#GP`; AVX requires SSE, and the three AVX-512 bits are all supported iff `avx512f` and enabled together). Enabling vector state only makes `YMM`/`ZMM` usable/saveable — it changes no Rust-visible memory. `nostack`/`preserves_flags`; `nomem` omitted as a barrier. | Reasoned + QEMU (`[simd] AVX enabled …`) |
 
 `cpu_security::enable` (safe) drives the SMEP/SMAP/UMIP path of C8 (the `OSXSAVE`
 path is `simd::enable`, §2j) and the `IA32_EFER` path of C9/C10: it
@@ -324,52 +324,59 @@ of silently stopping the clock).
 > *only* the BSP's LAPIC mode + virtual-wire LVTs, preserving the single-core IRQ
 > path so it can be verified in isolation by the existing boot test.
 
-## 2j. `hal::simd` — AVX vector state + AVX2 int8 GEMM (AI/ML compute)
+## 2j. `hal::simd` — AVX/AVX-512 vector state + int8 GEMM (AI/ML compute)
 
-The first vector code in the TCB. Two jobs: (1) `enable()` turns on AVX (`YMM`)
-state so `avx`/`avx2` instructions don't `#UD` — `CR4.OSXSAVE` (via the existing
+The first vector code in the TCB. Two jobs: (1) `enable()` turns on vector state so
+`avx`/`avx2`/`avx512f` instructions don't `#UD` — `CR4.OSXSAVE` (via the existing
 `write_cr4`, C8) then `XCR0 |= x87|SSE|AVX` (via `xsetbv`, C12; read-back via
-`xgetbv`, C11), all `cpuid`-gated on `xsave`+`avx`; and (2) `gemm_i8_avx2()` — a
-**safe** wrapper over an int8·int8→i32 matrix multiply whose 256-bit inner step is
-hand-written inline `asm!` (VEX). The public surface (`enable`, `avx2_ready`,
-`gemm_i8_avx2`) is **safe**; the AVX-state privileged writes are C11/C12 above, and
-the only new raw op is the kernel's in-bounds vector load/store (SM1). The `kernel`
-crate stays `#![forbid(unsafe_code)]` — it calls the safe wrapper, which returns
-`false` (→ scalar fallback) whenever AVX2 is not verified usable.
+`xgetbv`, C11), `cpuid`-gated on `xsave`+`avx`, plus — **only** when `avx512f` is
+advertised — the three AVX-512 component bits (`opmask|ZMM_Hi256|Hi16_ZMM`); and
+(2) two **safe** wrappers over an int8·int8→i32 matrix multiply — `gemm_i8_avx2()`
+(256-bit `YMM`, 8 columns/step) and `gemm_i8_avx512()` (512-bit `ZMM`, 16
+columns/step) — each with a hand-written inline `asm!` inner step (VEX / EVEX). The
+public surface (`enable`, `avx2_ready`/`avx512_ready`, `gemm_i8_avx2`/
+`gemm_i8_avx512`) is **safe**; the vector-state privileged writes are C11/C12 above,
+and the only new raw ops are the kernels' in-bounds vector load/stores (SM1 for
+AVX2, SM2 for AVX-512). The `kernel` crate stays `#![forbid(unsafe_code)]` — it
+calls the safe wrappers, each of which returns `false` (→ next tier / scalar
+fallback) whenever its tier is not verified usable.
 
 **Why `asm!`, not intrinsics.** The bare-metal target `x86_64-unknown-none`
-(soft-float baseline) does **not** codegen `core::arch` SIMD intrinsics to VEX
+(soft-float baseline) does **not** codegen `core::arch` SIMD intrinsics to VEX/EVEX
 instructions — they emit as calls that never lower to `vpmulld`, and passing
-`__m256i` across that call on the soft-float ABI corrupts the vectors (wrong
-results on *real* hardware). Inline `asm!` emits the instructions unconditionally,
-with the vectors living entirely inside each block (only `i32`/pointers cross the
-boundary), so there is no vector-ABI dependency.
+`__m256i`/`__m512i` across that call on the soft-float ABI corrupts the vectors
+(wrong results on *real* hardware). Inline `asm!` emits the instructions
+unconditionally, with the vectors living entirely inside each block (only
+`i32`/pointers cross the boundary), so there is no vector-ABI dependency.
 
-**Self-test gate.** `enable()` runs the AVX2 kernel on fixed input (multiple shapes:
-single block, multi-block+tail, ±127 extremes) and compares it to a scalar
-computation; `avx2_ready()` (a cached atomic) reports the tier usable **only** on a
-bit-exact match. So a vector unit that computes incorrectly can never make the
-kernel ship garbage — this caught the soft-float codegen problem above during
+**Self-test gate.** `enable()` runs each vector kernel on fixed input (multiple
+shapes: single block, multi-block+tail, ±127 extremes) and compares it to a scalar
+computation; `avx2_ready()`/`avx512_ready()` (cached atoms) report a tier usable
+**only** on a bit-exact match. So a vector unit that computes incorrectly can never
+make the kernel ship garbage — this caught a soft-float codegen problem during
 bring-up (fall back to scalar, not wrong output) and backstops any future
-CPU/emulator/toolchain regression. With the `asm!` kernel the self-test passes
-under both TCG (`-cpu Haswell`) and KVM (`-cpu host`).
+CPU/emulator/toolchain regression. The AVX2 self-test passes under both TCG (`-cpu
+Haswell`) and KVM (`-cpu host`); the AVX-512F self-test runs only where `avx512f` is
+advertised (KVM `-cpu host` on AVX-512 silicon; never under TCG's `Haswell`), so on
+a non-AVX-512 host `avx512_ready()` stays false and the tier is simply skipped.
 
 | # | Location | Unsafe op | Why needed | Soundness argument | Verification |
 |---|----------|-----------|------------|--------------------|--------------|
 | SM1 | `simd.rs` · `avx2_madd8` (inline `asm!`), called by `gemm_i8_avx2_impl` | VEX `asm!`: `vmovd`/`vpbroadcastd` + `vpmovsxbd`(m64) + `vpmulld` + `vpaddd`(m256) + `vmovdqu` store — one 256-bit int8→i32 multiply-accumulate of 8 columns | Vectorised int8 GEMM (8 int32 columns/step) | Reached only from the safe `gemm_i8_avx2`, which runs it **only** when `avx2_ready()` is true — i.e. after `enable` turned on AVX state **and** the self-test executed this exact kernel correctly on this core (so the VEX instructions are legal, no `#UD`). Each `asm!` block reads 8 bytes of `b` and read-writes 8×i32 of `c`, bounded by `j + 8 <= n` (vector path) or `j < n` (scalar tail) within the caller-validated (overflow-checked) `m`/`k`/`n` slice lengths; `vmovdqu` is the **unaligned** store (no alignment precondition); `a`/`b` shared, `c` exclusive. `ymm0`/`ymm1` declared clobbered; no `nomem` (reads/writes `[b]`/`[c]`), `nostack`, sets no flags. **Precondition:** interrupts disabled (ISR stubs don't save XMM/YMM — I1). Bit-identical to the scalar reference (`wrapping_add` is associative). | Reasoned + host differential tests (AVX2 == scalar over many shapes incl. an i32-wrap case + a 300-shape pseudo-random sweep) + **TCG *and* KVM boot** (`[ml] … active=avx2` asserted). Miri/Kani-opaque (inline asm), like the other HAL asm |
+| SM2 | `simd.rs` · `avx512_madd16` (inline `asm!`), called by `gemm_i8_avx512_impl` | EVEX `asm!`: `vmovd`/`vpbroadcastd`(`zmm`) + `vpmovsxbd`(m128→`zmm`) + `vpmulld`(`zmm`) + `vpaddd`(m512) + `vmovdqu32` store — one 512-bit int8→i32 multiply-accumulate of 16 columns | Wider vectorised int8 GEMM (16 int32 columns/step) — the AVX-512F sibling of SM1 | Reached only from the safe `gemm_i8_avx512`, which runs it **only** when `avx512_ready()` is true — i.e. after `enable` turned on AVX-512 (`ZMM`) state **and** the self-test executed this exact kernel correctly on this core (so the EVEX instructions are legal, no `#UD`). Each `asm!` block reads 16 bytes of `b` and read-writes 16×i32 of `c`, bounded by `j + 16 <= n` (vector path) or `j < n` (scalar tail) within the caller-validated (overflow-checked) `m`/`k`/`n` slice lengths; `vmovdqu32` is the **unaligned** store (no alignment precondition); `a`/`b` shared, `c` exclusive. `zmm0`/`zmm1` declared clobbered; no `nomem` (reads/writes `[b]`/`[c]`), `nostack`, sets no flags. **Precondition:** interrupts disabled (ISR stubs don't save ZMM — I1). Bit-identical to the scalar reference (`wrapping_add` is associative). | Reasoned + host differential tests (AVX-512F == scalar over the same shape sweep, run on an `avx512f` host) + **KVM boot** on AVX-512 runners (`[ml] … active=avx512f` accepted). Miri/Kani-opaque (inline asm), like the other HAL asm |
 
-> The `enable`/`avx2_ready`/`self_test` logic is pure control-flow over the
-> already-documented C8/C11/C12 privileged ops plus SM1 — it introduces no *other*
-> raw op. `avx2_ready` reads a `static AtomicU8` (no `unsafe`). The AVX2 int8-GEMM
-> loop structure, quantization, and tier dispatch live in the **safe** `kernel::ml`
-> module (`#![forbid(unsafe_code)]`); only the `asm!` inner step and the
-> vector-state enable are in the TCB. **Hard precondition:** `gemm_i8_avx2` runs with
-> interrupts **disabled** — the ISR stubs (I1) save only GP registers, not XMM/YMM,
-> so an IRQ whose handler the compiler emitted any XMM use into would corrupt the
-> in-flight accumulators. Both callers (the boot self-test, `kernel::ml::prove`) are
-> in the interrupts-off boot window; interrupts-on use needs `XSAVE` save/restore
-> first. AVX state is **per-core**: each AP must `enable()` before any GEMM once SMP
-> lands.
+> The `enable`/`avx2_ready`/`avx512_ready`/`self_test` logic is pure control-flow
+> over the already-documented C8/C11/C12 privileged ops plus SM1/SM2 — it introduces
+> no *other* raw op. `avx2_ready`/`avx512_ready` read a `static AtomicU8` (no
+> `unsafe`). The int8-GEMM loop structure, quantization, and tier dispatch live in
+> the **safe** `kernel::ml` module (`#![forbid(unsafe_code)]`); only the `asm!` inner
+> steps and the vector-state enable are in the TCB. **Hard precondition:**
+> `gemm_i8_avx2`/`gemm_i8_avx512` run with interrupts **disabled** — the ISR stubs
+> (I1) save only GP registers, not XMM/YMM/ZMM, so an IRQ whose handler the compiler
+> emitted any vector use into would corrupt the in-flight accumulators. Both callers
+> (the boot self-test, `kernel::ml::prove`) are in the interrupts-off boot window;
+> interrupts-on use needs `XSAVE` save/restore first. Vector state is **per-core**:
+> each AP must `enable()` before any GEMM once SMP lands.
 
 ---
 

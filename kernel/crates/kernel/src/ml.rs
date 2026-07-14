@@ -9,11 +9,13 @@
 //!
 //! This is entirely **safe** Rust (the crate is `#![forbid(unsafe_code)]`): the
 //! scalar reference and the dispatch only read the existing safe
-//! [`hal::cpuid::info`] and compute. The AVX-512 and AMX tiers (which need
-//! `core::arch` SIMD intrinsics + `XCR0`/`XFD`/tile-config enablement — new TCB)
-//! are later, designed phases; each is validated **bit-for-bit** against the
-//! scalar reference here, since the int8→i32 GEMM is exact. See
-//! `docs/specs/2026-07-14-aiml-inference-compute-design.md`.
+//! [`hal::cpuid::info`] and compute; the vector kernels live behind safe wrappers
+//! in the `hal` TCB. The **AVX2** and **AVX-512 Foundation** tiers are implemented
+//! ([`hal::simd`], `XCR0`-gated inline `asm!`); the **AVX-512 VNNI** (`VPDPBUSD`)
+//! and **AMX** (`XFD`/tile-config) throughput tiers are detected but not yet
+//! implemented — designed later phases. Every vector tier is validated
+//! **bit-for-bit** against the scalar reference here, since the int8→i32 GEMM is
+//! exact. See `docs/specs/2026-07-14-aiml-inference-compute-design.md`.
 
 use hal::cpuid::{self, CpuInfo};
 
@@ -26,6 +28,11 @@ pub enum Tier {
     Scalar,
     /// AVX2 (256-bit) int8 GEMM — implemented (`hal::simd`). Detected via `avx2`.
     Avx2,
+    /// AVX-512 **Foundation** (512-bit `ZMM`) int8 GEMM — implemented (`hal::simd`):
+    /// the 16-wide `VPMULLD` broadcast sibling of the AVX2 kernel. Detected via
+    /// `avx512f`. Distinct from [`Tier::Avx512Vnni`]: this uses the foundation
+    /// `VPMULLD`/`VPADDD` ops, not the fused `VPDPBUSD` dot-product.
+    Avx512F,
     /// AVX-512 VNNI (`VPDPBUSD`, 64×int8 per step). Detected via `avx512_vnni`.
     Avx512Vnni,
     /// AMX int8 tiles (`TDPBSSD`). Detected via `amx_int8` + `amx_tile`.
@@ -39,6 +46,7 @@ impl Tier {
         match self {
             Tier::Scalar => "scalar",
             Tier::Avx2 => "avx2",
+            Tier::Avx512F => "avx512f",
             Tier::Avx512Vnni => "avx512-vnni",
             Tier::Amx => "amx-int8",
         }
@@ -54,14 +62,17 @@ const fn capability_from_flags(
     amx_int8: bool,
     amx_tile: bool,
     avx512_vnni: bool,
+    avx512f: bool,
     avx2: bool,
 ) -> Tier {
     // Best-to-worst: AMX int8 (needs BOTH the tile substrate and the int8
-    // dot-product op) → AVX-512 VNNI → AVX2 → scalar.
+    // dot-product op) → AVX-512 VNNI → AVX-512 Foundation → AVX2 → scalar.
     if amx_int8 && amx_tile {
         Tier::Amx
     } else if avx512_vnni {
         Tier::Avx512Vnni
+    } else if avx512f {
+        Tier::Avx512F
     } else if avx2 {
         Tier::Avx2
     } else {
@@ -84,21 +95,25 @@ pub fn detected_capability(info: &CpuInfo) -> Tier {
         has(info, "amx_int8"),
         has(info, "amx_tile"),
         has(info, "avx512_vnni"),
+        has(info, "avx512f"),
         has(info, "avx2"),
     )
 }
 
 /// The best tier actually *implemented and runnable* right now.
 ///
-/// **AVX2** is implemented ([`hal::simd`]) and is selected when the CPU advertises
-/// it *and* AVX vector state is enabled ([`hal::simd::avx2_ready`]); otherwise
-/// scalar. AVX-512 VNNI and AMX are detected but not yet implemented, so they never
-/// become active (they fall back through [`gemm_i8`] to AVX2/scalar). [`gemm_i8`]
-/// dispatches to this, so the result is always correct and never claims a tier it
-/// does not run.
+/// **AVX-512F** and **AVX2** are implemented ([`hal::simd`]); each is selected when
+/// the CPU advertises it *and* its vector state is enabled and the boot self-test
+/// passed ([`hal::simd::avx512_ready`] / [`hal::simd::avx2_ready`]), best first,
+/// else scalar. AVX-512 VNNI and AMX are detected but not yet implemented, so they
+/// never become active (they fall back through [`gemm_i8`] to the AVX-512F/AVX2/
+/// scalar kernels). [`gemm_i8`] dispatches to this, so the result is always correct
+/// and never claims a tier it does not run.
 #[must_use]
 pub fn active_tier() -> Tier {
-    if hal::simd::avx2_ready() {
+    if hal::simd::avx512_ready() {
+        Tier::Avx512F
+    } else if hal::simd::avx2_ready() {
         Tier::Avx2
     } else {
         Tier::Scalar
@@ -205,12 +220,16 @@ pub fn gemm_i8_scalar(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: 
 
 /// Public int8 GEMM entry — dispatches to the best *implemented* kernel.
 ///
-/// Tries the AVX2 vector kernel ([`hal::simd::gemm_i8_avx2`]); it self-checks
-/// `avx2` + enabled AVX state and returns `false` when unavailable (or on bad
-/// dims), in which case we run the scalar reference. Both produce bit-identical
-/// results. The AVX-512 VNNI and AMX kernels slot in here (tried before AVX2) once
-/// implemented (design doc phases 3/4).
+/// Tries the AVX-512F vector kernel ([`hal::simd::gemm_i8_avx512`]) first, then the
+/// AVX2 one ([`hal::simd::gemm_i8_avx2`]); each self-checks its feature + enabled
+/// vector state and returns `false` when unavailable (or on bad dims), so we fall
+/// through to the next tier and finally the scalar reference. All three produce
+/// bit-identical results. The AVX-512 VNNI and AMX kernels slot in here (tried
+/// before AVX-512F) once implemented (design doc phases 3/4).
 pub fn gemm_i8(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) {
+    if hal::simd::gemm_i8_avx512(a, b, c, m, k, n) {
+        return;
+    }
     if hal::simd::gemm_i8_avx2(a, b, c, m, k, n) {
         return;
     }
@@ -220,20 +239,23 @@ pub fn gemm_i8(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) 
 // ── boot proof ────────────────────────────────────────────────────────────────
 
 /// Checksum of the identity-GEMM boot proof: `identity · B = B`, so `Σ C = Σ B =
-/// Σ(0..48) = 1128`. Self-evident — no hand-computed constant to get wrong.
-const PROOF_CHECKSUM: i64 = 1128;
+/// Σ(0..80) = 3160`. Self-evident — no hand-computed constant to get wrong.
+const PROOF_CHECKSUM: i64 = 3160;
 
 /// Run a real int8 GEMM through the live dispatch and log the result, proving the
 /// inference path works end-to-end in the booted kernel.
 ///
-/// Uses a 4×4 identity `A` and a 4×**12** `B` with `B[idx] = idx` (values 0..47).
-/// `identity·B = B`, so the output must equal `B` and its checksum must be
-/// [`PROOF_CHECKSUM`] — a self-validating smoke test. `n = 12` deliberately exceeds
-/// 8 so, when the active tier is AVX2, the 256-bit vector path runs (not just the
-/// scalar tail) — the boot proof then exercises the real AVX2 kernel under TCG
-/// (Haswell advertises `avx2`). Rigorous index/accumulation correctness lives in
-/// the host unit tests. Prints via the fmt-free serial helpers because
-/// `println!("{}", n)` faults on this target for integer args (see `memory.rs`).
+/// Uses a 4×4 identity `A` and a 4×**20** `B` with `B[idx] = idx` (values 0..79,
+/// all `< 127` so they fit int8 exactly). `identity·B = B`, so the output must equal
+/// `B` and its checksum must be [`PROOF_CHECKSUM`] — a self-validating smoke test.
+/// `n = 20` deliberately exceeds **16** so that whichever vector tier is active runs
+/// its real vector body end-to-end (a full 16-wide `ZMM` block for AVX-512F, two
+/// 8-wide `YMM` blocks for AVX2) plus a scalar tail — not just the tail. So the boot
+/// proof exercises the live vector kernel: AVX2 under TCG (Haswell advertises
+/// `avx2`), and AVX-512F on KVM runners that expose it. Rigorous index/accumulation
+/// correctness lives in the host unit tests. Prints via the fmt-free serial helpers
+/// because `println!("{}", n)` faults on this target for integer args (see
+/// `memory.rs`).
 pub fn prove() {
     let info = cpuid::info();
     let detected = detected_capability(&info);
@@ -241,7 +263,7 @@ pub fn prove() {
 
     const M: usize = 4;
     const K: usize = 4;
-    const N: usize = 12;
+    const N: usize = 20;
     let mut a = [0i8; M * K];
     for d in 0..M {
         a[d * K + d] = 1; // 4×4 identity
@@ -260,7 +282,7 @@ pub fn prove() {
     hal::serial::write_str(detected.label());
     hal::serial::write_str(", active=");
     hal::serial::write_str(active.label());
-    hal::serial::write_str("; 4x4*4x12 int8 GEMM ");
+    hal::serial::write_str("; 4x4*4x20 int8 GEMM ");
     hal::serial::write_str(if correct && checksum == PROOF_CHECKSUM {
         "ok"
     } else {
@@ -324,7 +346,7 @@ mod tests {
 
     #[test]
     fn boot_proof_input_checksums_to_the_constant() {
-        // Mirrors prove()'s 4×4 identity · 4×12 B computation (via the scalar
+        // Mirrors prove()'s 4×4 identity · 4×20 B computation (via the scalar
         // reference — gemm_i8's dispatch touches privileged CR4/XCR0 state that is
         // CPL-0-only, so it is exercised at boot, not in host tests). Guards
         // PROOF_CHECKSUM against drift.
@@ -332,12 +354,12 @@ mod tests {
         for d in 0..4 {
             a[d * 4 + d] = 1;
         }
-        let mut b = [0i8; 48];
+        let mut b = [0i8; 80];
         for (idx, slot) in b.iter_mut().enumerate() {
             *slot = idx as i8;
         }
-        let mut c = [0i32; 48];
-        gemm_i8_scalar(&a, &b, &mut c, 4, 4, 12);
+        let mut c = [0i32; 80];
+        gemm_i8_scalar(&a, &b, &mut c, 4, 4, 20);
         assert!(c.iter().zip(&b).all(|(&ci, &bi)| ci == bi as i32));
         let checksum: i64 = c.iter().map(|&x| x as i64).sum();
         assert_eq!(checksum, PROOF_CHECKSUM);
@@ -382,28 +404,51 @@ mod tests {
 
     #[test]
     fn capability_mapping_is_best_to_worst() {
+        // Args: (amx_int8, amx_tile, avx512_vnni, avx512f, avx2).
         // AMX needs both tile + int8, and wins over everything below it.
-        assert_eq!(capability_from_flags(true, true, false, false), Tier::Amx);
-        assert_eq!(capability_from_flags(true, true, true, true), Tier::Amx);
+        assert_eq!(
+            capability_from_flags(true, true, false, false, false),
+            Tier::Amx
+        );
+        assert_eq!(
+            capability_from_flags(true, true, true, true, true),
+            Tier::Amx
+        );
         // amx_int8 without the tile substrate is not usable → next tier wins.
         assert_eq!(
-            capability_from_flags(true, false, true, true),
+            capability_from_flags(true, false, true, true, true),
             Tier::Avx512Vnni
         );
         assert_eq!(
-            capability_from_flags(false, false, true, false),
+            capability_from_flags(false, false, true, true, false),
             Tier::Avx512Vnni
         );
-        // No AMX/VNNI → AVX2 if present.
-        assert_eq!(capability_from_flags(false, false, false, true), Tier::Avx2);
-        assert_eq!(capability_from_flags(true, false, false, true), Tier::Avx2);
+        // No AMX/VNNI, but avx512f present → the AVX-512 Foundation tier (a
+        // VNNI-capable CPU always has avx512f; VNNI still wins above).
+        assert_eq!(
+            capability_from_flags(false, false, false, true, true),
+            Tier::Avx512F
+        );
+        assert_eq!(
+            capability_from_flags(false, false, false, true, false),
+            Tier::Avx512F
+        );
+        // No AMX/VNNI/avx512f → AVX2 if present.
+        assert_eq!(
+            capability_from_flags(false, false, false, false, true),
+            Tier::Avx2
+        );
+        assert_eq!(
+            capability_from_flags(true, false, false, false, true),
+            Tier::Avx2
+        );
         // Nothing usable → scalar (a lone amx_tile or amx_int8 is not usable).
         assert_eq!(
-            capability_from_flags(false, false, false, false),
+            capability_from_flags(false, false, false, false, false),
             Tier::Scalar
         );
         assert_eq!(
-            capability_from_flags(false, true, false, false),
+            capability_from_flags(false, true, false, false, false),
             Tier::Scalar
         );
     }
@@ -421,13 +466,21 @@ mod proofs {
         let amx_int8: bool = kani::any();
         let amx_tile: bool = kani::any();
         let vnni: bool = kani::any();
+        let avx512f: bool = kani::any();
         let avx2: bool = kani::any();
-        let tier = capability_from_flags(amx_int8, amx_tile, vnni, avx2);
+        let tier = capability_from_flags(amx_int8, amx_tile, vnni, avx512f, avx2);
         // AMX iff both amx bits; never claims AMX without the tile substrate.
         if amx_int8 && amx_tile {
             assert!(tier == Tier::Amx);
         } else {
             assert!(tier != Tier::Amx);
+        }
+        // Never claims a vector tier the CPU does not advertise.
+        if tier == Tier::Avx512F {
+            assert!(avx512f);
+        }
+        if tier == Tier::Avx2 {
+            assert!(avx2);
         }
     }
 }

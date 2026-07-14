@@ -366,15 +366,21 @@ const SMP_ENABLED_MARKER: &str = "[smp] x2APIC enabled";
 /// The timer-liveness substring the enable line carries — its presence with a
 /// non-empty tick count proves the PIT kept ticking through LINT0=ExtINT.
 const SMP_TIMER_LIVE_MARKER: &str = "timer live";
-/// Proof that the **AVX2** vector tier is *active* — i.e. the boot-time AVX2
-/// int8-GEMM self-test passed and the hand-written `asm!` kernel is what runs. We
-/// match only `active=avx2`, NOT the `detected=…` field: `detected` is the best
-/// tier the CPU *advertises* and legitimately varies across a heterogeneous runner
-/// fleet (`avx2` on Haswell/TCG, `avx512-vnni` or `amx-int8` on newer silicon),
-/// whereas `active` is the best *implemented* tier and is `avx2` on any avx2-capable
-/// host — which is every x86-64 CPU since 2013. Asserting this proves the vector
-/// inference path executes and computes correctly, not just the scalar fallback.
-const ML_AVX2_ACTIVE: &str = ", active=avx2;";
+/// The `[ml]` `active=` values that mean a *vector* tier is live — a real SIMD
+/// int8-GEMM kernel runs (its boot self-test passed), not the scalar fallback. We
+/// accept **either** implemented tier because the runner fleet is heterogeneous:
+/// TCG (`-cpu Haswell`) and older KVM hosts run the 256-bit `avx2` kernel, while
+/// KVM hosts that expose AVX-512 run the wider 512-bit `avx512f` kernel. We do NOT
+/// assert the `detected=…` field: it is the best tier the CPU *advertises* and
+/// legitimately varies further (up to `avx512-vnni`/`amx-int8` on newer silicon),
+/// whereas `active` is the best *implemented* tier. Both vector tiers are proven
+/// bit-identical to scalar (boot self-test + host differential tests).
+const ML_VECTOR_ACTIVE: [&str; 2] = [", active=avx2;", ", active=avx512f;"];
+/// The boot-proof result substring: the live-dispatch `identity·B == B` int8 GEMM
+/// computed the right answer end-to-end (see `kernel::ml::prove`). Asserting it
+/// alongside a vector `active=` tier proves the vector kernel not only was selected
+/// but produced the correct result in the booted kernel.
+const ML_GEMM_OK: &str = "int8 GEMM ok";
 /// Seconds to wait for the boot end-marker before giving up. Generous because
 /// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
 /// the full bring-up — networking, then seeding + writing the 16 MiB disk image
@@ -525,32 +531,44 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // The AVX2 int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is
-    // the AVX2 vector kernel — proving the hand-written `asm!` kernel executes and
-    // computes correctly. `-cpu Haswell` (TCG) and `-cpu host` (KVM) both expose
-    // avx2, so this holds in either mode; a scalar fallback here means the vector
-    // kernel is wrong or avx2 is unexpectedly absent.
-    if !log.contains(ML_AVX2_ACTIVE) {
+    // A vector int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is a
+    // real SIMD kernel — proving the hand-written `asm!` kernels execute and compute
+    // correctly. `-cpu Haswell` (TCG) exposes avx2; `-cpu host` (KVM) exposes avx2
+    // and, on AVX-512 silicon, avx512f — so `active=` is `avx2` or `avx512f`, never
+    // scalar. A scalar fallback here means a vector kernel is wrong or avx2 is
+    // unexpectedly absent.
+    let active_tier = ML_VECTOR_ACTIVE.iter().find(|m| log.contains(**m));
+    if active_tier.is_none() {
         eprintln!(
-            "TEST FAILED: expected '{}' in the [ml] line (the AVX2 self-test should \
-             pass where avx2 is exposed — did the vector kernel regress?).",
-            ML_AVX2_ACTIVE
+            "TEST FAILED: expected one of {:?} in the [ml] line (a vector self-test \
+             should pass where avx2/avx512f is exposed — did a vector kernel regress?).",
+            ML_VECTOR_ACTIVE
         );
         return ExitCode::FAILURE;
     }
+    // ...and it must have computed the boot proof correctly end-to-end.
+    if !log.contains(ML_GEMM_OK) {
+        eprintln!(
+            "TEST FAILED: a vector tier is active but the boot-proof GEMM did not \
+             report '{}' (the live vector dispatch produced a wrong result).",
+            ML_GEMM_OK
+        );
+        return ExitCode::FAILURE;
+    }
+    let active_tier = active_tier.unwrap();
 
     if kvm {
         println!(
-            "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' — and the \
-             AVX2 int8-GEMM tier verified active ('{}' in the [ml] line), plus banner \
-             + end-marker '{}'.",
-            SMP_ENABLED_MARKER, SMP_TIMER_LIVE_MARKER, ML_AVX2_ACTIVE, END_MARKER
+            "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' — and a \
+             vector int8-GEMM tier verified active ('{}' with '{}' in the [ml] line), \
+             plus banner + end-marker '{}'.",
+            SMP_ENABLED_MARKER, SMP_TIMER_LIVE_MARKER, active_tier, ML_GEMM_OK, END_MARKER
         );
     } else {
         println!(
-            "TEST PASSED: full banner, SMP bring-up line, AVX2 tier active, and \
-             end-marker '{}' confirmed in serial output.",
-            END_MARKER
+            "TEST PASSED: full banner, SMP bring-up line, vector tier active ('{}' \
+             with '{}'), and end-marker '{}' confirmed in serial output.",
+            active_tier, ML_GEMM_OK, END_MARKER
         );
     }
     ExitCode::SUCCESS
