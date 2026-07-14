@@ -9,3 +9,9 @@ edition = "2021"
 [dependencies]
 hal = { path = "../hal" }
 ui = { path = "../ui" }
+
+# `cfg(kani)` gates the in-tree proof harnesses (e.g. `ml`'s tier-selection
+# proof). Declare it so `-D warnings` does not flag the cfg as unexpected on a
+# normal (non-Kani) build, matching the `hal` crate's configuration.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

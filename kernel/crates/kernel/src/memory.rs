@@ -17,7 +17,13 @@
 /// window that [`init`] maps to physical frames. Until [`init`] runs, any
 /// allocation would find an empty heap and return null (so `init` must be called
 /// before the first `Box`/`Vec`/`String`).
-#[global_allocator]
+// Registered as THE global allocator only in real (non-test) builds. Under
+// `cfg(test)` the crate is compiled for the host with `std` linked for the test
+// harness; letting `std`'s default (system) allocator serve there means host unit
+// tests can allocate normally, instead of aborting on this bare-metal heap which
+// `mm::init` never sets up off-target. The static itself stays defined in both
+// builds so `init` still references it.
+#[cfg_attr(not(test), global_allocator)]
 static ALLOCATOR: hal::mm::LockedHeap = hal::mm::LockedHeap::new();
 
 /// Bring up the kernel heap and install the global allocator.
