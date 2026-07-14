@@ -82,12 +82,18 @@ pub fn kmain() -> ! {
                 hal::cpu::halt();
             }
             hal::cpu::disable_interrupts();
-            hal::println!(
-                "[smp] x2APIC enabled; BSP apic id={}; {} logical CPU(s); timer live ({} ticks)",
-                apic_id,
-                hal::apic::logical_cpu_count(),
-                hal::pit::ticks(),
-            );
+            // Build the line with the fmt-free serial helpers: `println!("{}", n)`
+            // faults on this target for INTEGER args (the GOT-relative vtable calls
+            // `core::fmt` emits need `.got`/`.rela` the linker script discards; see
+            // memory.rs / hal-tcb.md §5e). String-literal `println!` is fine, but
+            // the dynamic apic id / cpu count / tick count must go through write_dec.
+            hal::serial::write_str("[smp] x2APIC enabled; BSP apic id=");
+            hal::serial::write_dec(apic_id as u64);
+            hal::serial::write_str("; ");
+            hal::serial::write_dec(hal::apic::logical_cpu_count() as u64);
+            hal::serial::write_str(" logical CPU(s); timer live (");
+            hal::serial::write_dec(hal::pit::ticks());
+            hal::serial::write_str(" ticks)\n");
         }
         None => hal::println!("[smp] x2APIC not advertised; staying on legacy xAPIC/PIC"),
     }
