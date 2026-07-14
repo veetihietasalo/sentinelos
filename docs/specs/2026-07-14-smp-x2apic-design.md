@@ -147,6 +147,14 @@ concurrency story get its real test.
   boot under **KVM** (`-enable-kvm -cpu host`) or on real hardware, where x2APIC
   is present natively; there the `kmain` timer-liveness probe proves the PIT still
   ticks through LINT0=ExtINT across the switch.
+- **C1 evidence (the enable-path proof) is now automated.** `cargo xtask test-kvm`
+  (`make test-kvm`) boots under `-enable-kvm -cpu host` and **asserts** the
+  `[smp] x2APIC enabled … timer live` line, failing if the enable path did not run.
+  The `.github/workflows/kvm-smp.yml` CI job runs exactly this on a KVM-capable
+  runner and uploads the serial log as the artifact `smp-x2apic-kvm-serial-log` —
+  that log is the C1 record for issue #10. If a runner lacks `/dev/kvm` the job
+  skips with a warning (no false green claim), and the proof falls back to running
+  `make test-kvm` on real hardware.
 - **Phase 2:** all existing input / net / timer boot assertions must still pass
   with IRQs coming via the IOAPIC + LAPIC EOI.
 - **Phase 3+:** each AP prints a `[smp] AP n online (apic id=…)` line; the boot

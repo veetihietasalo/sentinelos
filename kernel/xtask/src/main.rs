@@ -13,7 +13,8 @@
 //! ```sh
 //! make build       # cross-compile the boot binary for x86_64-unknown-none
 //! make run         # build ISO, launch QEMU with serial output on stdout
-//! make test        # build ISO, boot headless in QEMU, assert banner in serial.log
+//! make test        # build ISO, boot headless in QEMU (TCG), assert banner in serial.log
+//! make test-kvm    # build ISO, boot under KVM (-cpu host), assert the x2APIC enable path
 //! make screenshot  # build ISO, boot in headless QEMU, capture PNG via QMP
 //! ```
 //!
@@ -36,10 +37,11 @@ fn main() -> ExitCode {
         Some("build") => do_build(),
         Some("run") => do_run(),
         Some("test") => do_test(),
+        Some("test-kvm") => do_test_kvm(),
         Some("screenshot") => do_screenshot(),
         other => {
             eprintln!(
-                "Usage: cargo xtask <build|run|test|screenshot>\nUnknown subcommand: {:?}",
+                "Usage: cargo xtask <build|run|test|test-kvm|screenshot>\nUnknown subcommand: {:?}",
                 other
             );
             ExitCode::FAILURE
@@ -355,6 +357,15 @@ const BANNER_LINE: &str = "SentinelOS \u{2014} boot bring-up OK";
 /// fallback share this prefix, so it positively confirms the path ran regardless
 /// of whether the host (KVM/hardware vs. TCG) advertises x2APIC.
 const SMP_MARKER: &str = "[smp]";
+/// The x2APIC **enable** line (the `Some` branch of `enable_bsp`). Only printed
+/// where x2APIC is actually present — i.e. under KVM (`-cpu host`) or on real
+/// hardware, never under TCG. Asserting it in the KVM boot test is the concrete
+/// evidence that the AP1 MSR write sequence ran and the virtual wire held
+/// (verification condition C1 for the SMP TCB; see the SMP design doc + issue #10).
+const SMP_ENABLED_MARKER: &str = "[smp] x2APIC enabled";
+/// The timer-liveness substring the enable line carries — its presence with a
+/// non-empty tick count proves the PIT kept ticking through LINT0=ExtINT.
+const SMP_TIMER_LIVE_MARKER: &str = "timer live";
 /// Seconds to wait for the boot end-marker before giving up. Generous because
 /// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
 /// the full bring-up — networking, then seeding + writing the 16 MiB disk image
@@ -364,6 +375,23 @@ const SMP_MARKER: &str = "[smp]";
 const BOOT_TIMEOUT_SECS: u64 = 60;
 
 fn do_test() -> ExitCode {
+    boot_test(false)
+}
+
+/// KVM boot test: boot under real hardware acceleration (`-enable-kvm -cpu host`)
+/// so the guest sees x2APIC, then assert the x2APIC **enable** path ran. This is
+/// the verification-condition-C1 evidence the TCG boot test cannot produce (TCG
+/// does not emulate x2APIC). Requires a host with `/dev/kvm` (real hardware or a
+/// KVM-capable CI runner) — it fails fast if KVM cannot initialise.
+fn do_test_kvm() -> ExitCode {
+    boot_test(true)
+}
+
+/// Boot the kernel headless in QEMU, poll the serial log, and assert the boot
+/// markers. `kvm = false` is the portable TCG test (CI default); `kvm = true`
+/// adds real acceleration + `-cpu host` and additionally requires the x2APIC
+/// **enable** line (proving the SMP AP1 write sequence executed on real silicon).
+fn boot_test(kvm: bool) -> ExitCode {
     let Some(elf) = build_kernel() else {
         return ExitCode::FAILURE;
     };
@@ -378,35 +406,52 @@ fn do_test() -> ExitCode {
     let _ = fs::remove_file(&serial_log);
     let _ = fs::remove_file(&pcap);
 
-    println!("Launching QEMU (serial → file, polling for end-marker) ...");
+    // Base machine args, then the acceleration/CPU model differs by mode.
+    let serial_arg = format!("file:{}", serial_log.display());
+    let mut qargs: Vec<String> = vec!["-M".into(), "q35".into()];
+    if kvm {
+        // Real KVM acceleration with host-CPU passthrough: the host advertises
+        // x2APIC (every modern CPU has it), so `enable_bsp` takes the enable path
+        // instead of the TCG fallback. `-cpu host` requires the KVM accelerator.
+        qargs.push("-enable-kvm".into());
+        qargs.push("-cpu".into());
+        qargs.push("host".into());
+    } else {
+        // SMEP/SMAP/UMIP (Haswell base + explicit flags) so cpu_security enables
+        // them. x2APIC is intentionally NOT requested: TCG cannot emulate it, so
+        // the kernel takes its no-op fallback (the enable path is what the KVM
+        // variant proves). See docs/specs/2026-07-14-smp-x2apic-design.md.
+        qargs.push("-cpu".into());
+        qargs.push("Haswell,+smep,+smap,+umip".into());
+    }
+    // `-smp 4` gives the guest four logical CPUs for the SMP path.
+    for a in [
+        "-smp",
+        "4",
+        "-m",
+        "256M",
+        "-cdrom",
+        iso.to_str().unwrap(),
+        "-serial",
+        &serial_arg,
+        "-display",
+        "none",
+        "-no-reboot",
+    ] {
+        qargs.push(a.into());
+    }
+
+    println!(
+        "Launching QEMU ({}) ...",
+        if kvm { "KVM + -cpu host" } else { "TCG" }
+    );
     println!("NIC: e1000 on SLIRP; frames captured to {}", pcap.display());
 
     // Spawn QEMU in the background; direct COM1 to a file so we can poll it. The
     // e1000 NIC + SLIRP backend + filter-dump pcap let the test confirm the NIC
     // brings up and frames cross the wire (inspect target/net.pcap).
     let mut child = Command::new("qemu-system-x86_64")
-        .args([
-            "-M",
-            "q35",
-            // SMEP/SMAP/UMIP so cpu_security enables them; `-smp 4` gives the guest
-            // four logical CPUs for the SMP path. x2APIC is intentionally NOT
-            // requested: TCG cannot emulate it, so the kernel takes its no-op
-            // fallback (the enable path activates under KVM / real hardware). See
-            // docs/specs/2026-07-14-smp-x2apic-design.md.
-            "-cpu",
-            "Haswell,+smep,+smap,+umip",
-            "-smp",
-            "4",
-            "-m",
-            "256M",
-            "-cdrom",
-            iso.to_str().unwrap(),
-            "-serial",
-            &format!("file:{}", serial_log.display()),
-            "-display",
-            "none",
-            "-no-reboot",
-        ])
+        .args(&qargs)
         .args(e1000_args(pcap.to_str().unwrap()))
         .args(disk_args())
         .spawn()
@@ -460,10 +505,29 @@ fn do_test() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    println!(
-        "TEST PASSED: full banner, SMP bring-up line, and end-marker '{}' confirmed in serial output.",
-        END_MARKER
-    );
+    // Under KVM the guest sees x2APIC, so the *enable* path (not the fallback)
+    // must have run — this is the C1 evidence the TCG test cannot produce.
+    if kvm && !(log.contains(SMP_ENABLED_MARKER) && log.contains(SMP_TIMER_LIVE_MARKER)) {
+        eprintln!(
+            "KVM TEST FAILED: expected the x2APIC enable line '{} … {}' \
+             (the enable path did not run — is x2APIC exposed under `-cpu host`?).",
+            SMP_ENABLED_MARKER, SMP_TIMER_LIVE_MARKER
+        );
+        return ExitCode::FAILURE;
+    }
+
+    if kvm {
+        println!(
+            "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' confirmed \
+             (verification C1 evidence), plus banner + end-marker '{}'.",
+            SMP_ENABLED_MARKER, SMP_TIMER_LIVE_MARKER, END_MARKER
+        );
+    } else {
+        println!(
+            "TEST PASSED: full banner, SMP bring-up line, and end-marker '{}' confirmed in serial output.",
+            END_MARKER
+        );
+    }
     ExitCode::SUCCESS
 }
 
