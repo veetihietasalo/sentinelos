@@ -85,6 +85,16 @@ at bring-up).
 | C4 | `cpu.rs` · `halt_loop()` | `hlt` (in a `loop`) | Terminal park for boot path + panic handler (`-> !`) | Same as C3; re-halts on every wake so the core never spins hot and never falls through. Diverging, safe wrapper. | Reasoned (**pending**) |
 | C5 | `cpu.rs` · `breakpoint()` | `int3` (vector 3) | One-shot runtime self-test of the live IDT (the `[selftest]` boot line) | Software interrupt that vectors through the IDT's gate 3; touches no memory (`nomem`); the CPU's interrupt-frame push is balanced by the ISR stub. With a resumable #BP handler it returns; with none, `hal`'s default reporter halts. Cannot create UB. | Reasoned + QEMU (`int3` → #BP, resumes) |
 | C6 | `cpu.rs` · `read_cr2()` | `mov {}, cr2` (read CR2) | Report the faulting linear address in the #PF handler | Pure read of the CR2 control register at CPL 0; accesses no program memory (`nomem`), no stack (`nostack`), `preserves_flags`. Observing the last faulting address cannot affect memory validity/aliasing. | Reasoned + QEMU |
+| C7 | `cpu.rs` · `read_cr4()` | `mov {}, cr4` (read CR4) | Inspect which hardware protections (SMEP/SMAP/UMIP/PAE/PGE) are active | Pure read of CR4 at CPL 0; `nomem`/`nostack`/`preserves_flags`. Observing a control register cannot affect memory validity/aliasing. Exposed **safe**. | Reasoned + QEMU |
+| C8 | `cpu.rs` · `write_cr4()` (`pub(crate) unsafe`) | `mov cr4, {}` (write CR4) | Enable SMEP/SMAP/UMIP via `cpu_security::enable` | Driven only by `cpu_security::enable`, which read-modify-writes CR4, OR-ing in only CPU-advertised feature bits and preserving all others (incl. PAE/PGE). `nostack`/`preserves_flags`; `nomem` deliberately omitted so the write is a conservative barrier around paging-relevant state. SMEP/SMAP/UMIP add faults only for ring-0 use of user-accessible pages / ring-3 instructions, of which the kernel has none (audited: no `USER` mapping, no ring-3) — cannot create UB. | Reasoned + QEMU (SMEP+SMAP+UMIP on at boot, no #GP/#PF) |
+| C9 | `cpu.rs` · `read_msr()` (`pub(crate) unsafe`) | `rdmsr` (edx:eax ← MSR[ecx]) | Read `IA32_EFER` before setting NXE | Caller passes only known-present MSRs (`IA32_EFER`, implemented on every long-mode CPU) so `rdmsr` cannot #GP; pure read into `edx:eax`; `nomem`/`nostack`/`preserves_flags`. Cannot create UB. | Reasoned + QEMU |
+| C10 | `cpu.rs` · `write_msr()` (`pub(crate) unsafe`) | `wrmsr` (MSR[ecx] ← edx:eax) | Set `IA32_EFER.NXE` (enable NX) via `cpu_security::enable` | Driven only by `cpu_security::enable` writing `IA32_EFER` with NXE OR-ed into its current value (preserving LME/LMA/SCE). NXE makes PTE bit 63 effective — which the kernel's page flags already set and Limine already enables — so it is idempotent and can only make an errant instruction fetch fault, never corrupt memory. `nostack`/`preserves_flags`; `nomem` omitted as a barrier. | Reasoned + QEMU (`[cpu-sec] enabled: nx …`) |
+
+`cpu_security::enable` (safe) is the sole driver of C8/C10: it gates every bit on
+`cpuid` detection (never sets an unsupported bit → no #GP) and only *adds*
+protection on the audited supervisor-only address space, so its two `unsafe`
+blocks (the C8/C10 call sites) cannot create UB. See
+`docs/specs/2026-07-14-cpu-security-features-design.md`.
 
 ---
 

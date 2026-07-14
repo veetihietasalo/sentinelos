@@ -314,6 +314,10 @@ fn do_run() -> ExitCode {
     cmd.args([
         "-M",
         "q35",
+        // Advertise SMEP/SMAP/UMIP (Haswell base + explicit flags) so the kernel
+        // actually enables them; see cpu_security + the design doc.
+        "-cpu",
+        "Haswell,+smep,+smap,+umip",
         "-m",
         "256M",
         "-cdrom",
@@ -373,6 +377,10 @@ fn do_test() -> ExitCode {
         .args([
             "-M",
             "q35",
+            // Advertise SMEP/SMAP/UMIP so the kernel enables them (see the
+            // cpu_security module + the design doc).
+            "-cpu",
+            "Haswell,+smep,+smap,+umip",
             "-m",
             "256M",
             "-cdrom",
@@ -537,6 +545,10 @@ fn do_screenshot() -> ExitCode {
         .args([
             "-M",
             "q35",
+            // Advertise SMEP/SMAP/UMIP so the kernel enables them (see the
+            // cpu_security module + the design doc).
+            "-cpu",
+            "Haswell,+smep,+smap,+umip",
             "-m",
             "256M",
             "-cdrom",
