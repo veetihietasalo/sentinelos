@@ -366,10 +366,12 @@ const SMP_ENABLED_MARKER: &str = "[smp] x2APIC enabled";
 /// The timer-liveness substring the enable line carries — its presence with a
 /// non-empty tick count proves the PIT kept ticking through LINT0=ExtINT.
 const SMP_TIMER_LIVE_MARKER: &str = "timer live";
-/// The ML bring-up line proving the **AVX2** vector tier is active. Printed only
-/// where the AVX2 int8-GEMM self-test passes — i.e. real hardware / KVM, never TCG
-/// (which mis-emulates `VPMULLD`, so the kernel there falls back to scalar). Its
-/// presence under KVM is evidence the AVX2 kernel runs correctly on real silicon.
+/// The ML bring-up line proving the **AVX2** vector tier is active — printed when
+/// the CPU advertises `avx2` and the boot-time AVX2 int8-GEMM self-test passes. The
+/// kernel's AVX2 kernel is hand-written `asm!` (the `x86_64-unknown-none` soft-float
+/// target won't codegen `core::arch` SIMD intrinsics to VEX), so it runs correctly
+/// under both TCG (`-cpu Haswell` has avx2) and KVM — asserting this proves the
+/// vector inference path executes and computes correctly, not just the scalar tier.
 const ML_AVX2_ACTIVE: &str = "[ml] inference: detected=avx2, active=avx2";
 /// Seconds to wait for the boot end-marker before giving up. Generous because
 /// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
@@ -521,13 +523,15 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Under KVM (real hardware) the AVX2 int8-GEMM self-test must pass, so the ML
-    // tier is the AVX2 vector kernel — proving it runs correctly on real silicon
-    // (TCG mis-emulates VPMULLD and the kernel there falls back to scalar).
-    if kvm && !log.contains(ML_AVX2_ACTIVE) {
+    // The AVX2 int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is
+    // the AVX2 vector kernel — proving the hand-written `asm!` kernel executes and
+    // computes correctly. `-cpu Haswell` (TCG) and `-cpu host` (KVM) both expose
+    // avx2, so this holds in either mode; a scalar fallback here means the vector
+    // kernel is wrong or avx2 is unexpectedly absent.
+    if !log.contains(ML_AVX2_ACTIVE) {
         eprintln!(
-            "KVM TEST FAILED: expected the ML line '{}' (the AVX2 self-test should \
-             pass on real hardware — is avx2 exposed under `-cpu host`?).",
+            "TEST FAILED: expected the ML line '{}' (the AVX2 self-test should pass \
+             where avx2 is exposed — did the vector kernel regress?).",
             ML_AVX2_ACTIVE
         );
         return ExitCode::FAILURE;
@@ -541,7 +545,8 @@ fn boot_test(kvm: bool) -> ExitCode {
         );
     } else {
         println!(
-            "TEST PASSED: full banner, SMP bring-up line, and end-marker '{}' confirmed in serial output.",
+            "TEST PASSED: full banner, SMP bring-up line, AVX2 tier active, and \
+             end-marker '{}' confirmed in serial output.",
             END_MARKER
         );
     }

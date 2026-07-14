@@ -133,11 +133,13 @@ pub fn read_cr4() -> u64 {
 /// feature bits the CPU actually implements — writing a reserved or unsupported
 /// bit raises `#GP`. Enabling paging-relevant protections (SMEP/SMAP) is only
 /// safe if no kernel-executed/accessed page is user-accessible. This primitive
-/// is `pub(crate)` and is driven exclusively by [`crate::cpu_security::enable`],
-/// which read-modify-writes (setting only detected, audited-safe bits).
+/// is `pub(crate)` and is driven by two callers, each read-modify-writing to set
+/// only detected, audited-safe bits: [`crate::cpu_security::enable`] (SMEP/SMAP/
+/// UMIP) and [`crate::simd::enable`] (`OSXSAVE`, to bring up AVX vector state).
 #[inline]
 pub(crate) unsafe fn write_cr4(value: u64) {
-    // SAFETY: the caller (`cpu_security::enable`) guarantees `value` is the
+    // SAFETY: the caller (`cpu_security::enable` or `simd::enable`) guarantees
+    // `value` is the
     // current CR4 with only supported, memory-safety-preserving feature bits
     // OR-ed in. `mov cr4, {}` is a privileged move legal at CPL 0. We omit
     // `nomem` deliberately — a CR4 write can change paging-related semantics, so

@@ -89,44 +89,57 @@ AVX2 is universal (every x86-64 CPU since 2013, and QEMU TCG advertises it), so 
 is the one SIMD tier reachable by the existing CI, and it establishes all the
 infrastructure the AVX-512/AMX tiers reuse.
 
-**Kernel** (`hal::simd::gemm_i8_avx2`, `#[target_feature(enable = "avx2")]`): for
-each output row, broadcast each `A[i][p]` and multiply-accumulate a whole row of
-`B` into a row of `C` — eight int32 columns per 256-bit step (`VPMOVSXBD` sign-
-extend → `VPMULLD` → `VPADDD`), scalar tail for the remaining `< 8`. The K-sum runs
-in the same ascending order as the scalar loop, so the result is **bit-identical**.
+**Kernel** (`hal::simd::gemm_i8_avx2`): for each output row, broadcast each
+`A[i][p]` and multiply-accumulate a whole row of `B` into a row of `C` — eight
+int32 columns per 256-bit step (`VPMOVSXBD` sign-extend → `VPMULLD` → `VPADDD`),
+scalar tail for the remaining `< 8`. `wrapping_add` accumulation is associative, so
+the SIMD-over-columns result is **bit-identical** to the scalar loop.
+
+**Why inline `asm!`, not `core::arch` intrinsics.** The bare-metal target
+`x86_64-unknown-none` (soft-float baseline) does **not** codegen the SIMD
+intrinsics to VEX — in a debug build they emit as calls that never lower to
+`vpmulld`, and `__m256i` passed across that call on the soft-float ABI is corrupted,
+so the kernel computes wrong results on *real* hardware (the self-test caught this
+during bring-up). The 256-bit inner step is therefore hand-written `asm!`
+(`avx2_madd8`): it emits the exact instructions regardless of target, and the
+vectors never cross a call boundary. (A `build-std`/custom-target with `+avx2` is
+the alternative; `asm!` is simpler and matches the kernel's style.)
 
 **Vector-state enablement** (new TCB, `hal::simd::enable`): AVX (`YMM`) needs
 `CR4.OSXSAVE` + `XCR0[2:1:0]` (x87|SSE|AVX) set via `XSETBV`, else AVX instructions
 `#UD`. New `hal::cpu` primitives `xgetbv`/`xsetbv` back this (registered in
 hal-tcb.md), cpuid-gated exactly like `cpu_security`.
 
-**SIMD self-test (robustness).** `enable` runs the AVX2 kernel on a fixed input and
-compares it to a scalar computation; the AVX2 tier is marked usable
-(`avx2_ready`) **only** on a bit-exact match. This makes the kernel resilient to a
-broken vector unit: **QEMU 8.2 TCG mis-emulates `VPMULLD`** (it drops the odd
-32-bit lanes, like `VPMULDQ`), so under TCG the self-test fails and the ML path
-transparently uses the scalar reference — never computing garbage — while on real
-hardware / KVM it passes and the AVX2 kernel runs. This is why the AVX2 tier is
-executed & proven in the **KVM CI job** (`kvm-smp.yml`, which asserts
-`[ml] … active=avx2`), not the TCG job (where `active=scalar`).
+**SIMD self-test (robustness).** `enable` runs the AVX2 kernel on fixed inputs
+(single block, multi-block + tail, ±127 extremes) and compares to a scalar
+computation; the AVX2 tier is marked usable (`avx2_ready`) **only** on a bit-exact
+match. So a vector unit that computes incorrectly can never make the kernel ship
+garbage — it caught the soft-float codegen bug above (fall back to scalar), and
+backstops any future CPU/emulator/toolchain regression. With the `asm!` kernel the
+self-test passes under **both** TCG (`-cpu Haswell`) and KVM (`-cpu host`), so
+`active=avx2` is asserted in both the always-on Kernel CI boot test and the KVM job.
 
 **Verification:** a host differential harness asserts AVX2 == scalar bit-for-bit
-over many shapes (incl. non-multiples-of-8, negatives, extremes) — it runs on the
-CI host (real AVX2), independent of the kernel's own enablement. The full kernel
-path (enable → self-test → dispatch → AVX2) is proven on real silicon by the KVM
-boot assertion.
+over many shapes (non-multiples-of-8, negatives, ±127 extremes, an i32-accumulator
+wrap, and a 300-shape pseudo-random sweep) — it runs on the CI host (real AVX2),
+independent of the kernel's own enablement. The full kernel path (enable →
+self-test → dispatch → AVX2) is proven under emulation **and** on real silicon by
+the `active=avx2` boot assertions (TCG + KVM). Inline `asm!` is Miri/Kani-opaque
+(like the rest of the HAL), so those tools do not cover SM1; the host differential
+harness + boot self-test are its dynamic coverage.
 
 ## Phase 3 — AVX-512 VNNI tier (proposed)
 
 Add a `VPDPBUSD`-based kernel behind the same `gemm_i8` entry, selected when
 `avx512_vnni` is present. Mechanics: AVX-512 needs `XCR0[7:5]` (opmask + ZMM
 hi256 + ZMM16-31) enabled via `XSETBV` after `CR4.OSXSAVE` — extending the
-`hal::simd::enable` state setup, cpuid-gated. The intrinsics
-(`core::arch::x86_64::_mm512_dpbusd_epi32`) are `unsafe` + `#[target_feature]` in
-`hal::simd`, validated by the same bit-identical-vs-scalar differential harness and
-a self-test. Neither TCG (drops AVX-512) nor the current KVM runner (no AVX-512
-VNNI observed under `-cpu host`) can execute it, so it needs AVX-512 hardware to
-prove — the self-test keeps it dormant everywhere else.
+`hal::simd::enable` state setup, cpuid-gated. The `VPDPBUSD` inner step is written
+in inline `asm!` (VEX/EVEX) for the same reason as AVX2 — the soft-float target
+won't codegen the `core::arch` intrinsics — and validated by the same
+bit-identical-vs-scalar differential harness + a self-test. Neither TCG (drops
+AVX-512) nor the current KVM runner (no AVX-512 VNNI observed under `-cpu host`) can
+execute it, so it needs AVX-512 hardware to prove — the self-test keeps it dormant
+everywhere else.
 
 ## Phase 4 — AMX int8 tier (proposed)
 
@@ -150,14 +163,17 @@ against the scalar reference bit-for-bit, exactly like phase 2.
   in TCG unconditionally).
 - **Phase 2 (AVX2, now):** the decisive test is **bit-identical output vs. the
   scalar reference** over many `(m,k,n)` shapes and value ranges (non-multiples-of-8
-  to hit the scalar tail, negatives, extremes) — because the int8→i32 GEMM is
-  exact, any divergence is a real bug. This host differential harness runs on the
-  CI host (real AVX2), independent of the kernel's own state enablement. The full
-  kernel path (`enable` → self-test → dispatch → AVX2) is exercised on real silicon
-  by the **KVM CI job** (`kvm-smp.yml`), which asserts `[ml] … active=avx2`. Under
-  TCG the AVX2 self-test fails (broken `VPMULLD`) and the ML path uses scalar, so
-  the TCG boot proof still passes (`active=scalar`, correct checksum) — the kernel
-  never computes garbage on a broken vector unit.
+  for the scalar tail, negatives, ±127 extremes, an i32-accumulator wrap, and a
+  300-shape pseudo-random sweep) — because the int8→i32 GEMM is exact, any
+  divergence is a real bug. This host differential harness runs on the CI host
+  (real AVX2), independent of the kernel's own state enablement. The full kernel
+  path (`enable` → self-test → dispatch → AVX2) is exercised by the boot proof,
+  which asserts `[ml] … active=avx2` under **both** the always-on Kernel CI (TCG,
+  `-cpu Haswell`) and the KVM job (`-cpu host`) — the `asm!` kernel runs correctly
+  in both. The boot self-test guarantees that if a vector unit ever computes wrong,
+  the kernel falls back to scalar (`active=scalar`, correct checksum) rather than
+  shipping garbage. `asm!` is Miri/Kani-opaque, so SM1's dynamic coverage is the
+  host harness + boot self-test, not Miri.
 - **Phases 3–4 (AVX-512 VNNI, AMX):** same differential-vs-scalar oracle + a
   self-test, but they can only *execute* where the hardware exists: QEMU 8.2 TCG
   does not emulate AVX-512/AMX (drops the CPUID bits, like x2APIC) and the current
@@ -170,14 +186,21 @@ against the scalar reference bit-for-bit, exactly like phase 2.
 
 ## Open questions
 
-- **Where do the SIMD tiers live?** The intrinsics are `unsafe`, so either in
-  `hal` (TCB) or a new `compute-simd` crate that is the *only other* crate allowed
-  `unsafe`. Proposal: a dedicated `hal::simd` submodule so the TCB registry
-  (`hal-tcb.md`) stays the single catalog of unsafe; revisit if it grows large.
-- **Runtime dispatch vs. `#[target_feature]` monomorphization.** Stable Rust
-  requires `#[target_feature(enable="avx512f")]` on the intrinsic-using fn (itself
-  `unsafe`) and a runtime `cpuid` gate before calling it. That is the standard
-  pattern and needs no nightly. Confirmed compatible with the stable-only rule.
+- **Where do the SIMD tiers live?** Resolved: `hal::simd` (TCB), so the TCB
+  registry (`hal-tcb.md`) stays the single catalog of unsafe; revisit if it grows
+  large.
+- **Intrinsics vs. `asm!` on the bare-metal target.** Resolved by the AVX2 work:
+  the soft-float `x86_64-unknown-none` target does **not** codegen `core::arch`
+  SIMD intrinsics to VEX (they emit as calls and the `__m256i` ABI is broken), so
+  the SIMD inner steps are hand-written inline `asm!` — which needs no nightly and
+  no `#[target_feature]`, and emits the exact instructions. (Alternatives:
+  `build-std` recompiling `core` with `+avx2`, or a custom target JSON; `asm!` is
+  simpler and matches the kernel's existing style.) The boot self-test is the
+  backstop if any tier's `asm!` is wrong on a given unit.
+- **Perf: `VPMADDWD` fusion (future).** The AVX2 tier uses `VPMULLD`+`VPADDD`; a
+  `VPMADDWD` (int16 multiply-add over `VPMOVSXBW`-extended int8) would fuse the pair
+  and do 16 int8/step. Still bit-exact (associative `wrapping_add`). A throughput
+  optimization for later — the correctness path is settled.
 - **bf16 path.** `AMX_BF16` / `AVX512_BF16` reuse this exact structure with a bf16
   input/f32-accumulate GEMM. Deferred until the int8 tiers land, but the `Tier`
   enum + dispatch are designed to extend to it.

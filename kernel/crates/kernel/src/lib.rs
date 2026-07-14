@@ -76,7 +76,7 @@ pub fn kmain() -> ! {
             );
         } else {
             hal::println!(
-                "[simd] AVX enabled; AVX2 self-test failed/absent — ML on scalar tier (e.g. TCG mis-emulates VPMULLD)"
+                "[simd] AVX enabled; AVX2 unavailable or self-test failed — ML on scalar tier"
             );
         }
     } else {
