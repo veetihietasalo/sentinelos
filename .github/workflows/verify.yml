@@ -1,0 +1,65 @@
+name: Verify (Miri + Kani)
+
+# Formal/dynamic verification of the unsafe HAL/TCB, kept SEPARATE from Kernel CI
+# so the nightly-only tooling here never touches the stable kernel build. Miri
+# runs the hal unit tests under an interpreter that catches undefined behaviour
+# (out-of-bounds, misaligned, use-after-free, data races); Kani model-checks the
+# `#[cfg(kani)]` proof harnesses exhaustively.
+on:
+  push:
+    paths:
+      - "kernel/**"
+      - ".github/workflows/verify.yml"
+  pull_request:
+    paths:
+      - "kernel/**"
+      - ".github/workflows/verify.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Miri: dynamic UB detection over the hal test suite (enforced gate) ────────
+  miri:
+    name: Miri (hal UB check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      # hal builds bare-metal by default (kernel/.cargo/config.toml sets
+      # build.target = x86_64-unknown-none); Miri needs a host target, so build
+      # the host tests explicitly. `-Zmiri-disable-isolation` allows the harness's
+      # environment access; the hal tests are pure logic so none is required, it
+      # only keeps Miri from blocking incidental host calls.
+      - name: cargo miri test -p hal
+        working-directory: kernel
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo miri test -p hal --target x86_64-unknown-linux-gnu
+
+  # ── Kani: exhaustive proofs of the hal harnesses (best-effort, non-blocking) ──
+  kani:
+    name: Kani (hal proofs, best-effort)
+    runs-on: ubuntu-latest
+    # Provisional: the #[cfg(kani)] proof harnesses in hal are known-good specs,
+    # but this job could not be verified in the dev sandbox (the Kani toolchain
+    # failed to run there), so it does NOT gate merges yet. Promote to a required
+    # check once it's confirmed green on a real runner.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Kani (driver + toolchain bundle)
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+      - name: cargo kani -p hal
+        working-directory: kernel
+        env:
+          # Override the bare-metal build.target so Kani analyses hal for the host.
+          CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+        run: cargo kani -p hal --output-format terse

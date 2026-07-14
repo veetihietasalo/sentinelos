@@ -605,3 +605,25 @@ mod tests {
         assert_eq!(Vendor::Other.label(), "other");
     }
 }
+
+/// Kani proof harnesses — exhaustive (all-input) proofs of the pure decode logic.
+///
+/// Compiled only under `cargo kani` (the `kani` cfg); the normal stable build
+/// excludes this module entirely. Run with `cargo kani -p hal`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// `from_eax` is **total** (never panics for any 32-bit leaf-1 `eax`) and its
+    /// decoded fields stay within the architectural nibble-combining bounds —
+    /// stepping ≤ 0xF, model ≤ 0xFF, family ≤ 0xF + 0xFF (base plus, when the base
+    /// family is 0xF, the 8-bit extended family).
+    #[kani::proof]
+    fn from_eax_is_total_and_bounded() {
+        let eax: u32 = kani::any();
+        let fms = FamilyModelStepping::from_eax(eax);
+        assert!(fms.stepping <= 0xF);
+        assert!(fms.model <= 0xFF);
+        assert!(fms.family <= 0xF + 0xFF);
+    }
+}
