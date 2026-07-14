@@ -46,10 +46,38 @@ const LVT_DELIVERY_EXTINT: u64 = 0b111 << 8;
 /// LVT delivery mode `NMI` (0b100 in bits 10:8).
 const LVT_DELIVERY_NMI: u64 = 0b100 << 8;
 
+/// cpuid leaf 1 ECX bit 21 — the CPU advertises x2APIC.
+const CPUID_ECX_X2APIC: u32 = 1 << 21;
+
+/// Whether a leaf-1 ECX value advertises x2APIC (bit 21).
+///
+/// Pure bit test, split out from [`has_x2apic`] so it is host-unit-testable and
+/// Kani-provable (the `cpuid::raw` read it wraps is privileged inline asm and thus
+/// neither).
+#[must_use]
+const fn ecx_has_x2apic(ecx: u32) -> bool {
+    ecx & CPUID_ECX_X2APIC != 0
+}
+
+/// Max-addressable logical processors per package from leaf-1 EBX bits 23:16,
+/// clamped to at least 1.
+///
+/// Pure, split out from [`logical_cpu_count`] for the same testability reason.
+#[must_use]
+const fn ebx_logical_cpu_count(ebx: u32) -> u32 {
+    let count = (ebx >> 16) & 0xFF;
+    // `Ord::max` is not `const`, so clamp to ≥1 manually.
+    if count == 0 {
+        1
+    } else {
+        count
+    }
+}
+
 /// Whether the CPU advertises x2APIC (cpuid leaf 1 ECX bit 21).
 #[must_use]
 fn has_x2apic() -> bool {
-    cpuid::raw(1, 0).ecx & (1 << 21) != 0
+    ecx_has_x2apic(cpuid::raw(1, 0).ecx)
 }
 
 /// Maximum-addressable logical processors per package (cpuid leaf 1 EBX 23:16).
@@ -61,8 +89,7 @@ fn has_x2apic() -> bool {
 /// bring-up figure; the real online-AP list arrives with MADT parsing in phase 3.
 #[must_use]
 pub fn logical_cpu_count() -> u32 {
-    let count = (cpuid::raw(1, 0).ebx >> 16) & 0xFF;
-    count.max(1)
+    ebx_logical_cpu_count(cpuid::raw(1, 0).ebx)
 }
 
 /// The current core's x2APIC ID, or `None` if the LAPIC is not in x2APIC mode.
@@ -128,4 +155,60 @@ pub fn enable_bsp() -> Option<u32> {
     }
     // `id()` self-guards on EXTD (just set), so this is `Some(the BSP id)`.
     id()
+}
+
+// ── Unit tests (host) ──────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{ebx_logical_cpu_count, ecx_has_x2apic};
+
+    #[test]
+    fn x2apic_bit_detected() {
+        assert!(!ecx_has_x2apic(0));
+        assert!(ecx_has_x2apic(1 << 21));
+        assert!(!ecx_has_x2apic(!(1 << 21)));
+        assert!(ecx_has_x2apic(0xFFFF_FFFF));
+        // Off-by-one guards: the adjacent bits (SSE4.2 = 20, MOVBE = 22) must not
+        // read as x2APIC.
+        assert!(!ecx_has_x2apic(1 << 20));
+        assert!(!ecx_has_x2apic(1 << 22));
+    }
+
+    #[test]
+    fn logical_cpu_count_reads_ebx_23_16_and_clamps() {
+        assert_eq!(ebx_logical_cpu_count(0), 1); // clamp: never 0
+        assert_eq!(ebx_logical_cpu_count(1 << 16), 1);
+        assert_eq!(ebx_logical_cpu_count(4 << 16), 4);
+        assert_eq!(ebx_logical_cpu_count(0xFF << 16), 255);
+        // Only bits 23:16 are decoded — the surrounding bytes are ignored.
+        assert_eq!(ebx_logical_cpu_count(0xABCD_EF12), 0xCD);
+        // Bits outside 23:16 do not leak into the field (still clamps to 1).
+        assert_eq!(ebx_logical_cpu_count(0xFF00_FFFF), 1);
+    }
+}
+
+/// Kani proof harnesses — exhaustive (all-input) proofs of the pure cpuid-field
+/// decode logic. Compiled only under `cargo kani` (the `kani` cfg); the normal
+/// stable build (and `cargo test`) excludes this module. Run `cargo kani -p hal`.
+#[cfg(kani)]
+mod proofs {
+    use super::{ebx_logical_cpu_count, ecx_has_x2apic};
+
+    /// `ecx_has_x2apic` is **total** (never panics for any 32-bit ECX) and is
+    /// exactly the bit-21 test over all inputs.
+    #[kani::proof]
+    fn ecx_has_x2apic_is_total() {
+        let ecx: u32 = kani::any();
+        assert_eq!(ecx_has_x2apic(ecx), ecx & (1 << 21) != 0);
+    }
+
+    /// `ebx_logical_cpu_count` is **total** and always clamped to `1..=255`
+    /// (never 0), for any 32-bit EBX.
+    #[kani::proof]
+    fn ebx_logical_cpu_count_is_total_and_clamped() {
+        let ebx: u32 = kani::any();
+        let n = ebx_logical_cpu_count(ebx);
+        assert!((1..=255).contains(&n));
+    }
 }
