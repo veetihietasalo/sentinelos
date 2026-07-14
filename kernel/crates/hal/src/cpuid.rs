@@ -208,6 +208,44 @@ pub struct Feature {
     pub present: bool,
 }
 
+/// The x86 CPU vendor, decoded from the leaf-0 vendor-id string.
+///
+/// Kept as a typed enum (rather than string compares scattered through the
+/// kernel) so vendor-specific paths — AMD SME/SEV vs Intel TME/TDX memory
+/// encryption, `AuthenticAMD` vs `GenuineIntel` errata, APIC quirks — branch on
+/// one authoritative value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vendor {
+    /// `GenuineIntel`.
+    Intel,
+    /// `AuthenticAMD` (also the historical `AMDisbetter!` engineering-sample id).
+    Amd,
+    /// Any other or unrecognised vendor (hypervisor stubs, VIA/Zhaoxin, …).
+    Other,
+}
+
+impl Vendor {
+    /// Classify a 12-byte CPUID leaf-0 vendor-id string.
+    #[must_use]
+    pub fn from_id(id: &str) -> Self {
+        match id {
+            "GenuineIntel" => Vendor::Intel,
+            "AuthenticAMD" | "AMDisbetter!" => Vendor::Amd,
+            _ => Vendor::Other,
+        }
+    }
+
+    /// A short human label for the `cpuinfo` report (`"Intel"`, `"AMD"`, `"other"`).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Vendor::Intel => "Intel",
+            Vendor::Amd => "AMD",
+            Vendor::Other => "other",
+        }
+    }
+}
+
 /// Selected leaf-1 `edx` feature bits (the classic baseline ISA features).
 struct Leaf1Edx;
 impl Leaf1Edx {
@@ -227,6 +265,7 @@ impl Leaf1Ecx {
     const SSE3: u32 = 1 << 0;
     const SSSE3: u32 = 1 << 9;
     const FMA: u32 = 1 << 12;
+    const PCID: u32 = 1 << 17;
     const SSE4_1: u32 = 1 << 19;
     const SSE4_2: u32 = 1 << 20;
     const X2APIC: u32 = 1 << 21;
@@ -243,14 +282,77 @@ impl Leaf7Ebx {
     const AVX2: u32 = 1 << 5;
     const SMEP: u32 = 1 << 7;
     const BMI2: u32 = 1 << 8;
+    const AVX512F: u32 = 1 << 16;
     const RDSEED: u32 = 1 << 18;
     const SMAP: u32 = 1 << 20;
     const SHA: u32 = 1 << 29;
 }
 
-/// The maximum number of feature flags [`info`] can report (the count of bits
-/// inspected across leaf 1 and leaf 7 below). Callers can size a buffer to this.
-pub const MAX_FEATURES: usize = 25;
+/// Selected leaf-7 sub-leaf-0 `ecx` feature bits (privilege-hardening + newer ISA).
+struct Leaf7Ecx;
+impl Leaf7Ecx {
+    /// User-Mode Instruction Prevention — faults `sgdt`/`sidt`/… in ring 3.
+    const UMIP: u32 = 1 << 2;
+    /// CET shadow stack (control-flow integrity, return-address protection).
+    const CET_SS: u32 = 1 << 7;
+    /// 5-level paging / 57-bit linear addresses.
+    const LA57: u32 = 1 << 16;
+    const RDPID: u32 = 1 << 22;
+}
+
+/// Selected leaf-7 sub-leaf-0 `edx` feature bits (speculation-control + CET).
+struct Leaf7Edx;
+impl Leaf7Edx {
+    /// CET indirect-branch tracking (forward-edge control-flow integrity).
+    const CET_IBT: u32 = 1 << 20;
+    /// IBRS/IBPB via the `IA32_SPEC_CTRL`/`IA32_PRED_CMD` MSRs (Spectre v2).
+    const SPEC_CTRL: u32 = 1 << 26;
+    /// Single-Thread Indirect Branch Predictors.
+    const STIBP: u32 = 1 << 27;
+    /// L1 data-cache flush MSR (`IA32_FLUSH_CMD`) — L1TF mitigation.
+    const L1D_FLUSH: u32 = 1 << 28;
+    /// Speculative Store Bypass Disable (Spectre v4).
+    const SSBD: u32 = 1 << 31;
+}
+
+/// Selected extended leaf `0x8000_0001` `edx` bits (long mode + NX).
+struct Ext1Edx;
+impl Ext1Edx {
+    const SYSCALL: u32 = 1 << 11;
+    /// No-eXecute page permission (data pages non-executable) — W^X foundation.
+    const NX: u32 = 1 << 20;
+    /// 1 GiB huge pages.
+    const PDPE1GB: u32 = 1 << 26;
+    const RDTSCP: u32 = 1 << 27;
+    /// Long mode (x86-64).
+    const LM: u32 = 1 << 29;
+}
+
+/// Selected extended leaf `0x8000_0001` `ecx` bits.
+struct Ext1Ecx;
+impl Ext1Ecx {
+    /// AMD Secure Virtual Machine (AMD-V) hardware virtualization.
+    const SVM: u32 = 1 << 2;
+}
+
+/// AMD memory-encryption features — extended leaf `0x8000_001F` `eax`.
+///
+/// Directly relevant to SentinelOS's privacy mission: SME transparently encrypts
+/// DRAM; SEV/SEV-ES/SEV-SNP extend that to per-VM encryption with register-state
+/// and integrity protection. Intel's counterparts (TME/TDX) are probed via MSRs,
+/// not this leaf, and are tracked separately.
+struct Ext1FEax;
+impl Ext1FEax {
+    const SME: u32 = 1 << 0;
+    const SEV: u32 = 1 << 1;
+    const SEV_ES: u32 = 1 << 3;
+    const SEV_SNP: u32 = 1 << 4;
+}
+
+/// Capacity ceiling for the feature list [`info`] reports (bits inspected across
+/// leaf 1, leaf 7, and the extended leaves below). Callers can size a buffer to
+/// this; the `add` helper never writes past it.
+pub const MAX_FEATURES: usize = 48;
 
 /// A structured, heap-free snapshot of what `cpuid` reports about this CPU.
 ///
@@ -277,6 +379,12 @@ impl CpuInfo {
     #[must_use]
     pub fn features(&self) -> &[Feature] {
         &self.features[..self.feature_count]
+    }
+
+    /// The decoded CPU [`Vendor`] (Intel / AMD / other) from the vendor-id string.
+    #[must_use]
+    pub fn vendor_kind(&self) -> Vendor {
+        Vendor::from_id(self.vendor.as_str())
     }
 }
 
@@ -316,12 +424,33 @@ pub fn info() -> CpuInfo {
         (FamilyModelStepping::default(), 0, 0)
     };
 
-    // Leaf 7 sub-leaf 0: extended feature flags (ebx), when supported.
-    let ebx7 = if max_std >= 7 { raw(7, 0).ebx } else { 0 };
+    // Leaf 7 sub-leaf 0: extended feature flags (ebx/ecx/edx), when supported.
+    let (ebx7, ecx7, edx7) = if max_std >= 7 {
+        let l = raw(7, 0);
+        (l.ebx, l.ecx, l.edx)
+    } else {
+        (0, 0, 0)
+    };
+
+    // Extended leaves. `0x8000_0001` carries NX / long-mode / AMD-V; `0x8000_001F`
+    // carries AMD memory encryption (SME/SEV). Each is read only when the CPU
+    // advertises that far, so unsupported leaves read as absent, never UB.
+    let max_ext = max_extended_leaf();
+    let (ext1_edx, ext1_ecx) = if max_ext >= 0x8000_0001 {
+        let l = raw(0x8000_0001, 0);
+        (l.edx, l.ecx)
+    } else {
+        (0, 0)
+    };
+    let ext1f_eax = if max_ext >= 0x8000_001F {
+        raw(0x8000_001F, 0).eax
+    } else {
+        0
+    };
 
     // Brand string from the extended leaves, when supported.
     let mut brand = CpuidString::new();
-    if max_extended_leaf() >= 0x8000_0004 {
+    if max_ext >= 0x8000_0004 {
         for leaf in 0x8000_0002u32..=0x8000_0004 {
             let r = raw(leaf, 0);
             brand.push_word(r.eax);
@@ -369,6 +498,31 @@ pub fn info() -> CpuInfo {
     add("rdseed", ebx7, Leaf7Ebx::RDSEED);
     add("smap", ebx7, Leaf7Ebx::SMAP);
     add("sha", ebx7, Leaf7Ebx::SHA);
+    // Wide vectors (leaf 7 ebx) — relevant to CPU-side ML kernels.
+    add("avx512f", ebx7, Leaf7Ebx::AVX512F);
+    // Privilege & control-flow hardening (leaf 1 ecx, leaf 7 ecx/edx).
+    add("pcid", ecx1, Leaf1Ecx::PCID);
+    add("umip", ecx7, Leaf7Ecx::UMIP);
+    add("cet_ss", ecx7, Leaf7Ecx::CET_SS);
+    add("la57", ecx7, Leaf7Ecx::LA57);
+    add("rdpid", ecx7, Leaf7Ecx::RDPID);
+    add("cet_ibt", edx7, Leaf7Edx::CET_IBT);
+    add("spec_ctrl", edx7, Leaf7Edx::SPEC_CTRL);
+    add("stibp", edx7, Leaf7Edx::STIBP);
+    add("l1d_flush", edx7, Leaf7Edx::L1D_FLUSH);
+    add("ssbd", edx7, Leaf7Edx::SSBD);
+    // Extended leaf 0x8000_0001: long mode, NX (W^X), 1 GiB pages, AMD-V.
+    add("syscall", ext1_edx, Ext1Edx::SYSCALL);
+    add("nx", ext1_edx, Ext1Edx::NX);
+    add("pdpe1gb", ext1_edx, Ext1Edx::PDPE1GB);
+    add("rdtscp", ext1_edx, Ext1Edx::RDTSCP);
+    add("lm", ext1_edx, Ext1Edx::LM);
+    add("svm", ext1_ecx, Ext1Ecx::SVM);
+    // AMD memory encryption (leaf 0x8000_001F) — privacy-relevant.
+    add("sme", ext1f_eax, Ext1FEax::SME);
+    add("sev", ext1f_eax, Ext1FEax::SEV);
+    add("sev_es", ext1f_eax, Ext1FEax::SEV_ES);
+    add("sev_snp", ext1f_eax, Ext1FEax::SEV_SNP);
 
     CpuInfo {
         vendor,
@@ -433,5 +587,21 @@ mod tests {
     fn empty_cpuid_string_is_empty() {
         let s = CpuidString::new();
         assert_eq!(s.as_str(), "");
+    }
+
+    #[test]
+    fn vendor_classifies_intel_and_amd() {
+        assert_eq!(Vendor::from_id("GenuineIntel"), Vendor::Intel);
+        assert_eq!(Vendor::from_id("AuthenticAMD"), Vendor::Amd);
+        assert_eq!(Vendor::from_id("AMDisbetter!"), Vendor::Amd);
+        assert_eq!(Vendor::from_id("VIA VIA VIA "), Vendor::Other);
+        assert_eq!(Vendor::from_id(""), Vendor::Other);
+    }
+
+    #[test]
+    fn vendor_labels_are_stable() {
+        assert_eq!(Vendor::Intel.label(), "Intel");
+        assert_eq!(Vendor::Amd.label(), "AMD");
+        assert_eq!(Vendor::Other.label(), "other");
     }
 }

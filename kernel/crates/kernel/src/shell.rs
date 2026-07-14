@@ -420,9 +420,12 @@ impl Shell {
     fn cmd_cpuinfo(&mut self) {
         let info = hal::cpuid::info();
 
-        // "vendor: GenuineIntel"
+        // "vendor: AuthenticAMD (AMD)" — raw id plus the decoded Intel/AMD/other.
         let mut vendor = String::from("vendor: ");
         vendor.push_str(info.vendor.as_str());
+        vendor.push_str(" (");
+        vendor.push_str(info.vendor_kind().label());
+        vendor.push(')');
         self.push_line(vendor);
 
         // "brand: <48-byte brand string>" — only if the CPU provided one.
