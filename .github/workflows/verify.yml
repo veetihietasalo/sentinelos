@@ -1,0 +1,46 @@
+name: Verify (Miri)
+
+# Dynamic verification of the unsafe HAL/TCB, kept SEPARATE from Kernel CI so the
+# nightly-only Miri toolchain never touches the stable kernel build. Miri runs the
+# hal unit tests under an interpreter that catches undefined behaviour
+# (out-of-bounds/misaligned pointer use, use-after-free, data races).
+#
+# Kani proof harnesses live in-tree (`#[cfg(kani)]` in cpuid.rs / ata.rs) and are
+# run with `cargo kani -p hal`. A dedicated Kani CI job is deferred until the Kani
+# toolchain is confirmed working on a runner (it neither ran in the dev sandbox nor
+# resolves cleanly against the stable-pinned rust-toolchain.toml here).
+on:
+  push:
+    paths:
+      - "kernel/**"
+      - ".github/workflows/verify.yml"
+  pull_request:
+    paths:
+      - "kernel/**"
+      - ".github/workflows/verify.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  miri:
+    name: Miri (hal UB check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      # `cargo +nightly` is REQUIRED: kernel/rust-toolchain.toml pins the channel
+      # to stable (which has no miri component), and rust-toolchain.toml wins over
+      # the default toolchain; the explicit +nightly overrides it for this command.
+      # `--target x86_64-unknown-linux-gnu` overrides the bare-metal build.target so
+      # Miri runs the host tests. `-Zmiri-disable-isolation` only keeps Miri from
+      # blocking incidental host calls; the hal tests are pure logic.
+      - name: cargo +nightly miri test -p hal
+        working-directory: kernel
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo +nightly miri test -p hal --target x86_64-unknown-linux-gnu

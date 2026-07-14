@@ -8,3 +8,9 @@ name = "hal"
 
 [dependencies]
 limine = "0.5.0"
+
+# `kani` is a build cfg set by `cargo kani` (the model checker); declaring it here
+# keeps the `unexpected_cfgs` lint quiet under the normal stable build, where the
+# `#[cfg(kani)]` proof harnesses are compiled out entirely.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

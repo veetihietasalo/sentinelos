@@ -521,3 +521,33 @@ mod tests {
         );
     }
 }
+
+/// Kani proof harness — exhaustive proof of the disk-I/O safety gate.
+///
+/// Compiled only under `cargo kani`; the normal stable build excludes it. Run
+/// with `cargo kani -p hal`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// `validate` is the gate every PIO transfer passes through, so its acceptance
+    /// set *is* the safety contract of `read_sectors`/`write_sectors`. Prove that
+    /// for **any** `(lba, count, buf_len)`, an `Ok(n)` result implies every
+    /// precondition the transfer relies on: the returned count equals the input,
+    /// the count is a legal LBA28 sector count (`1..=256`), the buffer is exactly
+    /// `count * 512` bytes (no over/under-read of the caller's slice), and the last
+    /// addressed sector fits LBA28 (no wrap past the 128 GiB limit). Equivalently:
+    /// no unsafe request is ever accepted.
+    #[kani::proof]
+    fn validate_only_accepts_safe_requests() {
+        let lba: u32 = kani::any();
+        let count: u16 = kani::any();
+        let buf_len: usize = kani::any();
+        if let Ok(n) = validate(lba, count, buf_len) {
+            assert!(n == count);
+            assert!(count >= 1 && count <= 256);
+            assert!(buf_len == count as usize * SECTOR_SIZE);
+            assert!((lba as u64) + (count as u64) - 1 < (1u64 << 28));
+        }
+    }
+}
