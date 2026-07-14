@@ -18,6 +18,7 @@
 //! | 32     | IRQ0 PIT timer     | Bump the tick counter + EOI, then **return** (resumes). |
 //! | 33     | IRQ1 PS/2 keyboard | Drain the scancode byte into the ring + EOI, then **return** (resumes). |
 //! | 44     | IRQ12 PS/2 mouse   | Drain a packet byte, reassemble the 3-byte packet into the ring + dual EOI, then **return** (resumes). |
+//! | 255    | LAPIC spurious     | No-op **return** (a spurious interrupt owes no EOI); prevents a boot-halt once the LAPIC is software-enabled. |
 //!
 //! Vectors without a registered handler fall through to `hal`'s `default_handler`,
 //! which already reports and halts — no action needed here.
@@ -42,6 +43,11 @@ const IRQ_TIMER: u8 = 0;
 const VECTOR_KEYBOARD: u8 = hal::keyboard::VECTOR_KEYBOARD;
 /// Vector 44 (`0x2C`): IRQ12 — the PS/2 mouse (slave PIC), after the PIC remap.
 const VECTOR_MOUSE: u8 = hal::mouse::VECTOR_MOUSE;
+/// Vector 255 (`0xFF`): the LAPIC spurious-interrupt vector (matches the SVR the
+/// `hal::apic` x2APIC bring-up programs). A spurious interrupt is delivered when a
+/// raised interrupt is de-asserted before the CPU acknowledges it; the correct
+/// response is to **return without an EOI** (see [`handle_spurious`]).
+const VECTOR_SPURIOUS: u8 = 0xFF;
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -212,6 +218,18 @@ fn handle_nic(_frame: &InterruptFrame) {
     hal::e1000::on_irq();
 }
 
+/// Vector 255 (`0xFF`) — the LAPIC spurious-interrupt vector.
+///
+/// Once `hal::apic` software-enables the Local APIC (x2APIC virtual-wire), a
+/// spurious LAPIC interrupt can be delivered on this vector. Per the Intel SDM a
+/// spurious interrupt requires **no** End-Of-Interrupt and the handler must simply
+/// **return** (it does not set the LAPIC ISR). Without this handler the vector
+/// would fall through to `hal`'s `default_handler`, which halts the core — a
+/// latent boot-halt on real hardware. Returning normally makes it a no-op.
+fn handle_spurious(_frame: &InterruptFrame) {
+    // Intentionally empty: no EOI, just resume.
+}
+
 // ── Public initialisation ─────────────────────────────────────────────────────
 
 /// Register CPU exception handlers and arm the GDT + TSS + IDT.
@@ -274,6 +292,10 @@ pub fn init_timer() {
     hal::interrupts::set_handler(VECTOR_TIMER, handle_timer as Handler);
     hal::interrupts::set_handler(VECTOR_KEYBOARD, handle_keyboard as Handler);
     hal::interrupts::set_handler(VECTOR_MOUSE, handle_mouse as Handler);
+    // Register the LAPIC spurious-interrupt handler (vector 0xFF) now, so it is
+    // live before `kmain` software-enables the Local APIC (x2APIC): a spurious
+    // LAPIC interrupt must return without an EOI rather than halt the core.
+    hal::interrupts::set_handler(VECTOR_SPURIOUS, handle_spurious as Handler);
 
     // Remap the 8259A pair to vectors 32–47 (every line masked), then program
     // PIT channel 0 to ~100 Hz, then open IRQ0 (timer) and IRQ1 (keyboard).

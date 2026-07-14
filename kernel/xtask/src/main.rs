@@ -350,6 +350,11 @@ fn do_run() -> ExitCode {
 const END_MARKER: &str = "boot-bringup-ok";
 /// Full banner line we require to be present as well.
 const BANNER_LINE: &str = "SentinelOS \u{2014} boot bring-up OK";
+/// Marker proving the SMP (x2APIC) bring-up branch actually executed. Both the
+/// enable line (`[smp] x2APIC enabled …`) and the graceful "not advertised"
+/// fallback share this prefix, so it positively confirms the path ran regardless
+/// of whether the host (KVM/hardware vs. TCG) advertises x2APIC.
+const SMP_MARKER: &str = "[smp]";
 /// Seconds to wait for the boot end-marker before giving up. Generous because
 /// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
 /// the full bring-up — networking, then seeding + writing the 16 MiB disk image
@@ -447,8 +452,16 @@ fn do_test() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    if !log.contains(SMP_MARKER) {
+        eprintln!(
+            "TEST FAILED: end-marker present but SMP bring-up line '{}' missing.",
+            SMP_MARKER
+        );
+        return ExitCode::FAILURE;
+    }
+
     println!(
-        "TEST PASSED: full banner and end-marker '{}' confirmed in serial output.",
+        "TEST PASSED: full banner, SMP bring-up line, and end-marker '{}' confirmed in serial output.",
         END_MARKER
     );
     ExitCode::SUCCESS

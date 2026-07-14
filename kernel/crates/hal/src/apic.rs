@@ -52,26 +52,38 @@ fn has_x2apic() -> bool {
     cpuid::raw(1, 0).ecx & (1 << 21) != 0
 }
 
-/// Number of logical processors the package advertises (cpuid leaf 1 EBX 23:16).
+/// Maximum-addressable logical processors per package (cpuid leaf 1 EBX 23:16).
 ///
-/// Under QEMU this reflects `-smp N`. It is the *maximum addressable* count, not a
-/// list of which APs are actually present/enabled — that is the ACPI MADT's job
-/// (a later, ACPI-dependent phase). Good enough for a bring-up report.
+/// This is an *upper bound*, **not** the number of online CPUs (that is the ACPI
+/// MADT's job, a later phase). It is also topology-dependent: QEMU's default
+/// `-smp N` is N single-core packages, so this field often reads **1** even with
+/// N vCPUs — the per-package max, not the machine total. Good enough as a coarse
+/// bring-up figure; the real online-AP list arrives with MADT parsing in phase 3.
 #[must_use]
 pub fn logical_cpu_count() -> u32 {
     let count = (cpuid::raw(1, 0).ebx >> 16) & 0xFF;
     count.max(1)
 }
 
-/// The current core's x2APIC ID — valid only after [`enable_bsp`] has switched to
-/// x2APIC mode (reading MSR `0x802` in xAPIC mode `#GP`s), so call this after it.
+/// The current core's x2APIC ID, or `None` if the LAPIC is not in x2APIC mode.
+///
+/// Reads `IA32_APIC_BASE` first and checks the `EXTD` bit: MSR `0x802` exists only
+/// in x2APIC mode (reading it in xAPIC mode `#GP`s), so this **self-guards** and
+/// never faults regardless of call order — a safe wrapper must not depend on the
+/// caller having entered x2APIC mode. Returns `Some` only after [`enable_bsp`] (or
+/// firmware) has entered x2APIC mode.
 #[must_use]
-pub fn id() -> u32 {
-    // SAFETY: MSR 0x802 (x2APIC ID) is a pure, read-only register access that is
-    // architecturally valid once the LAPIC is in x2APIC mode. `enable_bsp` sets
-    // that mode before any caller reaches here; reading an APIC ID has no side
-    // effect and cannot corrupt memory.
-    (unsafe { cpu::read_msr(X2APIC_ID) }) as u32
+pub fn id() -> Option<u32> {
+    // SAFETY: IA32_APIC_BASE (MSR 0x1B) is implemented on every long-mode CPU, so
+    // this read cannot `#GP`; it is a pure, side-effect-free register read.
+    let base = unsafe { cpu::read_msr(IA32_APIC_BASE) };
+    if base & APIC_BASE_EXTD == 0 {
+        return None;
+    }
+    // SAFETY: EXTD is confirmed set above, so the LAPIC is in x2APIC mode and MSR
+    // 0x802 (x2APIC ID) is architecturally accessible; a read-only register access
+    // with no side effect — cannot corrupt memory.
+    Some((unsafe { cpu::read_msr(X2APIC_ID) }) as u32)
 }
 
 /// Enable the BSP's Local APIC in x2APIC mode, in **virtual-wire** configuration.
@@ -87,10 +99,14 @@ pub fn enable_bsp() -> Option<u32> {
     }
     // SAFETY: this is a fixed, architectural LAPIC bring-up sequence on MSRs that
     // exist on any x2APIC-capable CPU (checked above), touching no Rust memory:
-    //   1. IA32_APIC_BASE |= EN|EXTD — hardware-enable + switch to x2APIC mode.
-    //      Going xAPIC(EN)→x2APIC(EN|EXTD) is a valid transition; EN is already
-    //      set out of reset, and we only OR bits in (never clear the base
-    //      address). After this the 0x800-range registers below are accessible.
+    //   1. Enter x2APIC mode via IA32_APIC_BASE. The APIC mode machine forbids the
+    //      (EN=0,EXTD=0) → (EN=1,EXTD=1) jump in a single write, so if the LAPIC is
+    //      software-disabled we first set EN alone (enter xAPIC — a valid
+    //      intermediate state), then set EXTD. We only OR bits in (never clear the
+    //      base address). In practice EN is already set after reset/Limine, so the
+    //      first write is usually skipped; handling EN=0 makes the sequence robust
+    //      instead of asserting an unverified precondition. After EXTD is set the
+    //      0x800-range registers below are accessible.
     //   2. SVR = software-enable | spurious vector 0xFF — unmask the LVT.
     //   3. LVT LINT0 = ExtINT — the 8259 PIC's INTR passes through unchanged, so
     //      the existing PIT/keyboard/mouse/NIC handlers (which EOI the PIC) keep
@@ -100,10 +116,16 @@ pub fn enable_bsp() -> Option<u32> {
     // The `kmain` caller verifies delivery survived by waiting for PIT ticks.
     unsafe {
         let base = cpu::read_msr(IA32_APIC_BASE);
+        if base & APIC_BASE_EN == 0 {
+            // Software-disabled LAPIC: enable xAPIC first, because a direct
+            // disabled → x2APIC transition is illegal (`#GP`).
+            cpu::write_msr(IA32_APIC_BASE, base | APIC_BASE_EN);
+        }
         cpu::write_msr(IA32_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD);
         cpu::write_msr(X2APIC_SVR, SVR_SOFTWARE_ENABLE | SPURIOUS_VECTOR);
         cpu::write_msr(X2APIC_LVT_LINT0, LVT_DELIVERY_EXTINT);
         cpu::write_msr(X2APIC_LVT_LINT1, LVT_DELIVERY_NMI);
     }
-    Some(id())
+    // `id()` self-guards on EXTD (just set), so this is `Some(the BSP id)`.
+    id()
 }
