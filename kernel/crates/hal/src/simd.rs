@@ -481,14 +481,28 @@ mod tests {
     /// whose feature is absent is skipped (not failed) — CI hosts vary, and both
     /// kernels are proven identically against the scalar reference below, so running
     /// whichever the host supports still exercises the differential contract.
+    ///
+    /// Emits a per-tier ran/skipped line to stderr (visible under
+    /// `cargo test -- --nocapture`) so a green run distinguishes "the AVX-512 kernel
+    /// was verified here" from "the host lacks avx512f and it was silently skipped" —
+    /// the two look identical from an exit code otherwise. Standard GitHub runners
+    /// often lack `avx512f`, so the ZMM kernel's coverage must be confirmed on an
+    /// avx512f host (see the design doc's Phase 3 testing note), not assumed from CI.
     fn host_kernels() -> Vec<(&'static str, Kernel)> {
         let mut ks: Vec<(&'static str, Kernel)> = Vec::new();
-        if std::is_x86_feature_detected!("avx2") {
+        let avx2 = std::is_x86_feature_detected!("avx2");
+        let avx512f = std::is_x86_feature_detected!("avx512f");
+        if avx2 {
             ks.push(("avx2", gemm_i8_avx2_impl as Kernel));
         }
-        if std::is_x86_feature_detected!("avx512f") {
+        if avx512f {
             ks.push(("avx512f", gemm_i8_avx512_impl as Kernel));
         }
+        std::eprintln!(
+            "[simd host-diff] avx2: {}  avx512f: {}",
+            if avx2 { "RAN" } else { "skipped (absent)" },
+            if avx512f { "RAN" } else { "skipped (absent)" },
+        );
         ks
     }
 

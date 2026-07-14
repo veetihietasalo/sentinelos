@@ -537,15 +537,14 @@ fn boot_test(kvm: bool) -> ExitCode {
     // and, on AVX-512 silicon, avx512f — so `active=` is `avx2` or `avx512f`, never
     // scalar. A scalar fallback here means a vector kernel is wrong or avx2 is
     // unexpectedly absent.
-    let active_tier = ML_VECTOR_ACTIVE.iter().find(|m| log.contains(**m));
-    if active_tier.is_none() {
+    let Some(active_tier) = ML_VECTOR_ACTIVE.iter().find(|m| log.contains(**m)) else {
         eprintln!(
             "TEST FAILED: expected one of {:?} in the [ml] line (a vector self-test \
              should pass where avx2/avx512f is exposed — did a vector kernel regress?).",
             ML_VECTOR_ACTIVE
         );
         return ExitCode::FAILURE;
-    }
+    };
     // ...and it must have computed the boot proof correctly end-to-end.
     if !log.contains(ML_GEMM_OK) {
         eprintln!(
@@ -555,7 +554,6 @@ fn boot_test(kvm: bool) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let active_tier = active_tier.unwrap();
 
     if kvm {
         println!(

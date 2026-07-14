@@ -225,7 +225,7 @@ pub fn gemm_i8_scalar(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: 
 /// vector state and returns `false` when unavailable (or on bad dims), so we fall
 /// through to the next tier and finally the scalar reference. All three produce
 /// bit-identical results. The AVX-512 VNNI and AMX kernels slot in here (tried
-/// before AVX-512F) once implemented (design doc phases 3/4).
+/// before AVX-512F) once implemented (design doc phases 4/5).
 pub fn gemm_i8(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) {
     if hal::simd::gemm_i8_avx512(a, b, c, m, k, n) {
         return;
@@ -270,7 +270,7 @@ pub fn prove() {
     }
     let mut b = [0i8; K * N];
     for (idx, slot) in b.iter_mut().enumerate() {
-        *slot = idx as i8; // 0..47
+        *slot = idx as i8; // 0..79
     }
     let mut c = [0i32; M * N];
     gemm_i8(&a, &b, &mut c, M, K, N);
@@ -476,6 +476,9 @@ mod proofs {
             assert!(tier != Tier::Amx);
         }
         // Never claims a vector tier the CPU does not advertise.
+        if tier == Tier::Avx512Vnni {
+            assert!(vnni);
+        }
         if tier == Tier::Avx512F {
             assert!(avx512f);
         }
