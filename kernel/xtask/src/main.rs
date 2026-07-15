@@ -426,26 +426,64 @@ fn do_test_kvm() -> ExitCode {
     boot_test(true)
 }
 
-/// The only symbols allowed to contain vector-register (`XMM`/`YMM`/`ZMM`)
-/// instructions: the three hand-written GEMM `asm!` kernels and the `xsave`/`xrstor`
-/// round-trip self-test. Every one lives in `hal::simd`, is audited in `hal-tcb.md`,
-/// and is **never** reachable from an interrupt handler. Matched as substrings of
-/// the (mangled) symbol name.
-const VECTOR_CODE_ALLOWLIST: &[&str] = &[
-    "avx2_madd8",
-    "avx512_madd16",
-    "vnni_dp16",
-    "xsave_roundtrip_ok",
-];
+/// Symbol-name substrings that may legitimately contain vector instructions: the
+/// **`hal::simd` module** and nothing else. Vector code is confined to that one
+/// audited module (the GEMM `asm!` kernels + the `xsave`/`xrstor` self-test); it must
+/// never appear in interrupt-handler code (in `hal::pit`/`keyboard`/`mouse`/`idt` or
+/// any `kernel` module). Matching the **module path** (rather than the four specific
+/// symbols) is robust to the compiler inlining the `#[inline]` `madd` helpers into
+/// their `_impl` callers — the vector instructions stay under a `hal::simd` symbol
+/// either way. Both the mangled (`3hal4simd`) and demangled (`hal::simd`) forms are
+/// listed so the guard works whether or not objdump demangles.
+const VECTOR_CODE_ALLOWLIST: &[&str] = &["3hal4simd", "hal::simd"];
+
+/// Operand-less mnemonics that clobber vector **data** registers but carry no
+/// `%xmm/%ymm/%zmm` operand text, so the operand scan alone would miss them. (Save/
+/// restore ops like `xsave`/`fxsave` are deliberately excluded — they *preserve*
+/// vector state, they don't clobber it. MXCSR ops touch only the control word.) The
+/// soft-float target cannot emit these, but the guard covers them so it stays honest.
+const VECTOR_CLOBBER_MNEMONICS: &[&str] = &["vzeroupper", "vzeroall"];
+
+/// Pure core of [`do_check_no_vector`]: given `objdump -d` text and an allowlist of
+/// symbol-name substrings, return `(symbol, instruction)` for every vector
+/// instruction found in a **non**-allowlisted function. Detects a vector register
+/// operand (`%xmm`/`%ymm`/`%zmm`/`%k0`–`%k7`) or a [`VECTOR_CLOBBER_MNEMONICS`] op.
+/// Split out (no I/O) so it can be unit-tested against synthetic disassembly — see
+/// the `tests` module, which checks it both flags a planted instruction and does not
+/// flag one inside `hal::simd`.
+fn find_vector_violations(disasm: &str, allowlist: &[&str]) -> Vec<(String, String)> {
+    let mut current = String::new();
+    let mut violations: Vec<(String, String)> = Vec::new();
+    for line in disasm.lines() {
+        // Function header lines look like `<hexaddr> <symbol>:`.
+        if line.trim_end().ends_with(">:") {
+            if let (Some(lt), Some(gt)) = (line.find('<'), line.rfind('>')) {
+                current = line[lt + 1..gt].to_string();
+            }
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        // objdump (AT&T) prints vector registers `%`-prefixed (`%xmm0`/`%ymm1`/
+        // `%zmm2`/`%k3`), so match that form to avoid matching symbol names/immediates.
+        let touches_vector = lower.contains("%xmm")
+            || lower.contains("%ymm")
+            || lower.contains("%zmm")
+            || (0..8).any(|d| lower.contains(&format!("%k{d}")))
+            || VECTOR_CLOBBER_MNEMONICS.iter().any(|m| lower.contains(m));
+        if touches_vector && !allowlist.iter().any(|a| current.contains(a)) {
+            violations.push((current.clone(), line.trim().to_string()));
+        }
+    }
+    violations
+}
 
 /// Guard the "compiled handlers are vector-free" invariant that lets vector GEMM run
-/// with interrupts enabled: disassemble the kernel and assert **every**
-/// `XMM`/`YMM`/`ZMM` instruction lives inside an allowlisted `hal::simd` symbol
-/// ([`VECTOR_CODE_ALLOWLIST`]). If any other function (e.g. a future interrupt
-/// handler, or `memcpy`) ever emits a vector instruction, this fails — turning
-/// "an IRQ can't clobber vector state" into a machine-checked property. The
-/// soft-float `x86_64-unknown-none` target makes this hold today (only the audited
-/// kernels use vectors); the guard keeps it true.
+/// with interrupts enabled: disassemble the kernel and assert **every** vector
+/// instruction lives inside the audited `hal::simd` module ([`VECTOR_CODE_ALLOWLIST`]).
+/// If any other function (a future interrupt handler, `memcpy`, …) ever emits a
+/// vector instruction, this fails — turning "an IRQ can't clobber vector state" into
+/// a machine-checked property. The soft-float `x86_64-unknown-none` target makes this
+/// hold today (only the audited kernels use vectors); the guard keeps it true.
 fn do_check_no_vector() -> ExitCode {
     let Some(elf) = build_kernel() else {
         return ExitCode::FAILURE;
@@ -470,32 +508,12 @@ fn do_check_no_vector() -> ExitCode {
         }
     };
     let text = String::from_utf8_lossy(&out);
-
-    let mut current = String::new();
-    let mut violations: Vec<(String, String)> = Vec::new();
-    for line in text.lines() {
-        // Function header lines look like `<hexaddr> <symbol>:`.
-        if line.trim_end().ends_with(">:") {
-            if let (Some(lt), Some(gt)) = (line.find('<'), line.rfind('>')) {
-                current = line[lt + 1..gt].to_string();
-            }
-            continue;
-        }
-        // Instruction lines: flag any vector register operand. objdump (AT&T) prints
-        // them `%`-prefixed (`%xmm0`/`%ymm1`/`%zmm2`), so match that form to avoid
-        // matching symbol names or immediates.
-        let lower = line.to_ascii_lowercase();
-        if (lower.contains("%xmm") || lower.contains("%ymm") || lower.contains("%zmm"))
-            && !VECTOR_CODE_ALLOWLIST.iter().any(|a| current.contains(a))
-        {
-            violations.push((current.clone(), line.trim().to_string()));
-        }
-    }
+    let violations = find_vector_violations(&text, VECTOR_CODE_ALLOWLIST);
 
     if violations.is_empty() {
         println!(
-            "check-no-vector PASSED: every XMM/YMM/ZMM instruction is inside an \
-             allowlisted hal::simd symbol ({:?}); no interrupt-reachable code uses \
+            "check-no-vector PASSED: every vector instruction is inside the \
+             audited hal::simd module ({:?}); no interrupt-reachable code uses \
              vectors, so an IRQ cannot clobber an in-flight GEMM.",
             VECTOR_CODE_ALLOWLIST
         );
@@ -503,10 +521,10 @@ fn do_check_no_vector() -> ExitCode {
     } else {
         eprintln!(
             "check-no-vector FAILED: {} vector instruction(s) found OUTSIDE the \
-             allowlist. Non-allowlisted code with vector instructions could run in \
-             an interrupt handler and clobber an interrupted GEMM's YMM/ZMM state. \
-             Either remove the vector code or (if it is audited and never runs in a \
-             handler) add its symbol to VECTOR_CODE_ALLOWLIST.",
+             hal::simd module. Non-allowlisted code with vector instructions could \
+             run in an interrupt handler and clobber an interrupted GEMM's YMM/ZMM \
+             state. Either remove the vector code, or (if it is audited and never \
+             runs in a handler) move it into hal::simd.",
             violations.len()
         );
         for (func, insn) in violations.iter().take(40) {
@@ -922,5 +940,72 @@ fn do_screenshot() -> ExitCode {
             eprintln!("SCREENSHOT FAILED: PNG not found after screendump: {}", e);
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_vector_violations, VECTOR_CODE_ALLOWLIST};
+
+    // Synthetic `objdump -d` snippets: a function header line followed by AT&T
+    // instruction lines. These are the exact shapes `find_vector_violations` parses.
+
+    #[test]
+    fn flags_vector_operand_in_a_handler() {
+        // A vector instruction inside an interrupt handler (hal::pit::on_tick) — the
+        // exact thing the guard exists to catch — must be reported.
+        let disasm = "\
+ffffffff80100000 <_ZN3hal3pit7on_tick17habcdef0123456789E>:\n\
+    100000:\t48 89 e5             \tmov    %rsp,%rbp\n\
+    100003:\tc5 f8 57 c0          \tvxorps %xmm0,%xmm0,%xmm0\n";
+        let v = find_vector_violations(disasm, VECTOR_CODE_ALLOWLIST);
+        assert_eq!(v.len(), 1, "planted vector insn must be flagged");
+        assert!(v[0].0.contains("on_tick"), "reports the offending symbol");
+    }
+
+    #[test]
+    fn allows_vector_operand_inside_hal_simd() {
+        // The same instruction inside the audited hal::simd module is allowed.
+        let disasm = "\
+ffffffff80142360 <_ZN3hal4simd10avx2_madd817h196b7f4f546f12d3E>:\n\
+    142360:\tc5 fd fe c9          \tvpaddd %ymm1,%ymm0,%ymm1\n";
+        assert!(
+            find_vector_violations(disasm, VECTOR_CODE_ALLOWLIST).is_empty(),
+            "vector code in hal::simd is permitted"
+        );
+    }
+
+    #[test]
+    fn flags_operandless_vzeroupper_in_handler() {
+        // Operand-less vector-clobbering ops (no %xmm/%ymm/%zmm text) must still be
+        // caught outside hal::simd.
+        let disasm = "\
+ffffffff80101000 <_ZN3hal8keyboard9on_key_ev17hcafebabeE>:\n\
+    101000:\tc5 f8 77             \tvzeroupper\n";
+        let v = find_vector_violations(disasm, VECTOR_CODE_ALLOWLIST);
+        assert_eq!(v.len(), 1, "vzeroupper in a handler must be flagged");
+    }
+
+    #[test]
+    fn flags_opmask_register_in_handler() {
+        let disasm = "\
+ffffffff80102000 <_ZN6kernel3net4poll17hdeadbeefE>:\n\
+    102000:\t62 f1 7c 48 90 c1    \tkmovw  %k1,%k0\n";
+        assert_eq!(
+            find_vector_violations(disasm, VECTOR_CODE_ALLOWLIST).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn ignores_pure_gp_code() {
+        // Plain integer code (what every handler compiles to on the soft-float
+        // target) is never flagged.
+        let disasm = "\
+ffffffff80103000 <_ZN3hal3pic3eoi17hfeedfaceE>:\n\
+    103000:\t48 89 e5             \tmov    %rsp,%rbp\n\
+    103003:\tb0 20                \tmov    $0x20,%al\n\
+    103005:\tc3                   \tret\n";
+        assert!(find_vector_violations(disasm, VECTOR_CODE_ALLOWLIST).is_empty());
     }
 }

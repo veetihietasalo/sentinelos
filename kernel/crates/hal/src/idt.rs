@@ -53,7 +53,16 @@ pub(crate) const VECTOR_SAVE_AREA_MAX: usize = 4096;
 /// legal (after `OSXSAVE`), and the interrupt path is byte-for-byte unchanged on a
 /// CPU without vector state. `enable` runs in the interrupts-off boot window, so the
 /// `0 → 1` transition is never observed part-way through an interrupt.
-#[no_mangle]
+///
+/// **SMP hazard — must fix before AP interrupt bring-up.** This is a single **global**
+/// flag, but `CR4.OSXSAVE` is **per-core**. Once APs start, if the BSP has armed this
+/// and an AP takes *any* interrupt before running its own [`crate::simd::enable`],
+/// `isr_common` on that AP would execute `xsave` with `OSXSAVE` unset → `#UD`. So each
+/// AP must set `OSXSAVE` (via `simd::enable`) **before enabling interrupts**, and this
+/// flag must then become per-core (or the `xsave` gate a per-core check). Not
+/// triggerable today (single-core; no AP handler path). See the vector-state design
+/// doc. Referenced from `isr_common`'s `global_asm!` via `sym` (works with the mangled
+/// name — no `#[no_mangle]` needed).
 static VECTOR_SAVE_ARMED: AtomicU8 = AtomicU8::new(0);
 
 /// Arm the per-IRQ vector save in [`isr_common`]. Called once by

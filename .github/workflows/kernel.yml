@@ -109,14 +109,19 @@ jobs:
           cargo test -p kernel --lib --target x86_64-unknown-linux-gnu ml:: -- --nocapture
 
       # ── 8c. Vector-free-handlers invariant ────────────────────────────────
-      # Disassemble the kernel and assert every XMM/YMM/ZMM instruction lives in an
-      # audited hal::simd symbol (the GEMM kernels + the xsave self-test). This
-      # machine-checks that no interrupt handler emits vector code, so an IRQ can
-      # never clobber an in-flight GEMM's vector state — the invariant that lets
-      # vector GEMM run with interrupts enabled (see the vector-state design doc).
-      - name: make check-no-vector (handlers are vector-free)
+      # First, unit-test the guard's detection core (that it flags a planted vector
+      # instruction — operand, operand-less vzeroupper, opmask — outside hal::simd and
+      # allows one inside), so the guard's efficacy is regression-tested, not assumed.
+      # Then run it: disassemble the kernel and assert every vector instruction lives
+      # in the audited hal::simd module. This machine-checks that no interrupt handler
+      # emits vector code, so an IRQ can never clobber an in-flight GEMM — the
+      # invariant that lets vector GEMM run interrupts-on (see the vector-state doc).
+      - name: xtask guard unit tests + check-no-vector
         working-directory: kernel
-        run: make check-no-vector
+        run: |
+          cargo test --manifest-path xtask/Cargo.toml \
+            --target x86_64-unknown-linux-gnu --target-dir target/xtask
+          make check-no-vector
 
       # ── 9. Boot test (deterministic QEMU serial-output check) ─────────────
       # `make test` (host-detecting wrapper over xtask — works on this Linux

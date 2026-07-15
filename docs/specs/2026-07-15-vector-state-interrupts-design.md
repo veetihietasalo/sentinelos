@@ -76,12 +76,16 @@ handler could not corrupt an interrupted GEMM. Details:
 
 ### 3. Relaxed GEMM precondition
 
-With both mechanisms in place, `hal::simd::gemm_i8_*` may run with interrupts
-enabled. The doc precondition changes from "interrupts must be disabled" to a note
-that vector state is preserved across interrupts (by #1's guarantee that handlers are
-vector-free, backed by #2's per-IRQ save). A **boot proof** runs a GEMM with
-interrupts **enabled** and the PIT ticking, verifying the result is still bit-exact —
-empirically validating the relaxed precondition under real interrupt pressure.
+`hal::simd::gemm_i8_*` may run with interrupts enabled. The **load-bearing**
+guarantee is #1 (compiled handlers are vector-free, so an IRQ *cannot* clobber vector
+state); #2's per-IRQ save is defense-in-depth that hardens against a hypothetical
+vector-using handler. So even when #2 is *disarmed* (a CPU whose `XSAVE` area does not
+fit the reserved buffer, or a failed round-trip self-test), interrupts-on GEMM is
+still safe by #1 — disarming does **not** re-impose an interrupts-off contract on
+callers. A **boot proof** (`kernel::ml::prove_interrupts_on`) runs GEMMs with
+interrupts **enabled** and the PIT ticking, bit-exact — a stress test that shows
+interrupts fired and the per-IRQ save didn't corrupt results (it does not
+deterministically hit the mid-`madd` clobber window; #1 is what rules that out).
 
 ### 4. Staged `XSAVE`/`XRSTOR` primitives for the future context-switch path
 
@@ -98,15 +102,44 @@ lands and validates the primitives; the switch integration is future work.
 - `hal::cpu`: `xsave`/`xrstor` (`XSAVE`/`XRSTOR`), `xsave_area_size` (cpuid `0xD`).
 - `hal::idt::isr_common`: the gated per-IRQ `xsave`/`xrstor` asm.
 - New `static VECTOR_SAVE_ARMED`.
-All catalogued in `hal-tcb.md`. `kernel` stays `#![forbid(unsafe_code)]`.
+- `hal::simd::xsave_roundtrip_ok`: three VEX `asm!` blocks (`vmovdqu`/`vpxor`).
+All catalogued in `hal-tcb.md` (cpu C13/C14; idt I1; the self-test VEX asm noted under
+C13). `kernel` stays `#![forbid(unsafe_code)]`.
 
 ## Testing
 
-- **Invariant guard**: `cargo xtask check-no-vector` passes on the current tree and
-  fails if a non-GEMM function gains a vector instruction (verified by a deliberate
-  probe during development). Wired into CI.
-- **`xsave`/`xrstor` round-trip self-test** at boot (state survives save→zero→restore).
-- **Interrupts-on GEMM boot proof**: a GEMM computed with `sti` set and the PIT
-  firing, asserted bit-exact against the scalar reference.
+- **Invariant guard**: `cargo xtask check-no-vector` disassembles the shipped debug
+  ELF and asserts every vector instruction lives in the `hal::simd` module. Wired into
+  CI (`kernel.yml`). Its detection core (`find_vector_violations`) has **automated**
+  unit tests that plant a vector instruction (operand form, operand-less `vzeroupper`,
+  and opmask `%k`) in a synthetic handler symbol and assert it is flagged — and one
+  inside `hal::simd` and assert it is **not** — so the guard's efficacy is regression-
+  tested, not just manually probed once.
+- **`xsave`/`xrstor` round-trip self-test** at boot (state survives save→zero→restore),
+  gating the arming.
+- **Interrupts-on GEMM stress proof** (`prove_interrupts_on`): GEMMs with `sti` set and
+  the PIT firing, asserted bit-exact (see §3 for what it does/doesn't prove).
 - Existing boot proofs (`prove`, `infer_prove`) unchanged; the always-on Kernel CI +
   KVM jobs continue to assert them, now with the per-IRQ save active in `isr_common`.
+
+## Residual risk & follow-ups
+
+- **SMP (must fix before AP interrupt bring-up).** `VECTOR_SAVE_ARMED` is a single
+  **global** flag but `CR4.OSXSAVE` is **per-core**. Once APs start, an AP that takes
+  any interrupt before running its own `simd::enable` would `xsave` with `OSXSAVE`
+  unset → `#UD`. Before SMP: make the flag per-core (or the `xsave` gate a per-core
+  check), and enforce "each AP sets `OSXSAVE` before enabling interrupts" (stronger
+  than "before any GEMM"). Not triggerable today (single-core; no AP handler path).
+- **AVX-512/VNNI save path is KVM-only.** Under TCG only x87+SSE+YMM state is saved;
+  the wider `ZMM`/opmask/`Hi16_ZMM` components and the `4096 ≥ cpuid-0xD` sizing assert
+  are dynamically exercised only on an AVX-512 KVM runner (`kvm-smp`, non-deterministic
+  runner assignment) — reasoned + boot-observed there, not every-run.
+- **Nested-exception save is reasoned, not exercised.** The on-stack (vs per-CPU) area
+  is what makes a fault-in-handler correct, but the boot proof fires only maskable
+  timer IRQs through interrupt gates (IF cleared ⇒ no nesting), so nesting is never hit.
+- **Per-interrupt stack cost.** Each armed interrupt reserves ≥ `VECTOR_SAVE_AREA_MAX`
+  (4096) bytes on the current kernel stack; bounded because interrupt gates block
+  maskable-IRQ nesting, so depth = exception/NMI nesting. The double-fault IST is the
+  stack-overflow backstop.
+- **Preemptive context switch (future).** A switch resuming a different task's vector
+  code needs per-task save via C13/C14 — no preemptive scheduler exists yet.

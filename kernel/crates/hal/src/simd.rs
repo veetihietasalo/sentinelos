@@ -160,12 +160,14 @@ pub fn enable() -> bool {
     if want_avx512 && avx512vnni_advertised() && self_test(gemm_i8_avx512vnni_impl) {
         AVX512VNNI_STATUS.store(1, Ordering::Relaxed);
     }
-    // Arm the per-IRQ vector save in the interrupt path so vector GEMM is safe with
-    // interrupts enabled — but only once we confirm the CPU's `XSAVE` area fits the
-    // reserved on-stack area AND `xsave`/`xrstor` demonstrably round-trip here. If
-    // either check fails, we leave it disarmed: GEMM then keeps its interrupts-off
-    // contract (the safe fallback), never running garbage. `xsave_area_size` is read
-    // now, after `XCR0` is set, so it reflects the enabled components.
+    // Arm the per-IRQ vector save in the interrupt path (defense-in-depth) — but only
+    // once we confirm the CPU's `XSAVE` area fits the reserved on-stack area AND
+    // `xsave`/`xrstor` demonstrably round-trip here. If either check fails we leave it
+    // disarmed; GEMM is **still** safe with interrupts enabled, because the
+    // load-bearing guarantee is that compiled handlers contain no vector instructions
+    // (CI-checked by `xtask check-no-vector`) — this per-IRQ save only hardens against
+    // a hypothetical vector-using handler. `xsave_area_size` is read now, after `XCR0`
+    // is set, so it reflects the enabled components.
     if cpu::xsave_area_size() as usize <= crate::idt::VECTOR_SAVE_AREA_MAX && xsave_roundtrip_ok() {
         crate::idt::arm_vector_save();
     }
