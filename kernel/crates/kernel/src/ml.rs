@@ -344,7 +344,7 @@ pub fn quantize_tensor(values: &[f32], out: &mut [i8]) -> f32 {
 /// output, which callers use as a deterministic checksum anchor).
 ///
 /// # Panics
-/// On any slice-length/dimension inconsistency (a caller contract, checked).
+/// If `batch == 0`, or on any slice-length/dimension inconsistency (caller contract).
 #[allow(clippy::too_many_arguments)]
 pub fn dense_pre_activation(
     wq: &[i8],
@@ -358,6 +358,9 @@ pub fn dense_pre_activation(
     acc: &mut [i32],
     y: &mut [f32],
 ) {
+    // A zero batch is a meaningless call and would otherwise panic downstream in
+    // `chunks(0)` with an unrelated message; reject it explicitly (contract).
+    assert!(batch > 0, "dense: batch must be nonzero");
     assert_eq!(wq.len(), n_out * k_in, "dense: W must be n_out*k_in");
     assert_eq!(xq.len(), k_in * batch, "dense: X must be k_in*batch");
     assert_eq!(bias.len(), n_out, "dense: bias must be n_out");
@@ -412,7 +415,8 @@ fn infer_forward_checksum() -> i64 {
         *v = infer_fill(t * 7 + 5);
     }
     // Zero biases keep the anchor simple; the mixed-sign weighted sums still drive
-    // ReLU to clamp roughly half the hidden units, so the nonlinearity is exercised.
+    // ReLU to clamp a good fraction of the hidden activations (~38% here, and every
+    // hidden row is mixed-sign), so the nonlinearity is genuinely exercised.
     let b1 = [0f32; HID];
     let b2 = [0f32; OUT];
 
@@ -645,6 +649,17 @@ mod tests {
         dense_pre_activation(&wq, 0.5, &xq, 0.25, &bias, 2, 2, 2, &mut acc, &mut y);
         assert_eq!(acc, [19, 22, 43, 50]);
         assert_eq!(y, [12.375, 12.75, 25.375, 26.25]);
+    }
+
+    #[test]
+    #[should_panic(expected = "batch must be nonzero")]
+    fn dense_rejects_zero_batch() {
+        // A zero batch is internally consistent (all products are 0) but meaningless;
+        // it must fail the explicit contract, not panic later in `chunks(0)`.
+        let bias = [0.0f32; 2];
+        let mut acc = [0i32; 0];
+        let mut y = [0f32; 0];
+        dense_pre_activation(&[], 1.0, &[], 1.0, &bias, 2, 0, 0, &mut acc, &mut y);
     }
 
     #[test]

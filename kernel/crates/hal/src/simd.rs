@@ -41,8 +41,9 @@
 //! wrappers must run with interrupts **disabled** until `XSAVE`-based save/restore
 //! lands: an IRQ landing mid-kernel whose handler the compiler emitted any vector
 //! use into (a `memcpy`/struct copy suffices) would clobber the in-flight
-//! accumulators → silently wrong output. Both current callers run in the
-//! interrupts-off boot window; see [`gemm_i8_avx2`].
+//! accumulators → silently wrong output. All current callers (the boot self-test,
+//! `kernel::ml::prove`, and `kernel::ml::infer_prove`) run in the interrupts-off
+//! boot window; see [`gemm_i8_avx2`].
 //!
 //! **SMP note.** Vector state (`CR4.OSXSAVE` + `XCR0`) is **per-core**; [`enable`]
 //! must run on each AP before any GEMM on that AP once SMP lands (the `*_ready`
@@ -300,9 +301,10 @@ fn self_test_fill(t: usize) -> i8 {
 /// `XSAVE`-based vector save/restore lands: otherwise an IRQ landing mid-kernel,
 /// whose handler the compiler emitted any `XMM` use into (a `memcpy`/struct copy
 /// is enough — it need not touch vectors in source), would clobber the in-flight
-/// accumulators → silently wrong output. Today both callers (the boot self-test in
-/// [`enable`], and `kernel::ml::prove`) run in the interrupts-off boot window; any
-/// future interrupts-on use needs the save/restore first.
+/// accumulators → silently wrong output. Today all callers (the boot self-test in
+/// [`enable`], `kernel::ml::prove`, and `kernel::ml::infer_prove` via the MLP dense
+/// layers) run in the interrupts-off boot window; any future interrupts-on use needs
+/// the save/restore first.
 #[must_use]
 pub fn gemm_i8_avx2(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) -> bool {
     // Validate dimensions with `checked_mul` so a `usize` overflow can never make a

@@ -393,7 +393,9 @@ const ML_GEMM_OK: &str = "int8 GEMM ok";
 /// — not just a bare GEMM — computed the expected result on the active tier.
 const ML_MLP_CHECKSUM: &str = "int8 forward via";
 /// The exact acc2 checksum the MLP proof must print (tier-independent — the int8
-/// GEMMs are bit-exact across tiers and the f32 requant is deterministic).
+/// GEMMs are bit-exact across tiers and the f32 requant is deterministic). Matched
+/// as a substring (like `ML_GEMM_OK`): the checksum is a fixed constant, so there is
+/// no longer value that could prefix-collide in practice.
 const ML_MLP_OK: &str = "acc2 checksum=240475";
 /// Seconds to wait for the boot end-marker before giving up. Generous because
 /// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
