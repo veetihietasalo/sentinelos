@@ -1,16 +1,22 @@
-name: Verify (Miri)
+name: Verify (Miri + Kani)
 
 # Dynamic verification of the unsafe HAL/TCB, kept SEPARATE from Kernel CI so the
 # nightly-only Miri toolchain never touches the stable kernel build. Miri runs the
 # hal unit tests under an interpreter that catches undefined behaviour
 # (out-of-bounds/misaligned pointer use, use-after-free, data races).
 #
-# Kani proof harnesses live in-tree (`#[cfg(kani)]` in cpuid.rs / ata.rs) and are
-# run with `cargo kani -p hal`. A dedicated Kani CI job is deferred until the Kani
-# toolchain is confirmed working on a runner (it neither ran in the dev sandbox nor
-# resolves cleanly against the stable-pinned rust-toolchain.toml here).
+# Kani proof harnesses live in-tree (`#[cfg(kani)]` in hal's cpuid.rs / ata.rs /
+# simd.rs / apic.rs, and kernel's ml.rs) and are run by the `kani` job below with
+# `cargo kani -p hal` and `cargo kani -p kernel`. That job is EXPERIMENTAL
+# (`continue-on-error: true`): the harnesses have never been discharged in CI, only
+# written in-tree and reasoned about locally, since the Kani toolchain cannot fetch
+# its bundle in the dev sandbox. See the `kani` job below for the promotion plan.
 on:
+  # Scoped to main: an unscoped `push:` also fires on PR branches, duplicating
+  # every PR's run (the `push` and `pull_request` events have different
+  # `github.ref` values, so the concurrency group below does not dedupe them).
   push:
+    branches: [main]
     paths:
       - "kernel/**"
       - ".github/workflows/verify.yml"
@@ -44,3 +50,43 @@ jobs:
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
         run: cargo +nightly miri test -p hal --target x86_64-unknown-linux-gnu
+
+      # `kernel`'s full host test suite (fs/wm/app + 16MiB-image-scale loops) is
+      # prohibitively slow under Miri's interpreter, so we scope this to `ml::` —
+      # the int8-quantised GEMM/MLP arithmetic that most benefits from Miri's
+      # UB/pointer-provenance checking. Do not widen this to the whole suite.
+      - name: cargo +nightly miri test -p kernel ml::
+        working-directory: kernel
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu ml::
+
+  # EXPERIMENTAL — non-gating. The in-tree Kani harnesses (`capability_from_flags_
+  # is_total` in kernel::ml, `vnni_bias_correction_is_exact` in hal::simd, plus the
+  # apic decode proofs in hal::apic/cpuid/ata) have never been discharged in CI: the
+  # Kani toolchain cannot fetch its setup bundle in the dev sandbox this repo was
+  # authored in, so `cargo kani setup` and the proofs themselves are UNTESTED here.
+  # `continue-on-error: true` keeps this job from blocking merges until a real CI
+  # run proves the setup + harnesses actually pass; once that is confirmed, promote
+  # this job to gating by deleting `continue-on-error`.
+  kani:
+    name: Kani (proof harnesses) [experimental]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy,llvm-tools
+          targets: x86_64-unknown-none
+      - name: Install kani-verifier
+        run: cargo install --locked kani-verifier
+      - name: cargo kani setup
+        run: cargo kani setup
+      - name: cargo kani -p hal
+        working-directory: kernel
+        run: cargo kani -p hal
+      - name: cargo kani -p kernel
+        working-directory: kernel
+        run: cargo kani -p kernel

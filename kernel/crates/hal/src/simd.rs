@@ -785,8 +785,8 @@ fn scalar_cell(a: &[i8], b: &[i8]) -> i32 {
 mod tests {
     extern crate std;
     use super::{
-        gemm_i8_avx2_impl, gemm_i8_avx512_impl, gemm_i8_avx512vnni_impl, scalar_cell,
-        vnni_cell_bias, Kernel,
+        gemm_i8_avx2, gemm_i8_avx2_impl, gemm_i8_avx512, gemm_i8_avx512_impl, gemm_i8_avx512vnni,
+        gemm_i8_avx512vnni_impl, scalar_cell, vnni_cell_bias, Kernel,
     };
     use std::vec;
     use std::vec::Vec;
@@ -991,9 +991,10 @@ mod tests {
     // (SM1/SM2). The two tests below check it on the **pure model** (`vnni_cell_bias`,
     // no `asm!`), so they run on **every** host — including Miri and non-`avx512vnni`
     // CI runners where the hardware differential tests skip the VNNI kernel — giving
-    // the ring identity an always-on, hardware-independent regression guard. (The
-    // Kani proof `proofs::vnni_bias_correction_is_exact` covers it exhaustively over
-    // symbolic bytes.)
+    // the ring identity an always-on, hardware-independent regression guard. (A Kani
+    // harness — `proofs::vnni_bias_correction_is_exact`, symbolic over the byte
+    // space — is in-tree; it is discharged by the experimental CI Kani job once that
+    // is proven live. Until then these host tests are the enforced guard.)
 
     #[test]
     fn vnni_bias_model_matches_scalar() {
@@ -1038,6 +1039,70 @@ mod tests {
             s,
             "VNNI bias model != scalar across a wrap"
         );
+    }
+
+    /// The public wrapper's rejection paths (`gemm_i8_avx2`/`gemm_i8_avx512`/
+    /// `gemm_i8_avx512vnni`), exercised **without** any feature detection: every
+    /// case here rejects before the `*_ready()` gate would even matter, or — for
+    /// (c) — because the `*_ready` statics are never armed outside a real boot
+    /// (`enable` is the sole writer and it never runs on the host or in tests).
+    /// So this test is hardware-independent and always-on, unlike the differential
+    /// kernels-vs-scalar tests above which need host feature detection.
+    #[test]
+    fn wrappers_reject_bad_dims_and_unready() {
+        type Wrapper = fn(&[i8], &[i8], &mut [i32], usize, usize, usize) -> bool;
+        let wrappers: [(&str, Wrapper); 3] = [
+            ("avx2", gemm_i8_avx2),
+            ("avx512", gemm_i8_avx512),
+            ("avx512vnni", gemm_i8_avx512vnni),
+        ];
+
+        // A sentinel c buffer: if a wrapper returns `false`, it must not have
+        // touched `c` at all, so any survivor value works — use one that could
+        // never arise from a real GEMM accumulation as an extra tripwire.
+        const SENTINEL: i32 = -1;
+
+        // (a) Mismatched slice lengths: `b`/`c` are sized for a 1×2×1 GEMM, but we
+        // ask for 2×2×3 — every wrapper must reject before touching `c`.
+        let a = [1i8, 2];
+        let b = [1i8, 2];
+        for (name, wrapper) in wrappers {
+            let mut c = [SENTINEL; 6];
+            assert!(
+                !wrapper(&a, &b, &mut c, 2, 2, 3),
+                "{name}: mismatched dims must be rejected"
+            );
+            assert_eq!(c, [SENTINEL; 6], "{name}: c must be untouched on rejection");
+        }
+
+        // (b) Overflowing dims: `m * k` overflows `usize`, so the `checked_mul`
+        // guard must reject rather than panicking or silently wrapping into a
+        // bogus (and coincidentally matching) length check.
+        let tiny_a = [1i8, 2];
+        let tiny_b = [3i8, 4];
+        for (name, wrapper) in wrappers {
+            let mut c = [SENTINEL; 2];
+            assert!(
+                !wrapper(&tiny_a, &tiny_b, &mut c, usize::MAX, 2, 1),
+                "{name}: overflowing dims must be rejected"
+            );
+            assert_eq!(c, [SENTINEL; 2], "{name}: c must be untouched on rejection");
+        }
+
+        // (c) Valid, consistent dims (1×2 · 2×1) — but on this host the `*_ready()`
+        // statics are never armed (the sole writer, `enable`, only ever runs once
+        // at real boot), so the not-ready gate must reject every wrapper here even
+        // though the shapes are perfectly well-formed.
+        let a2 = [1i8, 2];
+        let b2 = [3i8, 4];
+        for (name, wrapper) in wrappers {
+            let mut c = [SENTINEL; 1];
+            assert!(
+                !wrapper(&a2, &b2, &mut c, 1, 2, 1),
+                "{name}: not-ready gate must reject on a host that never armed it"
+            );
+            assert_eq!(c, [SENTINEL; 1], "{name}: c must be untouched on rejection");
+        }
     }
 }
 

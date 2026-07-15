@@ -17,6 +17,10 @@
 //! the UART mid-byte and interleaving output. It is **not** a multi-core lock;
 //! SMP synchronisation is a sub-project #2 concern.
 
+// Only the bare-metal `inb`/`outb`/`interrupts_enabled` bodies use inline asm; the
+// host stubs (`not(target_os = "none")`) do not, so this import is bare-metal-only
+// to avoid an unused-import warning on the host test target.
+#[cfg(target_os = "none")]
 use core::arch::asm;
 use core::fmt::{self, Write};
 
@@ -46,6 +50,7 @@ const LSR_THR_EMPTY: u8 = 1 << 5;
 /// a register that is safe to read and that doing so has no
 /// memory-safety-relevant side effects. All call sites in this module read only
 /// 16550 UART registers at the fixed COM1 base, which is a pure device read.
+#[cfg(target_os = "none")]
 #[inline]
 unsafe fn inb(port: u16) -> u8 {
     let value: u8;
@@ -62,6 +67,24 @@ unsafe fn inb(port: u16) -> u8 {
     value
 }
 
+/// Host stub for [`inb`]: `in` is a privileged instruction, so on any target
+/// other than bare-metal (`target_os = "none"`) — kernel-crate **host unit
+/// tests** and Miri, where `hal` is compiled for Linux — executing it would
+/// `#GP` (delivered as SIGSEGV) and kill the whole test process. Returns `0xFF`
+/// (all status bits set) so any "wait for status bit" poll — e.g.
+/// [`Serial::is_transmit_ready`]'s `LSR_THR_EMPTY` check — succeeds immediately
+/// instead of spinning forever.
+///
+/// # Safety
+///
+/// Trivially safe (no side effects); `unsafe` only to keep one signature with
+/// the bare-metal twin.
+#[cfg(not(target_os = "none"))]
+#[inline]
+unsafe fn inb(_port: u16) -> u8 {
+    0xFF
+}
+
 /// Write a byte to the given x86 I/O port.
 ///
 /// # Safety
@@ -70,6 +93,7 @@ unsafe fn inb(port: u16) -> u8 {
 /// therefore `unsafe`. The caller must ensure `port` names a register that is
 /// safe to write with `value`. All call sites in this module write only
 /// 16550 UART configuration/data registers at the fixed COM1 base.
+#[cfg(target_os = "none")]
 #[inline]
 unsafe fn outb(port: u16, value: u8) {
     // SAFETY: `out dx, al` writes the byte in `al` to the I/O port in `dx`. The
@@ -81,6 +105,18 @@ unsafe fn outb(port: u16, value: u8) {
         asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack));
     }
 }
+
+/// Host stub for [`outb`]: `out` is privileged and would `#GP`→SIGSEGV in a
+/// host test process (see [`inb`]'s host stub). Console output is silently
+/// dropped on non-bare-metal targets — host tests assert on return values, not
+/// serial text, and the QEMU boot test asserts the real serial log.
+///
+/// # Safety
+///
+/// Trivially safe (no side effects); `unsafe` only to match the bare-metal twin.
+#[cfg(not(target_os = "none"))]
+#[inline]
+unsafe fn outb(_port: u16, _value: u8) {}
 
 /// A handle to a 16550-compatible UART at a fixed I/O port base.
 ///
@@ -204,6 +240,7 @@ pub fn init() {
 /// Read the current interrupt-enable flag (RFLAGS.IF) so it can be restored.
 ///
 /// Returns `true` if maskable interrupts were enabled.
+#[cfg(target_os = "none")]
 #[inline]
 fn interrupts_enabled() -> bool {
     let flags: u64;
@@ -217,6 +254,17 @@ fn interrupts_enabled() -> bool {
     }
     // Bit 9 of RFLAGS is the interrupt-enable flag (IF).
     (flags & (1 << 9)) != 0
+}
+
+/// Host stub for [`interrupts_enabled`]: `pushfq` is unprivileged but Miri
+/// cannot interpret inline asm, and on the host the kernel's IF-state model is
+/// meaningless anyway. Returns `false` so [`with_console`] never calls the
+/// (no-op) enable path — matching the interrupts-off convention of the paths
+/// host tests exercise.
+#[cfg(not(target_os = "none"))]
+#[inline]
+fn interrupts_enabled() -> bool {
+    false
 }
 
 /// Run `f` with maskable interrupts disabled, restoring the previous interrupt

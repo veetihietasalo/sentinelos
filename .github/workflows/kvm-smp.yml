@@ -16,7 +16,11 @@ name: SMP KVM proof (x2APIC enable path)
 # has to come from real hardware via `make test-kvm` (see the SMP design doc).
 
 on:
+  # Scoped to main: an unscoped `push:` also fires on PR branches, duplicating
+  # every PR's run (the `push` and `pull_request` events have different
+  # `github.ref` values, so the concurrency group below does not dedupe them).
   push:
+    branches: [main]
     paths:
       - "kernel/**"
       - ".github/workflows/kvm-smp.yml"

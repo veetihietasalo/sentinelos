@@ -17,6 +17,7 @@ use core::arch::asm;
 /// This is a safe wrapper: clearing the interrupt flag cannot, on its own,
 /// violate Rust's memory-safety invariants. It is exposed so that higher-level
 /// safe code can establish short critical sections without `unsafe`.
+#[cfg(target_os = "none")]
 #[inline]
 pub fn disable_interrupts() {
     // SAFETY: `cli` clears the interrupt-enable flag (IF) in RFLAGS. It touches
@@ -29,6 +30,16 @@ pub fn disable_interrupts() {
     }
 }
 
+/// Host stub for [`disable_interrupts`]: `cli` is privileged, so in a host test
+/// process (kernel-crate unit tests, Miri — `hal` compiled for Linux) it would
+/// `#GP` (delivered as SIGSEGV) and kill the whole test binary; this was the
+/// root cause of `cargo test -p kernel` crashing whenever a tested code path
+/// logged via `hal::serial` (fs/wm/app tests). No-op on non-bare-metal targets:
+/// there is no kernel interrupt state to mask on the host.
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn disable_interrupts() {}
+
 /// Enable maskable hardware interrupts on the current CPU (`sti`).
 ///
 /// After this call the CPU will (subject to the interrupt-shadow of `sti`)
@@ -40,6 +51,7 @@ pub fn disable_interrupts() {
 /// violate Rust's memory-safety invariants. Whether an interrupt *handler* is
 /// safe to run is the responsibility of whoever installed the IDT (out of scope
 /// for sub-project #1, where no interrupt handlers are installed).
+#[cfg(target_os = "none")]
 #[inline]
 pub fn enable_interrupts() {
     // SAFETY: `sti` sets the interrupt-enable flag (IF) in RFLAGS. It touches no
@@ -52,6 +64,16 @@ pub fn enable_interrupts() {
         asm!("sti", options(nomem, nostack));
     }
 }
+
+/// Host stub for [`enable_interrupts`]: `sti` is privileged, so in a host test
+/// process (kernel-crate unit tests, Miri — `hal` compiled for Linux) it would
+/// `#GP` (delivered as SIGSEGV) and kill the whole test binary; this was the
+/// root cause of `cargo test -p kernel` crashing whenever a tested code path
+/// logged via `hal::serial` (fs/wm/app tests). No-op on non-bare-metal targets:
+/// there is no kernel interrupt state to unmask on the host.
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn enable_interrupts() {}
 
 /// Raise a breakpoint exception (`int3`, vector 3) on the current CPU.
 ///

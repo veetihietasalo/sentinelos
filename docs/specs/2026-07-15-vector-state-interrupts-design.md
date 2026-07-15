@@ -143,3 +143,27 @@ C13). `kernel` stays `#![forbid(unsafe_code)]`.
   stack-overflow backstop.
 - **Preemptive context switch (future).** A switch resuming a different task's vector
   code needs per-task save via C13/C14 — no preemptive scheduler exists yet.
+
+## Recorded decision — per-IRQ save retention
+
+The per-IRQ `xsave`/`xrstor` in `isr_common` is **acknowledged as redundant** with
+the load-bearing guard on this target: `cargo xtask check-no-vector` already
+machine-checks that no compiled interrupt handler contains a vector instruction, so
+on `x86_64-unknown-none` today, no handler ever touches `YMM`/`ZMM`/MXCSR state and
+the per-IRQ save never has anything to protect against in practice.
+
+It is **retained deliberately** as defense-in-depth against target/`target_feature`
+drift — the one scenario where it *would* become load-bearing: if a future compiler
+version, a changed `-C target-feature` baseline, a new dependency, or a refactor ever
+caused a handler (or code it calls) to emit a vector instruction without the guard
+being run or updated in lockstep, the per-IRQ save is the only thing standing between
+that regression and silent GEMM corruption under interrupts. Belt-and-braces is the
+appropriate posture for a TCB primitive whose failure mode is silent data corruption,
+not a crash.
+
+This was the explicit outcome of kernel-reviewer's PR #16 review and the security
+team's review of this design: both concluded the redundancy is intentional and
+should stay, rather than being trimmed as dead weight. Revisit this decision if IRQ
+latency ever becomes a measured concern (the per-IRQ save is not free — see
+"Per-interrupt stack cost" above — but no latency budget exists yet to weigh it
+against).

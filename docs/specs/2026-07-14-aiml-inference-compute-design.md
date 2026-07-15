@@ -79,17 +79,20 @@ prints both `detected` and `active` so the gap is visible, not hidden.
   `quantize(&[f32], scale, &mut [i8])`, `dequantize(i32, scale_a, scale_b) -> f32`.
 - **GEMM** — `gemm_i8_scalar(a, b, c, m, k, n)`: row-major `C[m×n] = A[m×k]·B[k×n]`
   with i32 accumulation; `gemm_i8(...)` is the tier-dispatching public entry.
-- **Dispatch** — `capability_from_flags(...)` (pure, unit + candidate-Kani
-  tested) maps detected flags → `Tier`; `detected_capability(&CpuInfo)` reads them
-  via the `Feature` list.
+- **Dispatch** — `capability_from_flags(...)` (pure, host-unit-tested; a Kani
+  harness — `capability_from_flags_is_total` — is written in-tree but only
+  discharged by the experimental CI Kani job once it is proven live; until then
+  the always-on host tests are the enforced guard) maps detected flags → `Tier`;
+  `detected_capability(&CpuInfo)` reads them via the `Feature` list.
 - **Boot proof** — `ml::prove()` runs a real int8 GEMM (a 4×4 `identity · B = B`
-  with a 4×**12** `B` so, on the AVX2 tier, the 256-bit vector path executes, not
-  just the scalar tail), checks the i32 checksum against a compile-time constant,
-  and logs `[ml] inference: detected=…, active=…; 4x4*4x12 int8 GEMM ok;
-  checksum=1128` before `boot-bringup-ok`. Under the boot test's `-cpu Haswell`,
-  `detected=avx2` (Haswell has AVX2) but `active=scalar` — the AVX2 self-test fails
-  under TCG (see Phase 2), so it correctly falls back. On real hardware / KVM,
-  `active=avx2`.
+  with a 4×**20** `B` so, on the AVX2 tier, the 256-bit vector path executes a full
+  block, not just the scalar tail), checks the i32 checksum against a compile-time
+  constant, and logs `[ml] inference: detected=…, active=…; 4x4*4x20 int8 GEMM ok;
+  checksum=3160` before `boot-bringup-ok`. Under the boot test's `-cpu Haswell`,
+  `detected=avx2` **and** `active=avx2`: the AVX2 `asm!` kernel fix (Phase 2) made
+  the self-test pass under TCG too, and `xtask`'s boot-test assertion now *enforces*
+  a vector tier — a `active=scalar` fallback under Haswell fails the test, not just
+  logs a note. `active=scalar` never happens on any CI/boot path today.
 
 No TCB change: it only *reads* the existing safe `cpuid::info()` and computes.
 
@@ -261,10 +264,16 @@ bug diverges far past it). This confirms the pipeline computes the *right functi
 not merely a self-consistent one.
 
 **Limits (honest).** This is one tiny fixed network; there is no model-loading, no
-attention/conv, no bf16. And like all vector GEMM here it must run
-**interrupts-disabled** (the ISR stubs don't save vector state), so today it only
-runs in the boot window — lifting that needs `XSAVE`-based save/restore in the
-interrupt path (the next enabling step for inference in a live, scheduled system).
+attention/conv, no bf16. Interrupts-on is now safe: the "handlers are vector-free"
+CI guard (`xtask check-no-vector`) machine-checks that no compiled interrupt
+handler emits a vector instruction, and `hal::idt::isr_common` additionally
+`XSAVE`s/`XRSTOR`s the vector state per IRQ as defense-in-depth — see
+`2026-07-15-vector-state-interrupts-design.md` for the full argument and
+`ml::prove_interrupts_on`'s bit-exact-under-timer-pressure stress test. The
+remaining boundary is a **future preemptive context switch**: today the kernel
+never switches tasks mid-GEMM, so per-task vector-state save/restore across a
+context switch is not yet implemented — that is the next enabling step for
+inference in a live, scheduled system, not interrupts-on GEMM (already lifted).
 
 ## Testing
 
@@ -306,9 +315,13 @@ interrupt path (the next enabling step for inference in a live, scheduled system
   host. Because that hardware differential test **skips** on stock CI runners, the
   novel part — the unsigned/signed **bias-correction ring identity** — also gets an
   *always-on, hardware-independent* guard: a pure model (`vnni_cell_bias`, no `asm!`)
-  proven equal to the scalar dot product by a Kani harness (symbolic bytes) and by
-  host tests that run on **every** runner and under Miri (a 2000-shape sweep + a
-  wrap case). TCG cannot execute the kernel, so the always-on Kernel CI shows
+  checked equal to the scalar dot product by host tests that run on **every**
+  runner and under Miri (a 2000-shape sweep + a wrap case). A Kani harness
+  (`vnni_bias_correction_is_exact`, symbolic bytes) is also written in-tree
+  (`#[cfg(kani)]`), but it is discharged only by the experimental CI Kani job —
+  it has never been proven live in CI, so it is not yet the enforced guard; the
+  always-on host tests + Miri are. TCG cannot execute the kernel, so the always-on
+  Kernel CI shows
   `active=avx2`; the KVM boot job asserts `active=avx512-vnni` + `int8 GEMM ok` on
   runners that expose VNNI — **observed** on the tier's first CI run (serial log
   archived), which also confirms the AVX-512 `XCR0` enablement + the AVX-512F self-
