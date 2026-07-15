@@ -223,6 +223,49 @@ also needs XSAVE area management if we ever context-switch mid-tile (deferred:
 phase-1 inference runs to completion in one kernel call, no preemption). Validated
 against the scalar reference bit-for-bit, exactly like phase 2.
 
+## Inference workloads — quantized MLP (**implemented**)
+
+The tiers above are *primitives* (a GEMM, quantization, dispatch). This is the first
+real **workload** built on them — a batched quantized 2-layer MLP forward pass — so
+the path is exercised as *inference*, and the quantization API (`quant_scale` /
+`quantize` / `dequantize`) is wired end-to-end instead of being test-only. All
+**safe** Rust on the safe primitives; no new TCB.
+
+**Composition** (`kernel::ml`): `quantize_tensor` (a `quant_scale` + `quantize`
+wrapper) and `dense_pre_activation` — one dense layer over a batch,
+`Y[n_out×batch] = dequant(Wq[n_out×k_in] · Xq[k_in×batch]) + bias`, running the int8
+GEMM through the tiered `gemm_i8`, dequantizing with both per-tensor scales, adding a
+broadcast bias. A forward pass chains: quantize inputs+weights → dense (layer 1) →
+dequant+bias → `relu_inplace` → `quantize_tensor` (requantize) → dense (layer 2) →
+dequant+bias. Every buffer is caller-owned, so it allocates nothing.
+
+**Why batched.** A plain matrix-vector product (`W·x`) has GEMM `n = 1`, which stays
+on the scalar tail and never touches the vector kernels. Processing a **batch** of
+columns (`batch ≥ 16`) makes the GEMM's `n` large enough to engage the active vector
+tier — so inference actually runs on AVX2/AVX-512/VNNI, not just scalar.
+
+**Boot proof** (`infer_prove`, in `kmain` after `prove`): runs a fixed 4→8→3,
+`batch = 16` MLP with deterministic weights and checksums the final int32
+accumulator against a constant (`240475`). That checksum is **exact and
+tier-independent** — the int8 GEMMs are bit-exact across every tier and the f32
+requant between layers is deterministic (IEEE-754 correctly-rounded) — so it holds
+whether the active tier is scalar, AVX2, AVX-512F, or VNNI. Boot line:
+`[ml] mlp: 4-8-3 batch16 int8 forward via <tier> ok; acc2 checksum=240475`, asserted
+by the xtask boot test (TCG + KVM).
+
+**Verification.** Host tests: a hand-checked dense layer (exact integer GEMM + exact
+power-of-two scales), the checksum-stability guard, and — the key numeric test — the
+quantized MLP output compared against a **pure-f32 reference** forward pass, asserting
+it stays within a small quantization tolerance (a transposed-weights or wrong-scale
+bug diverges far past it). This confirms the pipeline computes the *right function*,
+not merely a self-consistent one.
+
+**Limits (honest).** This is one tiny fixed network; there is no model-loading, no
+attention/conv, no bf16. And like all vector GEMM here it must run
+**interrupts-disabled** (the ISR stubs don't save vector state), so today it only
+runs in the boot window — lifting that needs `XSAVE`-based save/restore in the
+interrupt path (the next enabling step for inference in a live, scheduled system).
+
 ## Testing
 
 - **Phase 1 (now):** host unit tests for `gemm_i8_scalar` (identity, a hand-checked

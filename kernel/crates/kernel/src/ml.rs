@@ -301,6 +301,178 @@ pub fn prove() {
     hal::serial::write_str("\n");
 }
 
+// ── quantized MLP inference — the first end-to-end workload ─────────────────────
+//
+// Everything above is a *primitive* (a GEMM, quantization, tier dispatch). This
+// section composes them into an actual (tiny) neural-network forward pass, so the
+// AI/ML path is exercised as *inference*, not just a bare matrix multiply — and the
+// quantization API stops being test-only. It is entirely **safe** Rust built on the
+// safe primitives; no new TCB.
+
+/// ReLU activation, in place: `y := max(0, y)`. (`core` has no `f32::max`, and there
+/// is no libm in the kernel, so compute it directly.)
+fn relu_inplace(y: &mut [f32]) {
+    for v in y.iter_mut() {
+        if *v < 0.0 {
+            *v = 0.0;
+        }
+    }
+}
+
+/// Quantize a whole f32 tensor into `out` (symmetric int8), returning the scale it
+/// used — the standard "quantize this tensor" step ([`quant_scale`] + [`quantize`]).
+///
+/// # Panics
+/// If `values.len() != out.len()` (via [`quantize`]).
+pub fn quantize_tensor(values: &[f32], out: &mut [i8]) -> f32 {
+    let scale = quant_scale(values);
+    quantize(values, scale, out);
+    scale
+}
+
+/// One dense (fully-connected) layer over a **batch**, pre-activation:
+///
+/// `Y[n_out × batch] = dequant( Wq[n_out × k_in] · Xq[k_in × batch] ) + bias`
+///
+/// The int8·int8→i32 GEMM runs through the tiered [`gemm_i8`] (so it uses the best
+/// implemented vector tier), the i32 result is dequantized to f32 with the two
+/// per-tensor scales, and `bias[i]` is added to every column of output row `i`.
+/// Processing `batch` columns at once is what makes the GEMM's `n` dimension large
+/// enough to engage the vector kernels — a plain matrix-vector product (`batch = 1`)
+/// would stay on the scalar tail. Every buffer is caller-owned, so this allocates
+/// nothing; `acc` is `n_out × batch` i32 scratch (also left holding the raw GEMM
+/// output, which callers use as a deterministic checksum anchor).
+///
+/// # Panics
+/// If `batch == 0`, or on any slice-length/dimension inconsistency (caller contract).
+#[allow(clippy::too_many_arguments)]
+pub fn dense_pre_activation(
+    wq: &[i8],
+    sw: f32,
+    xq: &[i8],
+    sx: f32,
+    bias: &[f32],
+    n_out: usize,
+    k_in: usize,
+    batch: usize,
+    acc: &mut [i32],
+    y: &mut [f32],
+) {
+    // A zero batch is a meaningless call and would otherwise panic downstream in
+    // `chunks(0)` with an unrelated message; reject it explicitly (contract).
+    assert!(batch > 0, "dense: batch must be nonzero");
+    assert_eq!(wq.len(), n_out * k_in, "dense: W must be n_out*k_in");
+    assert_eq!(xq.len(), k_in * batch, "dense: X must be k_in*batch");
+    assert_eq!(bias.len(), n_out, "dense: bias must be n_out");
+    assert_eq!(acc.len(), n_out * batch, "dense: acc must be n_out*batch");
+    assert_eq!(y.len(), n_out * batch, "dense: y must be n_out*batch");
+    gemm_i8(wq, xq, acc, n_out, k_in, batch);
+    // Dequantize each i32 accumulator to f32 and add the per-row bias (broadcast
+    // across the batch). `acc`/`y` are `n_out` rows of `batch` columns, row-major.
+    for ((&bi, acc_row), y_row) in bias.iter().zip(acc.chunks(batch)).zip(y.chunks_mut(batch)) {
+        for (yv, &av) in y_row.iter_mut().zip(acc_row) {
+            *yv = dequantize(av, sw, sx) + bi;
+        }
+    }
+}
+
+// ── inference boot proof ────────────────────────────────────────────────────────
+
+/// Checksum of the MLP boot proof's final int32 accumulator — a stable,
+/// tier-independent regression anchor: the int8 GEMMs are bit-exact across every
+/// tier and the f32 requant between layers is deterministic, so this integer is
+/// fixed. Guarded against drift by the host test `mlp_boot_proof_checksum_is_stable`.
+const INFER_CHECKSUM: i64 = 240475;
+
+/// Deterministic f32 in `[-1, 1)` for the fixed-weight inference boot proof (no rng).
+fn infer_fill(t: usize) -> f32 {
+    let v = (t.wrapping_mul(2_654_435_761) >> 8) % 256;
+    v as f32 / 128.0 - 1.0
+}
+
+/// The fixed batched 2-layer MLP forward pass shared by [`infer_prove`] and its host
+/// test: returns the checksum of the final int32 accumulator. Architecture 4→8→3
+/// with ReLU, `batch = 16`. Composes the full quantized-inference pipeline —
+/// quantize inputs+weights → int8 GEMM (layer 1) → dequant+bias → ReLU → requantize
+/// → int8 GEMM (layer 2) — through the live tiered [`gemm_i8`]. Alloc-free (fixed
+/// stack buffers); `batch = 16` so each layer's GEMM engages the active vector tier.
+fn infer_forward_checksum() -> i64 {
+    const IN: usize = 4;
+    const HID: usize = 8;
+    const OUT: usize = 3;
+    const B: usize = 16;
+
+    let mut x = [0f32; IN * B];
+    for (t, v) in x.iter_mut().enumerate() {
+        *v = infer_fill(t);
+    }
+    let mut w1 = [0f32; HID * IN];
+    for (t, v) in w1.iter_mut().enumerate() {
+        *v = infer_fill(t * 3 + 1);
+    }
+    let mut w2 = [0f32; OUT * HID];
+    for (t, v) in w2.iter_mut().enumerate() {
+        *v = infer_fill(t * 7 + 5);
+    }
+    // Zero biases keep the anchor simple; the mixed-sign weighted sums still drive
+    // ReLU to clamp a good fraction of the hidden activations (~38% here, and every
+    // hidden row is mixed-sign), so the nonlinearity is genuinely exercised.
+    let b1 = [0f32; HID];
+    let b2 = [0f32; OUT];
+
+    let mut xq = [0i8; IN * B];
+    let sx = quantize_tensor(&x, &mut xq);
+    let mut w1q = [0i8; HID * IN];
+    let sw1 = quantize_tensor(&w1, &mut w1q);
+
+    // Layer 1: H = ReLU(dequant(W1·X)).
+    let mut acc1 = [0i32; HID * B];
+    let mut h = [0f32; HID * B];
+    dense_pre_activation(&w1q, sw1, &xq, sx, &b1, HID, IN, B, &mut acc1, &mut h);
+    relu_inplace(&mut h);
+
+    // Requantize the hidden activations; quantize layer-2 weights.
+    let mut hq = [0i8; HID * B];
+    let sh = quantize_tensor(&h, &mut hq);
+    let mut w2q = [0i8; OUT * HID];
+    let sw2 = quantize_tensor(&w2, &mut w2q);
+
+    // Layer 2: Y = dequant(W2·H).
+    let mut acc2 = [0i32; OUT * B];
+    let mut y = [0f32; OUT * B];
+    dense_pre_activation(&w2q, sw2, &hq, sh, &b2, OUT, HID, B, &mut acc2, &mut y);
+
+    acc2.iter().map(|&v| v as i64).sum()
+}
+
+/// Run a real **batched quantized 2-layer MLP** forward pass through the live
+/// inference path and log the result — proving end-to-end inference works in the
+/// booted kernel, not just a bare GEMM. Self-validates by checksumming the final
+/// int32 accumulator (exact + tier-independent) against [`INFER_CHECKSUM`]; a
+/// mismatch means a tier computed the pipeline wrong. Prints via the fmt-free serial
+/// helpers (integer `println!` faults on this target — see `memory.rs`).
+pub fn infer_prove() {
+    let checksum = infer_forward_checksum();
+    let active = active_tier();
+
+    hal::serial::write_str("[ml] mlp: 4-8-3 batch16 int8 forward via ");
+    hal::serial::write_str(active.label());
+    hal::serial::write_str(if checksum == INFER_CHECKSUM {
+        " ok"
+    } else {
+        " FAIL"
+    });
+    hal::serial::write_str("; acc2 checksum=");
+    // The accumulator sum can be negative; `write_dec` takes u64, so emit the sign.
+    if checksum < 0 {
+        hal::serial::write_str("-");
+        hal::serial::write_dec((-checksum) as u64);
+    } else {
+        hal::serial::write_dec(checksum as u64);
+    }
+    hal::serial::write_str("\n");
+}
+
 // ── unit tests (host) ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -458,6 +630,133 @@ mod tests {
         assert_eq!(
             capability_from_flags(false, true, false, false, false),
             Tier::Scalar
+        );
+    }
+
+    // ── inference (MLP) ──────────────────────────────────────────────────────
+
+    #[test]
+    fn dense_pre_activation_hand_checked() {
+        // W [2×2] = [[1,2],[3,4]], X [2×batch=2] = cols (5,7),(6,8); pre-quantized
+        // int8 with scales sw=0.5, sx=0.25 (both exact powers of two → exact f32).
+        // acc = W·X = [[1*5+2*7, 1*6+2*8],[3*5+4*7, 3*6+4*8]] = [[19,22],[43,50]].
+        // y = acc*sw*sx + bias = acc*0.125 + [10, 20].
+        let wq = [1i8, 2, 3, 4];
+        let xq = [5i8, 6, 7, 8];
+        let bias = [10.0f32, 20.0];
+        let mut acc = [0i32; 4];
+        let mut y = [0f32; 4];
+        dense_pre_activation(&wq, 0.5, &xq, 0.25, &bias, 2, 2, 2, &mut acc, &mut y);
+        assert_eq!(acc, [19, 22, 43, 50]);
+        assert_eq!(y, [12.375, 12.75, 25.375, 26.25]);
+    }
+
+    #[test]
+    #[should_panic(expected = "batch must be nonzero")]
+    fn dense_rejects_zero_batch() {
+        // A zero batch is internally consistent (all products are 0) but meaningless;
+        // it must fail the explicit contract, not panic later in `chunks(0)`.
+        let bias = [0.0f32; 2];
+        let mut acc = [0i32; 0];
+        let mut y = [0f32; 0];
+        dense_pre_activation(&[], 1.0, &[], 1.0, &bias, 2, 0, 0, &mut acc, &mut y);
+    }
+
+    #[test]
+    fn mlp_boot_proof_checksum_is_stable() {
+        // Guards INFER_CHECKSUM against drift. The pipeline is deterministic and
+        // tier-independent (int8 GEMMs are bit-exact across tiers; the f32 requant
+        // is deterministic), so this holds on whatever tier the host runs.
+        assert_eq!(infer_forward_checksum(), INFER_CHECKSUM);
+    }
+
+    #[test]
+    fn mlp_approximates_f32_reference() {
+        // The quantized 2-layer MLP must compute the *right function*: its output
+        // stays close to a pure-f32 forward pass (int8 quant of ~[-1,1] values only
+        // introduces small per-tensor rounding error). A transposed-weights or
+        // wrong-scale bug would diverge far past this tolerance.
+        const IN: usize = 4;
+        const HID: usize = 6;
+        const OUT: usize = 2;
+        const B: usize = 8;
+        let mut x = [0f32; IN * B];
+        for (t, v) in x.iter_mut().enumerate() {
+            *v = infer_fill(t + 11);
+        }
+        let mut w1 = [0f32; HID * IN];
+        for (t, v) in w1.iter_mut().enumerate() {
+            *v = infer_fill(t * 5 + 2);
+        }
+        let mut w2 = [0f32; OUT * HID];
+        for (t, v) in w2.iter_mut().enumerate() {
+            *v = infer_fill(t * 9 + 4);
+        }
+
+        // Pure-f32 reference forward: relu(W1·X) then W2·(·), zero biases.
+        let mut h_ref = [0f32; HID * B];
+        for i in 0..HID {
+            for j in 0..B {
+                let mut acc = 0.0f32;
+                for p in 0..IN {
+                    acc += w1[i * IN + p] * x[p * B + j];
+                }
+                h_ref[i * B + j] = if acc < 0.0 { 0.0 } else { acc };
+            }
+        }
+        let mut y_ref = [0f32; OUT * B];
+        for i in 0..OUT {
+            for j in 0..B {
+                let mut acc = 0.0f32;
+                for p in 0..HID {
+                    acc += w2[i * HID + p] * h_ref[p * B + j];
+                }
+                y_ref[i * B + j] = acc;
+            }
+        }
+
+        // Quantized forward through the real primitives.
+        let mut xq = [0i8; IN * B];
+        let sx = quantize_tensor(&x, &mut xq);
+        let mut w1q = [0i8; HID * IN];
+        let sw1 = quantize_tensor(&w1, &mut w1q);
+        let mut acc1 = [0i32; HID * B];
+        let mut h = [0f32; HID * B];
+        let zb1 = [0f32; HID];
+        dense_pre_activation(&w1q, sw1, &xq, sx, &zb1, HID, IN, B, &mut acc1, &mut h);
+        relu_inplace(&mut h);
+        let mut hq = [0i8; HID * B];
+        let sh = quantize_tensor(&h, &mut hq);
+        let mut w2q = [0i8; OUT * HID];
+        let sw2 = quantize_tensor(&w2, &mut w2q);
+        let mut acc2 = [0i32; OUT * B];
+        let mut y = [0f32; OUT * B];
+        let zb2 = [0f32; OUT];
+        dense_pre_activation(&w2q, sw2, &hq, sh, &zb2, OUT, HID, B, &mut acc2, &mut y);
+
+        // Compare against the reference; tolerate quantization error, catch wiring bugs.
+        let mut range = 0.0f32;
+        for &r in &y_ref {
+            let a = if r < 0.0 { -r } else { r };
+            if a > range {
+                range = a;
+            }
+        }
+        let mut max_err = 0.0f32;
+        for (&yq, &yr) in y.iter().zip(&y_ref) {
+            let e = yq - yr;
+            let e = if e < 0.0 { -e } else { e };
+            if e > max_err {
+                max_err = e;
+            }
+        }
+        assert!(
+            range > 0.1,
+            "reference output is degenerate (range={range})"
+        );
+        assert!(
+            max_err < 0.1 * range,
+            "quantized MLP diverged from f32 reference: max_err={max_err}, range={range}"
         );
     }
 }
