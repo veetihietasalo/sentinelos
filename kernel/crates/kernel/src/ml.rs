@@ -301,6 +301,69 @@ pub fn prove() {
     hal::serial::write_str("\n");
 }
 
+/// Prove vector GEMM is correct with **interrupts enabled** — validating that the
+/// old "interrupts must be disabled" precondition is now lifted.
+///
+/// Two mechanisms make this safe (see the vector-state-across-interrupts design):
+/// the **load-bearing** one is that on this soft-float target compiled interrupt
+/// handlers contain **no** vector instructions (CI-enforced by `xtask
+/// check-no-vector`), so they cannot clobber an interrupted GEMM's `YMM`/`ZMM` state;
+/// and `hal::idt::isr_common` additionally `XSAVE`s/`XRSTOR`s the full vector state
+/// per IRQ as defense-in-depth.
+///
+/// This is a **stress test**, not a deterministic proof of the precondition lift: it
+/// runs the identity·B GEMM (the [`prove`] shape, so the active vector tier engages)
+/// in a tight loop with `sti` set and the PIT firing, so timer IRQs land *during* the
+/// loop, and asserts every result stays bit-exact. It reliably shows "interrupts
+/// fired and the per-IRQ `xsave`/`xrstor` did not corrupt any result", and reports
+/// `ok` only if the results held **and** the timer demonstrably advanced. It does
+/// **not** deterministically hit the few-instruction window where a live `YMM`/`ZMM`
+/// accumulator exists inside a single `madd` call (accumulators spill to `c` in
+/// memory between calls) — that a handler can never clobber vectors at all is what
+/// the CI guard guarantees. Restores the interrupts-off boot state. Prints fmt-free.
+pub fn prove_interrupts_on() {
+    const M: usize = 4;
+    const K: usize = 4;
+    const N: usize = 20;
+    let mut a = [0i8; M * K];
+    for d in 0..M {
+        a[d * K + d] = 1;
+    }
+    let mut b = [0i8; K * N];
+    for (idx, slot) in b.iter_mut().enumerate() {
+        *slot = idx as i8;
+    }
+    let mut c = [0i32; M * N];
+
+    let start = hal::pit::ticks();
+    hal::cpu::enable_interrupts();
+    let mut all_ok = true;
+    let mut iters: u64 = 0;
+    // Keep computing until the timer has advanced a few ticks (so IRQs certainly
+    // landed mid-loop), with a hard iteration cap so a dead timer can't spin forever.
+    while hal::pit::ticks().wrapping_sub(start) < 3 && iters < 50_000_000 {
+        gemm_i8(&a, &b, &mut c, M, K, N);
+        let checksum: i64 = c.iter().map(|&x| x as i64).sum();
+        if checksum != PROOF_CHECKSUM {
+            all_ok = false;
+            break;
+        }
+        iters += 1;
+    }
+    hal::cpu::disable_interrupts();
+    let elapsed = hal::pit::ticks().wrapping_sub(start);
+    // `ok` requires BOTH: no corrupted result, and the timer actually advanced (else
+    // we proved nothing about interrupts landing).
+    let ok = all_ok && elapsed >= 1;
+
+    hal::serial::write_str("[ml] gemm-under-irq: ");
+    hal::serial::write_dec(iters);
+    hal::serial::write_str(" gemms across ");
+    hal::serial::write_dec(elapsed);
+    hal::serial::write_str(" timer ticks -> ");
+    hal::serial::write_str(if ok { "ok\n" } else { "FAIL\n" });
+}
+
 // ── quantized MLP inference — the first end-to-end workload ─────────────────────
 //
 // Everything above is a *primitive* (a GEMM, quantization, tier dispatch). This

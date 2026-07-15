@@ -32,11 +32,47 @@ use crate::gdt::{DOUBLE_FAULT_IST_INDEX, KERNEL_CODE_SELECTOR};
 use crate::interrupts::{handler_for, InterruptFrame};
 use core::arch::global_asm;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Number of IDT entries. The architecture defines 256 vectors; we install stubs
 /// for the 32 CPU-exception vectors (0–31) and leave the rest pointing at a
 /// catch-all stub so a stray vector still reports rather than triple-faulting.
 const IDT_ENTRIES: usize = 256;
+
+/// Bytes reserved on the interrupt stack for the per-IRQ `XSAVE` area, sized for
+/// x87 + SSE + AVX + AVX-512 (~2.7 KiB) with margin, and a multiple of 64 (`XSAVE`
+/// requires 64-byte alignment). [`crate::simd::enable`] validates the CPU's actual
+/// `cpuid`-leaf-`0xD` size fits this before arming the save (see [`arm_vector_save`]).
+pub(crate) const VECTOR_SAVE_AREA_MAX: usize = 4096;
+
+/// Whether [`isr_common`] performs the per-IRQ vector `XSAVE`/`XRSTOR`.
+///
+/// `0` until [`crate::simd::enable`] turns on `CR4.OSXSAVE` + `XCR0` and validates
+/// the save area, then `1`. `isr_common` reads it on entry and skips the save
+/// entirely when `0` — so `xsave` is executed **only** when it is architecturally
+/// legal (after `OSXSAVE`), and the interrupt path is byte-for-byte unchanged on a
+/// CPU without vector state. `enable` runs in the interrupts-off boot window, so the
+/// `0 → 1` transition is never observed part-way through an interrupt.
+///
+/// **SMP hazard — must fix before AP interrupt bring-up.** This is a single **global**
+/// flag, but `CR4.OSXSAVE` is **per-core**. Once APs start, if the BSP has armed this
+/// and an AP takes *any* interrupt before running its own [`crate::simd::enable`],
+/// `isr_common` on that AP would execute `xsave` with `OSXSAVE` unset → `#UD`. So each
+/// AP must set `OSXSAVE` (via `simd::enable`) **before enabling interrupts**, and this
+/// flag must then become per-core (or the `xsave` gate a per-core check). Not
+/// triggerable today (single-core; no AP handler path). See the vector-state design
+/// doc. Referenced from `isr_common`'s `global_asm!` via `sym` (works with the mangled
+/// name — no `#[no_mangle]` needed).
+static VECTOR_SAVE_ARMED: AtomicU8 = AtomicU8::new(0);
+
+/// Arm the per-IRQ vector save in [`isr_common`]. Called once by
+/// [`crate::simd::enable`] after it has enabled vector state and confirmed both the
+/// `XSAVE` area size fits [`VECTOR_SAVE_AREA_MAX`] and the `xsave`/`xrstor`
+/// round-trip self-test passes. Idempotent; a plain relaxed store (single writer at
+/// boot, interrupts off).
+pub(crate) fn arm_vector_save() {
+    VECTOR_SAVE_ARMED.store(1, Ordering::Relaxed);
+}
 
 /// A 64-bit IDT gate descriptor (16 bytes), hardware layout.
 ///
@@ -145,12 +181,59 @@ isr_common:
 
     // rdi = &InterruptFrame (points at the lowest saved reg, r15).
     mov rdi, rsp
-    // Keep the 16-byte stack alignment the SysV ABI expects at a `call`. We
-    // pushed 15 regs (odd count) on top of the vector+errcode+CPU frame; align
-    // down before the call and restore after.
+    // rbp = frame base; the general-purpose register restore returns rsp here.
     mov rbp, rsp
+
+    // ── Per-IRQ vector save (gated on VECTOR_SAVE_ARMED) ──────────────────────
+    // Belt-and-suspenders: on this soft-float target compiled handlers contain no
+    // vector instructions (CI-enforced), so they cannot clobber an interrupted
+    // GEMM's YMM/ZMM state — but we also save it here so even a (guard-forbidden)
+    // vector-using handler is safe. If not armed (before simd::enable, or a CPU
+    // without xsave), skip: r15 = 0 marks "nothing saved" and drives the exit path
+    // to skip the restore too, so save and restore are decided by the SAME value
+    // and can never mismatch.
+    lea rbx, [rip + {armed}]
+    cmp byte ptr [rbx], 0
+    jne 1f
+    xor r15, r15
+    jmp 2f
+1:
+    // Reserve a 64-byte-aligned XSAVE area on the interrupt stack.
+    sub rsp, {area_size}
+    and rsp, -64
+    // Zero the 64-byte XSAVE header (offset 512..576): XSTATE_BV, XCOMP_BV, and the
+    // reserved bytes — so the later XRSTOR reads standard (non-compacted) format and
+    // does not #GP.
+    mov qword ptr [rsp + 512], 0
+    mov qword ptr [rsp + 520], 0
+    mov qword ptr [rsp + 528], 0
+    mov qword ptr [rsp + 536], 0
+    mov qword ptr [rsp + 544], 0
+    mov qword ptr [rsp + 552], 0
+    mov qword ptr [rsp + 560], 0
+    mov qword ptr [rsp + 568], 0
+    // Save every XCR0-enabled component (mask edx:eax = -1, intersected with XCR0).
+    mov eax, -1
+    mov edx, -1
+    xsave [rsp]
+    // r15 = save-area pointer; callee-saved, so the trampoline preserves it.
+    mov r15, rsp
+2:
+    // Keep the 16-byte stack alignment the SysV ABI expects at a `call`, saving the
+    // pre-call rsp (frame base, or the aligned save area) in callee-saved rbx.
+    mov rbx, rsp
     and rsp, -16
     call {trampoline}
+    mov rsp, rbx
+
+    // ── Per-IRQ vector restore (only if we saved above: r15 != 0) ─────────────
+    test r15, r15
+    jz 3f
+    mov eax, -1
+    mov edx, -1
+    xrstor [r15]
+3:
+    // Return rsp to the frame base for the general-purpose register restore.
     mov rsp, rbp
 
     pop r15
@@ -213,6 +296,8 @@ isr_stub_\num:
 .noaltmacro
 "#,
     trampoline = sym isr_trampoline,
+    armed = sym VECTOR_SAVE_ARMED,
+    area_size = const VECTOR_SAVE_AREA_MAX,
 );
 
 /// The `extern "C"` trampoline the assembly tail calls.

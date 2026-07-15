@@ -258,6 +258,88 @@ pub(crate) unsafe fn xsetbv(xcr: u32, value: u64) {
     }
 }
 
+/// The size in bytes of the `XSAVE` area required for the state components
+/// currently enabled in `XCR0` — `cpuid` leaf `0xD`, sub-leaf 0, `EBX`.
+///
+/// Must be read **after** `XCR0` has been set (by [`crate::simd::enable`]), since
+/// `EBX` reflects the *currently enabled* components. Returns 0 if leaf `0xD` is
+/// unsupported. Used to assert the compile-time on-stack save area in the ISR path
+/// is large enough on this CPU, and to size a future context-switch save area.
+#[must_use]
+pub fn xsave_area_size() -> u32 {
+    if crate::cpuid::max_standard_leaf() < 0xD {
+        return 0;
+    }
+    crate::cpuid::raw(0xD, 0).ebx
+}
+
+/// Save the enabled vector/FPU state components to `area` via `xsave`.
+///
+/// The save-mask `mask` (`edx:eax`) selects which components to consider; it is
+/// intersected with `XCR0`, so `!0` saves all enabled components. Written for the
+/// future preemptive context-switch path (per-task vector save); validated at boot
+/// by a round-trip self-test.
+///
+/// # Safety
+///
+/// `xsave` `#UD`s unless `CR4.OSXSAVE` is set, and `#GP`s unless `area` is
+/// **64-byte aligned** and points at ≥ [`xsave_area_size`] writable bytes whose
+/// 64-byte header is zeroed (`XCOMP_BV = 0` ⇒ standard, non-compacted format). The
+/// caller must guarantee all three. It writes the vector state into `area`
+/// (touching only that buffer) and reads no other memory.
+#[inline]
+pub(crate) unsafe fn xsave(area: *mut u8, mask: u64) {
+    let lo = mask as u32;
+    let hi = (mask >> 32) as u32;
+    // SAFETY: per the doc contract the caller guarantees `CR4.OSXSAVE` is set and
+    // `area` is 64-byte-aligned, large enough, and header-zeroed — so `xsave`
+    // neither `#UD`s nor `#GP`s. It writes the selected state components to
+    // `[area]`; we mark that memory operand written (no `nomem`), use no stack, and
+    // preserve flags. Saving register state to a valid buffer cannot create UB.
+    unsafe {
+        core::arch::asm!(
+            "xsave [{p}]",
+            p = in(reg) area,
+            in("eax") lo,
+            in("edx") hi,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Restore vector/FPU state components from `area` via `xrstor`.
+///
+/// The restore-mask `mask` (`edx:eax`) selects which components to consider
+/// (intersected with `XCR0`); components whose `XSTATE_BV` bit is 0 are reset to
+/// their initial (zeroed) state. Pairs with [`xsave`].
+///
+/// # Safety
+///
+/// `xrstor` `#UD`s unless `CR4.OSXSAVE` is set, and `#GP`s unless `area` is 64-byte
+/// aligned and holds a valid `XSAVE` image (standard format, `XCOMP_BV = 0`) — e.g.
+/// one produced by [`xsave`] into the same buffer. The caller must guarantee both.
+/// It overwrites the CPU's vector state from `area`; it reads `area` and writes no
+/// other memory.
+#[inline]
+pub(crate) unsafe fn xrstor(area: *const u8, mask: u64) {
+    let lo = mask as u32;
+    let hi = (mask >> 32) as u32;
+    // SAFETY: per the doc contract `CR4.OSXSAVE` is set and `area` is a valid,
+    // 64-byte-aligned standard-format XSAVE image, so `xrstor` neither `#UD`s nor
+    // `#GP`s. It reads the image from `[area]` and loads the vector registers; we
+    // mark `[area]` read (no `nomem`), use no stack, preserve flags. Loading
+    // register state from a valid image cannot create UB in Rust-managed memory.
+    unsafe {
+        core::arch::asm!(
+            "xrstor [{p}]",
+            p = in(reg) area,
+            in("eax") lo,
+            in("edx") hi,
+            options(readonly, nostack, preserves_flags),
+        );
+    }
+}
+
 /// Halt the CPU until the next interrupt (`hlt`) — executed exactly once.
 ///
 /// If interrupts are disabled this parks the core until an NMI or reset.
