@@ -393,12 +393,16 @@ const ML_GEMM_OK: &str = "int8 GEMM ok";
 /// requant → GEMM) whose final int32 accumulator checksum is a fixed, tier-
 /// independent constant. Asserting the exact checksum proves end-to-end *inference*
 /// — not just a bare GEMM — computed the expected result on the active tier.
-const ML_MLP_CHECKSUM: &str = "int8 forward via";
-/// The exact acc2 checksum the MLP proof must print (tier-independent — the int8
-/// GEMMs are bit-exact across tiers and the f32 requant is deterministic). Matched
-/// as a substring (like `ML_GEMM_OK`): the checksum is a fixed constant, so there is
-/// no longer value that could prefix-collide in practice.
-const ML_MLP_OK: &str = "acc2 checksum=240475";
+///
+/// This spans `infer_prove`'s pass/fail branch point (`" ok"` vs `" FAIL"`) THROUGH
+/// the checksum digits in one contiguous string, deliberately: `infer_prove` prints
+/// `"; acc2 checksum=<n>"` unconditionally (pass or fail), so matching the checksum
+/// digits alone would be a vacuous gate that never actually distinguishes a failing
+/// run. Requiring the literal text `"ok; acc2 checksum=240475"` as one substring
+/// means the log can only contain it if the pass branch was taken (printing `" ok"`)
+/// AND the checksum was exactly 240475 immediately after — either alone would not
+/// satisfy the match.
+const ML_MLP_OK: &str = "ok; acc2 checksum=240475";
 /// The interrupts-on GEMM proof result (see `kernel::ml::prove_interrupts_on`):
 /// vector GEMMs run bit-exact in a loop with interrupts ENABLED and the PIT firing,
 /// so timer IRQs land mid-GEMM (each running the `isr_common` per-IRQ `XSAVE`).
@@ -427,22 +431,48 @@ fn do_test_kvm() -> ExitCode {
 }
 
 /// Symbol-name substrings that may legitimately contain vector instructions: the
-/// **`hal::simd` module** and nothing else. Vector code is confined to that one
-/// audited module (the GEMM `asm!` kernels + the `xsave`/`xrstor` self-test); it must
+/// **`hal::simd` module**, the **`isr_common`** ISR entry stub, and the
+/// **`hal::cpu::xrstor`** primitive, and nothing else. Vector code is confined to
+/// `hal::simd` (the GEMM `asm!` kernels + the `xsave`/`xrstor` self-test); it must
 /// never appear in interrupt-handler code (in `hal::pit`/`keyboard`/`mouse`/`idt` or
-/// any `kernel` module). Matching the **module path** (rather than the four specific
-/// symbols) is robust to the compiler inlining the `#[inline]` `madd` helpers into
-/// their `_impl` callers — the vector instructions stay under a `hal::simd` symbol
-/// either way. Both the mangled (`3hal4simd`) and demangled (`hal::simd`) forms are
-/// listed so the guard works whether or not objdump demangles.
-const VECTOR_CODE_ALLOWLIST: &[&str] = &["3hal4simd", "hal::simd"];
+/// any `kernel` module) — **except** two audited, deliberate cases:
+///   - `isr_common` itself, whose gated per-IRQ `xsave`/`xrstor` (hal-tcb I1) is the
+///     mechanism that makes the "handlers are vector-free" invariant hold in the
+///     first place, so it must be allowlisted rather than flagged.
+///   - `hal::cpu::xrstor`, the shared `pub(crate)` primitive (hal-tcb C14) whose
+///     *only* caller is `hal::simd`'s boot-time round-trip self-test
+///     (`xsave_roundtrip_ok`) — in an unoptimized (`cargo build`, no `-O`) kernel
+///     build, `#[inline]` is only a hint, so `xrstor`'s call site stays under
+///     `hal::simd` but the `xrstor` instruction itself is outlined into its own
+///     `hal::cpu::xrstor` symbol, which does not match the `hal::simd` substring.
+///     It is reserved for the same future per-task context-switch save path
+///     documented on `hal::cpu::xsave`/`hal::cpu::xrstor`.
+///
+/// Matching the **module path** (rather than the four specific GEMM symbols) is
+/// robust to the compiler inlining the `#[inline]` `madd` helpers into their
+/// `_impl` callers — the vector instructions stay under a `hal::simd` symbol either
+/// way. Both the mangled (`3hal4simd`, `3hal3cpu6xrstor`) and demangled
+/// (`hal::simd`, `hal::cpu::xrstor`) forms are listed so the guard works whether or
+/// not objdump demangles.
+const VECTOR_CODE_ALLOWLIST: &[&str] = &[
+    "3hal4simd",
+    "hal::simd",
+    "isr_common",
+    "3hal3cpu6xrstor",
+    "hal::cpu::xrstor",
+];
 
-/// Operand-less mnemonics that clobber vector **data** registers but carry no
-/// `%xmm/%ymm/%zmm` operand text, so the operand scan alone would miss them. (Save/
-/// restore ops like `xsave`/`fxsave` are deliberately excluded — they *preserve*
-/// vector state, they don't clobber it. MXCSR ops touch only the control word.) The
-/// soft-float target cannot emit these, but the guard covers them so it stays honest.
-const VECTOR_CLOBBER_MNEMONICS: &[&str] = &["vzeroupper", "vzeroall"];
+/// Operand-less mnemonics that clobber vector **data**/control state but carry no
+/// `%xmm/%ymm/%zmm` operand text, so the operand scan alone would miss them.
+/// `xrstor`/`fxrstor`/`ldmxcsr` **load** (overwrite) vector or MXCSR state from
+/// memory and are therefore included — a stray one outside `hal::simd`/`isr_common`
+/// would silently clobber live vector state. Save ops (`xsave`/`fxsave`/`stmxcsr`)
+/// are deliberately excluded: they only *read* registers to memory, they never
+/// clobber register state, so they cannot violate the "handlers are vector-free"
+/// invariant this guard enforces. The soft-float target cannot emit any of these,
+/// but the guard covers them so it stays honest.
+const VECTOR_CLOBBER_MNEMONICS: &[&str] =
+    &["vzeroupper", "vzeroall", "xrstor", "fxrstor", "ldmxcsr"];
 
 /// Pure core of [`do_check_no_vector`]: given `objdump -d` text and an allowlist of
 /// symbol-name substrings, return `(symbol, instruction)` for every vector
@@ -690,11 +720,11 @@ fn boot_test(kvm: bool) -> ExitCode {
     // The MLP inference proof must have run AND produced the exact expected checksum
     // — proving end-to-end quantized inference (not just a bare GEMM) on the active
     // tier. The checksum is tier-independent, so this holds under both TCG and KVM.
-    if !log.contains(ML_MLP_CHECKSUM) || !log.contains(ML_MLP_OK) {
+    if !log.contains(ML_MLP_OK) {
         eprintln!(
-            "TEST FAILED: the MLP inference proof did not report '{}' with '{}' \
+            "TEST FAILED: the MLP inference proof did not report '{}' \
              (end-to-end quantized inference produced a wrong or missing result).",
-            ML_MLP_CHECKSUM, ML_MLP_OK
+            ML_MLP_OK
         );
         return ExitCode::FAILURE;
     }
@@ -1007,5 +1037,34 @@ ffffffff80103000 <_ZN3hal3pic3eoi17hfeedfaceE>:\n\
     103003:\tb0 20                \tmov    $0x20,%al\n\
     103005:\tc3                   \tret\n";
         assert!(find_vector_violations(disasm, VECTOR_CODE_ALLOWLIST).is_empty());
+    }
+
+    #[test]
+    fn flags_xrstor_in_a_non_allowlisted_handler() {
+        // `xrstor` has no %xmm/%ymm/%zmm operand text (it takes a memory operand),
+        // but it LOADS vector state, so a stray one outside hal::simd/isr_common
+        // must be flagged just like an operand-form vector instruction.
+        let disasm = "\
+ffffffff80104000 <_ZN3hal5mouse9on_packet17h0011223344556677E>:\n\
+    104000:\t48 89 e5             \tmov    %rsp,%rbp\n\
+    104003:\t0f ae 0d 00 00 00 00 \txrstor 0x0(%rip)\n";
+        let v = find_vector_violations(disasm, VECTOR_CODE_ALLOWLIST);
+        assert_eq!(v.len(), 1, "xrstor in a handler must be flagged");
+        assert!(v[0].0.contains("on_packet"), "reports the offending symbol");
+    }
+
+    #[test]
+    fn allows_xrstor_inside_isr_common() {
+        // isr_common's gated per-IRQ xrstor (hal-tcb I1) is the one audited
+        // exception: it must NOT be flagged even though its symbol is not under
+        // hal::simd, because VECTOR_CODE_ALLOWLIST explicitly names it.
+        let disasm = "\
+ffffffff80105000 <isr_common>:\n\
+    105000:\t48 89 e5             \tmov    %rsp,%rbp\n\
+    105003:\t0f ae 0f             \txrstor (%rdi)\n";
+        assert!(
+            find_vector_violations(disasm, VECTOR_CODE_ALLOWLIST).is_empty(),
+            "isr_common's audited xrstor is allowlisted, not flagged"
+        );
     }
 }

@@ -2,7 +2,11 @@ name: Kernel CI
 
 # Trigger on changes to kernel source or this workflow file.
 on:
+  # Scoped to main: an unscoped `push:` also fires on PR branches, duplicating
+  # every PR's run (the `push` and `pull_request` events have different
+  # `github.ref` values, so the concurrency group below does not dedupe them).
   push:
+    branches: [main]
     paths:
       - "kernel/**"
       - ".github/workflows/kernel.yml"
@@ -100,13 +104,15 @@ jobs:
       # workspace's bare-metal `build.target`. `--nocapture` surfaces the
       # per-tier ran/skipped line, so a green run distinguishes "AVX-512 kernel
       # exercised" (avx512f-capable runner) from "skipped" (the common case on
-      # stock runners; the AVX2 kernel always runs). `-p kernel` is filtered to
-      # `ml::` because some unrelated fs/wm host tests are not host-safe yet.
+      # stock runners; the AVX2 kernel always runs). `-p kernel` now runs
+      # unfiltered: the privileged primitives (`cli`/`sti`, port I/O, …) have
+      # host stubs on `not(target_os = "none")`, so the whole kernel host test
+      # suite (fs/wm/app included) is host-safe, not just `ml::`.
       - name: cargo test (host differential SIMD + ml)
         working-directory: kernel
         run: |
           cargo test -p hal --target x86_64-unknown-linux-gnu -- --nocapture
-          cargo test -p kernel --lib --target x86_64-unknown-linux-gnu ml:: -- --nocapture
+          cargo test -p kernel --lib --target x86_64-unknown-linux-gnu -- --nocapture
 
       # ── 8c. Vector-free-handlers invariant ────────────────────────────────
       # First, unit-test the guard's detection core (that it flags a planted vector
