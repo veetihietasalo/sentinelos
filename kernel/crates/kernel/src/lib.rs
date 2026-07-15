@@ -127,6 +127,10 @@ pub fn kmain() -> ! {
     // end-to-end proof. Pure safe Rust; the SIMD/AMX kernels are later phases.
     // See docs/specs/2026-07-14-aiml-inference-compute-design.md.
     ml::prove();
+    // ...then run a real batched quantized 2-layer MLP forward pass over that same
+    // path, proving end-to-end *inference* (quantize → GEMM → dequant → ReLU →
+    // requant → GEMM) works in the booted kernel, not just a bare matrix multiply.
+    ml::infer_prove();
 
     // Bring up NETWORKING: find + init the e1000 NIC (heap is ready), read its
     // MAC, set up RX/TX rings, then start the minimal ARP/IPv4/ICMP stack and

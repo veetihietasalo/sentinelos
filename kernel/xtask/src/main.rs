@@ -386,6 +386,15 @@ const ML_VECTOR_ACTIVE: [&str; 3] = [
 /// alongside a vector `active=` tier proves the vector kernel not only was selected
 /// but produced the correct result in the booted kernel.
 const ML_GEMM_OK: &str = "int8 GEMM ok";
+/// The MLP inference boot-proof result (see `kernel::ml::infer_prove`): a real
+/// batched quantized 2-layer MLP forward pass (quantize → GEMM → dequant → ReLU →
+/// requant → GEMM) whose final int32 accumulator checksum is a fixed, tier-
+/// independent constant. Asserting the exact checksum proves end-to-end *inference*
+/// — not just a bare GEMM — computed the expected result on the active tier.
+const ML_MLP_CHECKSUM: &str = "int8 forward via";
+/// The exact acc2 checksum the MLP proof must print (tier-independent — the int8
+/// GEMMs are bit-exact across tiers and the f32 requant is deterministic).
+const ML_MLP_OK: &str = "acc2 checksum=240475";
 /// Seconds to wait for the boot end-marker before giving up. Generous because
 /// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
 /// the full bring-up — networking, then seeding + writing the 16 MiB disk image
@@ -556,6 +565,18 @@ fn boot_test(kvm: bool) -> ExitCode {
             "TEST FAILED: a vector tier is active but the boot-proof GEMM did not \
              report '{}' (the live vector dispatch produced a wrong result).",
             ML_GEMM_OK
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // The MLP inference proof must have run AND produced the exact expected checksum
+    // — proving end-to-end quantized inference (not just a bare GEMM) on the active
+    // tier. The checksum is tier-independent, so this holds under both TCG and KVM.
+    if !log.contains(ML_MLP_CHECKSUM) || !log.contains(ML_MLP_OK) {
+        eprintln!(
+            "TEST FAILED: the MLP inference proof did not report '{}' with '{}' \
+             (end-to-end quantized inference produced a wrong or missing result).",
+            ML_MLP_CHECKSUM, ML_MLP_OK
         );
         return ExitCode::FAILURE;
     }
