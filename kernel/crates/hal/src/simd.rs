@@ -36,14 +36,18 @@
 //! non-multiples of the step width, negatives, ±127 extremes, `k` not ÷ 4, and a
 //! large-`k` accumulator-wrap case) and re-checked at every boot by [`enable`].
 //!
-//! **Interrupt precondition (hard).** The interrupt stubs ([`crate::idt`]) save
-//! only the general-purpose registers, **not** `XMM`/`YMM`/`ZMM`. So the GEMM
-//! wrappers must run with interrupts **disabled** until `XSAVE`-based save/restore
-//! lands: an IRQ landing mid-kernel whose handler the compiler emitted any vector
-//! use into (a `memcpy`/struct copy suffices) would clobber the in-flight
-//! accumulators → silently wrong output. All current callers (the boot self-test,
-//! `kernel::ml::prove`, and `kernel::ml::infer_prove`) run in the interrupts-off
-//! boot window; see [`gemm_i8_avx2`].
+//! **Interrupts (precondition lifted).** The GEMM wrappers are now safe to run with
+//! interrupts **enabled**, by two independent mechanisms (see the
+//! vector-state-across-interrupts design doc): (1) on this soft-float target
+//! compiled code emits **no** vector instructions outside these three kernels — so a
+//! compiled interrupt handler cannot clobber `XMM`/`YMM`/`ZMM`; this is machine-
+//! checked by `cargo xtask check-no-vector`, which fails the build if any non-audited
+//! function gains a vector instruction; and (2) [`crate::idt::isr_common`]
+//! additionally `XSAVE`s/`XRSTOR`s the full vector state per IRQ once [`enable`] arms
+//! it. `kernel::ml::prove_interrupts_on` proves a GEMM stays bit-exact with the PIT
+//! firing. (A future *preemptive* context switch is the one remaining case needing
+//! per-task save — via [`crate::cpu::xsave`]/[`crate::cpu::xrstor`] — since a switch
+//! resumes a different task's vector code; no preemptive scheduler exists yet.)
 //!
 //! **SMP note.** Vector state (`CR4.OSXSAVE` + `XCR0`) is **per-core**; [`enable`]
 //! must run on each AP before any GEMM on that AP once SMP lands (the `*_ready`
@@ -156,7 +160,76 @@ pub fn enable() -> bool {
     if want_avx512 && avx512vnni_advertised() && self_test(gemm_i8_avx512vnni_impl) {
         AVX512VNNI_STATUS.store(1, Ordering::Relaxed);
     }
+    // Arm the per-IRQ vector save in the interrupt path so vector GEMM is safe with
+    // interrupts enabled — but only once we confirm the CPU's `XSAVE` area fits the
+    // reserved on-stack area AND `xsave`/`xrstor` demonstrably round-trip here. If
+    // either check fails, we leave it disarmed: GEMM then keeps its interrupts-off
+    // contract (the safe fallback), never running garbage. `xsave_area_size` is read
+    // now, after `XCR0` is set, so it reflects the enabled components.
+    if cpu::xsave_area_size() as usize <= crate::idt::VECTOR_SAVE_AREA_MAX && xsave_roundtrip_ok() {
+        crate::idt::arm_vector_save();
+    }
     true
+}
+
+/// Boot-time round-trip self-test of [`cpu::xsave`]/[`cpu::xrstor`]: stash a known
+/// pattern in `xmm0`, save all enabled vector state, clobber `xmm0`, restore, and
+/// confirm the pattern came back bit-for-bit. Gates arming the per-IRQ vector save
+/// (and validates the very primitives a future context switch will use) — we trust
+/// the save/restore machinery only if it demonstrably round-trips on this core. Runs
+/// after [`enable`] set `CR4.OSXSAVE` + `XCR0`, so `xsave`/`xrstor` are legal.
+///
+/// The `xmm0` pattern deliberately lives *across* the `xsave`/`xrstor` calls: on this
+/// soft-float target no compiled code (including the `#[inline]` `cpu::xsave`/
+/// `cpu::xrstor`, which touch only the save area + `eax`/`edx`) ever uses `xmm0`, and
+/// the side-effecting `asm!` blocks execute in program order, so the physical `xmm0`
+/// persists between them — the same target property the whole design rests on.
+fn xsave_roundtrip_ok() -> bool {
+    #[repr(align(64))]
+    struct Area([u8; crate::idt::VECTOR_SAVE_AREA_MAX]);
+    // Zero-initialised, so the `XSAVE` header (`XCOMP_BV`, reserved bytes) is 0 =
+    // standard, non-compacted format — what `xsave`/`xrstor` require.
+    let mut area = Area([0u8; crate::idt::VECTOR_SAVE_AREA_MAX]);
+    let known: [u32; 4] = [0xDEAD_BEEF, 0x1234_5678, 0xCAFE_F00D, 0x0BAD_C0DE];
+    let mut got: [u32; 4] = [0u32; 4];
+
+    // SAFETY: `XCR0` vector state is enabled by the caller, so this VEX-encoded load
+    // is legal (AVX needs only `CR4.OSXSAVE` + `XCR0`, both set — unlike legacy SSE,
+    // which would also need `CR4.OSFXSR`; we mirror the GEMM's VEX encoding). Loads
+    // the 16-byte `known` (a `[u32; 4]`, ≥ 16 valid unaligned bytes) into `xmm0`;
+    // reads memory only (`readonly`), no stack, `xmm0` declared clobbered.
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu xmm0, xmmword ptr [{k}]",
+            k = in(reg) known.as_ptr(),
+            out("xmm0") _,
+            options(nostack, readonly),
+        );
+    }
+    // SAFETY: `area` is 64-byte aligned (`repr(align(64))`), zero-initialised
+    // (header zeroed ⇒ standard format), and `VECTOR_SAVE_AREA_MAX` bytes — the
+    // caller confirmed that is ≥ the CPU's `xsave_area_size`; `CR4.OSXSAVE` is set.
+    // So `xsave` legally writes the live `xmm0` (= `known`) into `area`.
+    unsafe { cpu::xsave(area.0.as_mut_ptr(), !0) };
+    // SAFETY: clobber `xmm0` (zero it) so the subsequent restore is meaningful;
+    // VEX-encoded (legal under AVX state), no memory touched, `xmm0` declared clobbered.
+    unsafe {
+        core::arch::asm!("vpxor xmm0, xmm0, xmm0", out("xmm0") _, options(nostack, nomem));
+    }
+    // SAFETY: `area` holds the standard-format image `xsave` just wrote and
+    // `CR4.OSXSAVE` is set, so `xrstor` legally reloads `xmm0` (= `known`) from it.
+    unsafe { cpu::xrstor(area.0.as_ptr(), !0) };
+    // SAFETY: stores the restored `xmm0` into the 16-byte `got` (VEX-encoded, legal
+    // under AVX state); `xmm0` declared clobbered.
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu xmmword ptr [{g}], xmm0",
+            g = in(reg) got.as_mut_ptr(),
+            out("xmm0") _,
+            options(nostack),
+        );
+    }
+    got == known
 }
 
 /// Whether `cpuid` advertises AVX2 integer instructions (leaf 7 EBX bit 5).
@@ -294,17 +367,16 @@ fn self_test_fill(t: usize) -> i8 {
 /// slice lengths are inconsistent (incl. a `usize` overflow in `m*k`/`k*n`/`m*n`),
 /// so the caller can fall back to scalar. Never `#UD`s and never panics.
 ///
-/// # Precondition — interrupts must be disabled
+/// # Interrupts — safe either way
 ///
-/// The interrupt stubs ([`crate::idt`]) save only the general-purpose registers,
-/// **not** `XMM`/`YMM`. So this must run with interrupts **disabled** until
-/// `XSAVE`-based vector save/restore lands: otherwise an IRQ landing mid-kernel,
-/// whose handler the compiler emitted any `XMM` use into (a `memcpy`/struct copy
-/// is enough — it need not touch vectors in source), would clobber the in-flight
-/// accumulators → silently wrong output. Today all callers (the boot self-test in
-/// [`enable`], `kernel::ml::prove`, and `kernel::ml::infer_prove` via the MLP dense
-/// layers) run in the interrupts-off boot window; any future interrupts-on use needs
-/// the save/restore first.
+/// Historically this required interrupts **disabled** (the ISR stubs save only the
+/// general-purpose registers, not `XMM`/`YMM`/`ZMM`). That precondition is now
+/// **lifted**: on the soft-float target no compiled handler contains vector
+/// instructions (machine-checked by `cargo xtask check-no-vector`), so an IRQ cannot
+/// clobber the in-flight accumulators, and [`crate::idt::isr_common`] also
+/// `XSAVE`s/`XRSTOR`s the vector state per IRQ as defense-in-depth. See the module
+/// docs; `kernel::ml::prove_interrupts_on` demonstrates a bit-exact GEMM with the PIT
+/// firing.
 #[must_use]
 pub fn gemm_i8_avx2(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) -> bool {
     // Validate dimensions with `checked_mul` so a `usize` overflow can never make a
@@ -324,7 +396,7 @@ pub fn gemm_i8_avx2(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: us
     // core, so the kernel's VEX instructions are legal (no `#UD`) and known-good
     // here. The lengths were validated above (overflow-checked), so every in-kernel
     // load/store stays within `a`/`b`/`c`; `a`/`b` are shared and `c` exclusive
-    // (distinct GEMM buffers). Caller runs with interrupts disabled (see above).
+    // (distinct GEMM buffers). Interrupts may be enabled — see the fn docs.
     unsafe {
         gemm_i8_avx2_impl(a, b, c, m, k, n);
     }
@@ -415,7 +487,7 @@ unsafe fn avx2_madd8(a_ip: i32, b: *const i8, c: *mut i32) {
 /// int32 columns per `ZMM` step). Returns `true` if it ran, or `false` (→ caller
 /// falls back to a narrower tier / scalar) when AVX-512 is not verified usable
 /// ([`avx512_ready`]) or the dims are inconsistent. Never `#UD`s, never panics.
-/// Same hard **interrupts-disabled** precondition as [`gemm_i8_avx2`].
+/// Safe with interrupts enabled, same as [`gemm_i8_avx2`] (see its docs).
 #[must_use]
 pub fn gemm_i8_avx512(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) -> bool {
     let (Some(mk), Some(kn), Some(mn)) = (m.checked_mul(k), k.checked_mul(n), m.checked_mul(n))
@@ -432,7 +504,7 @@ pub fn gemm_i8_avx512(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: 
     // (`ZMM`) state AND the self-test executed this kernel correctly on this core,
     // so the EVEX instructions are legal (no `#UD`). The lengths were validated
     // above (overflow-checked), so every in-kernel load/store stays within
-    // `a`/`b`/`c`; `a`/`b` shared, `c` exclusive; caller runs with interrupts off.
+    // `a`/`b`/`c`; `a`/`b` shared, `c` exclusive; interrupts may be enabled (see docs).
     unsafe {
         gemm_i8_avx512_impl(a, b, c, m, k, n);
     }
@@ -512,8 +584,8 @@ unsafe fn avx512_madd16(a_ip: i32, b: *const i8, c: *mut i32) {
 /// unsigned×signed 4×int8 dot-product-accumulate, 64 int8 MACs per 512-bit step).
 /// Returns `true` if it ran, or `false` (→ caller falls back to a narrower tier)
 /// when VNNI is not verified usable ([`avx512vnni_ready`]) or the dims are
-/// inconsistent. Never `#UD`s, never panics. Same hard **interrupts-disabled**
-/// precondition as [`gemm_i8_avx2`].
+/// inconsistent. Never `#UD`s, never panics. Safe with interrupts enabled, same as
+/// [`gemm_i8_avx2`] (see its docs).
 ///
 /// # The unsigned/signed bias correction (why this is bit-exact)
 ///
@@ -543,7 +615,7 @@ pub fn gemm_i8_avx512vnni(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize,
     // (`ZMM`) state AND the self-test executed this kernel correctly on this core, so
     // the `VPDPBUSD` instruction is legal (no `#UD`). The lengths were validated
     // above (overflow-checked), so every in-kernel load/store stays within
-    // `a`/`b`/`c`; `a`/`b` shared, `c` exclusive; caller runs with interrupts off.
+    // `a`/`b`/`c`; `a`/`b` shared, `c` exclusive; interrupts may be enabled (see docs).
     unsafe {
         gemm_i8_avx512vnni_impl(a, b, c, m, k, n);
     }

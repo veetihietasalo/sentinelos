@@ -38,10 +38,12 @@ fn main() -> ExitCode {
         Some("run") => do_run(),
         Some("test") => do_test(),
         Some("test-kvm") => do_test_kvm(),
+        Some("check-no-vector") => do_check_no_vector(),
         Some("screenshot") => do_screenshot(),
         other => {
             eprintln!(
-                "Usage: cargo xtask <build|run|test|test-kvm|screenshot>\nUnknown subcommand: {:?}",
+                "Usage: cargo xtask <build|run|test|test-kvm|check-no-vector|screenshot>\n\
+                 Unknown subcommand: {:?}",
                 other
             );
             ExitCode::FAILURE
@@ -397,6 +399,12 @@ const ML_MLP_CHECKSUM: &str = "int8 forward via";
 /// as a substring (like `ML_GEMM_OK`): the checksum is a fixed constant, so there is
 /// no longer value that could prefix-collide in practice.
 const ML_MLP_OK: &str = "acc2 checksum=240475";
+/// The interrupts-on GEMM proof result (see `kernel::ml::prove_interrupts_on`):
+/// vector GEMMs run bit-exact in a loop with interrupts ENABLED and the PIT firing,
+/// so timer IRQs land mid-GEMM (each running the `isr_common` per-IRQ `XSAVE`).
+/// `-> ok` requires every result held AND the timer actually advanced, so asserting
+/// it proves the interrupts-off precondition is genuinely lifted.
+const ML_IRQ_OK: &str = "timer ticks -> ok";
 /// Seconds to wait for the boot end-marker before giving up. Generous because
 /// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
 /// the full bring-up — networking, then seeding + writing the 16 MiB disk image
@@ -416,6 +424,96 @@ fn do_test() -> ExitCode {
 /// KVM-capable CI runner) — it fails fast if KVM cannot initialise.
 fn do_test_kvm() -> ExitCode {
     boot_test(true)
+}
+
+/// The only symbols allowed to contain vector-register (`XMM`/`YMM`/`ZMM`)
+/// instructions: the three hand-written GEMM `asm!` kernels and the `xsave`/`xrstor`
+/// round-trip self-test. Every one lives in `hal::simd`, is audited in `hal-tcb.md`,
+/// and is **never** reachable from an interrupt handler. Matched as substrings of
+/// the (mangled) symbol name.
+const VECTOR_CODE_ALLOWLIST: &[&str] = &[
+    "avx2_madd8",
+    "avx512_madd16",
+    "vnni_dp16",
+    "xsave_roundtrip_ok",
+];
+
+/// Guard the "compiled handlers are vector-free" invariant that lets vector GEMM run
+/// with interrupts enabled: disassemble the kernel and assert **every**
+/// `XMM`/`YMM`/`ZMM` instruction lives inside an allowlisted `hal::simd` symbol
+/// ([`VECTOR_CODE_ALLOWLIST`]). If any other function (e.g. a future interrupt
+/// handler, or `memcpy`) ever emits a vector instruction, this fails — turning
+/// "an IRQ can't clobber vector state" into a machine-checked property. The
+/// soft-float `x86_64-unknown-none` target makes this hold today (only the audited
+/// kernels use vectors); the guard keeps it true.
+fn do_check_no_vector() -> ExitCode {
+    let Some(elf) = build_kernel() else {
+        return ExitCode::FAILURE;
+    };
+    println!(
+        "Disassembling {} to check for stray vector instructions ...",
+        elf.display()
+    );
+    let out = match Command::new("objdump").arg("-d").arg(&elf).output() {
+        Ok(o) if o.status.success() => o.stdout,
+        Ok(o) => {
+            eprintln!(
+                "objdump failed ({}): {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("could not run objdump: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let text = String::from_utf8_lossy(&out);
+
+    let mut current = String::new();
+    let mut violations: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        // Function header lines look like `<hexaddr> <symbol>:`.
+        if line.trim_end().ends_with(">:") {
+            if let (Some(lt), Some(gt)) = (line.find('<'), line.rfind('>')) {
+                current = line[lt + 1..gt].to_string();
+            }
+            continue;
+        }
+        // Instruction lines: flag any vector register operand. objdump (AT&T) prints
+        // them `%`-prefixed (`%xmm0`/`%ymm1`/`%zmm2`), so match that form to avoid
+        // matching symbol names or immediates.
+        let lower = line.to_ascii_lowercase();
+        if (lower.contains("%xmm") || lower.contains("%ymm") || lower.contains("%zmm"))
+            && !VECTOR_CODE_ALLOWLIST.iter().any(|a| current.contains(a))
+        {
+            violations.push((current.clone(), line.trim().to_string()));
+        }
+    }
+
+    if violations.is_empty() {
+        println!(
+            "check-no-vector PASSED: every XMM/YMM/ZMM instruction is inside an \
+             allowlisted hal::simd symbol ({:?}); no interrupt-reachable code uses \
+             vectors, so an IRQ cannot clobber an in-flight GEMM.",
+            VECTOR_CODE_ALLOWLIST
+        );
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "check-no-vector FAILED: {} vector instruction(s) found OUTSIDE the \
+             allowlist. Non-allowlisted code with vector instructions could run in \
+             an interrupt handler and clobber an interrupted GEMM's YMM/ZMM state. \
+             Either remove the vector code or (if it is audited and never runs in a \
+             handler) add its symbol to VECTOR_CODE_ALLOWLIST.",
+            violations.len()
+        );
+        for (func, insn) in violations.iter().take(40) {
+            eprintln!("  in {func}:\n      {insn}");
+        }
+        ExitCode::FAILURE
+    }
 }
 
 /// Boot the kernel headless in QEMU, poll the serial log, and assert the boot
@@ -579,6 +677,18 @@ fn boot_test(kvm: bool) -> ExitCode {
             "TEST FAILED: the MLP inference proof did not report '{}' with '{}' \
              (end-to-end quantized inference produced a wrong or missing result).",
             ML_MLP_CHECKSUM, ML_MLP_OK
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // Vector GEMM must stay bit-exact with interrupts ENABLED (the per-IRQ XSAVE +
+    // vector-free handlers, proven under real timer pressure) — the lifted
+    // interrupts-off precondition.
+    if !log.contains(ML_IRQ_OK) {
+        eprintln!(
+            "TEST FAILED: the interrupts-on GEMM proof did not report '{}' \
+             (a timer IRQ corrupted an in-flight GEMM, or the timer never fired).",
+            ML_IRQ_OK
         );
         return ExitCode::FAILURE;
     }

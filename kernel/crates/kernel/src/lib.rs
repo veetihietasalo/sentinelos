@@ -131,6 +131,11 @@ pub fn kmain() -> ! {
     // path, proving end-to-end *inference* (quantize → GEMM → dequant → ReLU →
     // requant → GEMM) works in the booted kernel, not just a bare matrix multiply.
     ml::infer_prove();
+    // ...and prove vector GEMM stays correct with interrupts ENABLED — the old
+    // interrupts-off precondition is lifted now that handlers are vector-free
+    // (CI-enforced) and isr_common per-IRQ-saves vector state. Runs GEMMs in a loop
+    // with the PIT firing, then restores the interrupts-off boot state.
+    ml::prove_interrupts_on();
 
     // Bring up NETWORKING: find + init the e1000 NIC (heap is ready), read its
     // MAC, set up RX/TX rings, then start the minimal ARP/IPv4/ICMP stack and

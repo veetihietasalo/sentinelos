@@ -108,11 +108,22 @@ jobs:
           cargo test -p hal --target x86_64-unknown-linux-gnu -- --nocapture
           cargo test -p kernel --lib --target x86_64-unknown-linux-gnu ml:: -- --nocapture
 
+      # ── 8c. Vector-free-handlers invariant ────────────────────────────────
+      # Disassemble the kernel and assert every XMM/YMM/ZMM instruction lives in an
+      # audited hal::simd symbol (the GEMM kernels + the xsave self-test). This
+      # machine-checks that no interrupt handler emits vector code, so an IRQ can
+      # never clobber an in-flight GEMM's vector state — the invariant that lets
+      # vector GEMM run with interrupts enabled (see the vector-state design doc).
+      - name: make check-no-vector (handlers are vector-free)
+        working-directory: kernel
+        run: make check-no-vector
+
       # ── 9. Boot test (deterministic QEMU serial-output check) ─────────────
       # `make test` (host-detecting wrapper over xtask — works on this Linux
       # runner and on macOS) builds the ISO, boots QEMU headless, captures serial
       # output to target/serial.log, and asserts the "SentinelOS — boot bring-up
-      # OK" banner plus the boot-bringup-ok end-marker.
+      # OK" banner plus the boot-bringup-ok end-marker (now including the
+      # interrupts-on GEMM proof `gemm-under-irq: … -> ok`).
       - name: make test (boot test)
         working-directory: kernel
         run: make test

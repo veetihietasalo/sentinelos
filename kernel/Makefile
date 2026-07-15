@@ -15,6 +15,9 @@
 #   make test-kvm    # build ISO + boot under KVM (-cpu host), assert the x2APIC
 #                    #   ENABLE path ran — the C1 evidence TCG cannot produce.
 #                    #   Requires /dev/kvm (real hardware or a KVM-capable runner).
+#   make check-no-vector # disassemble the kernel; assert vector instructions live
+#                    #   ONLY in the audited hal::simd GEMM/xsave symbols, so no
+#                    #   interrupt handler can clobber an in-flight GEMM.
 #   make screenshot  # build ISO + capture a framebuffer PNG via QMP
 #
 # Requires: qemu-system-x86_64, xorriso, and kernel/limine (see README).
@@ -22,7 +25,7 @@
 HOST := $(shell rustc -vV | sed -n 's/^host: //p')
 XTASK := cargo run --manifest-path xtask/Cargo.toml --target $(HOST) --target-dir target/xtask --
 
-.PHONY: build run test test-kvm screenshot
+.PHONY: build run test test-kvm check-no-vector screenshot
 build:
 	$(XTASK) build
 run:
@@ -31,5 +34,7 @@ test:
 	$(XTASK) test
 test-kvm:
 	$(XTASK) test-kvm
+check-no-vector:
+	$(XTASK) check-no-vector
 screenshot:
 	$(XTASK) screenshot
