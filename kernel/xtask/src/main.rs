@@ -422,6 +422,21 @@ const ML_IRQ_OK: &str = "timer ticks -> ok";
 /// switch (`hal::context::switch`/`sentinel_gpr_switch`) corrupted a task's
 /// execution.
 const SCHED_COOPERATIVE_OK: &str = "[sched] cooperative: A0 B0 A1 B1 A2 B2 ok";
+/// The passing form of `spawn`'s guard-page proof line (see
+/// `kernel::sched::spawn`): a read-only page-table walk confirming the guard
+/// page just below a freshly-allocated kernel stack is genuinely unmapped
+/// (`hal::mm::stack_guard_is_unmapped`). Printed once per `spawn` call (`'A'`
+/// and `'B'` in the PR-A boot proof), so requiring it as a substring is enough
+/// — it must appear at least once and never be contradicted by
+/// [`GUARD_PAGE_MAPPED_MARKER`].
+const GUARD_PAGE_UNMAPPED_MARKER: &str = "guard-page unmapped=true";
+/// The failing form of the same line. This must **never** appear: if the
+/// guard page were mapped, a stack overflow would silently corrupt whatever
+/// lies below it instead of faulting, defeating the whole point of the guard
+/// page. Asserted in both directions alongside
+/// [`GUARD_PAGE_UNMAPPED_MARKER`] so neither a missing walk nor a failed one
+/// can slip through.
+const GUARD_PAGE_MAPPED_MARKER: &str = "guard-page unmapped=false";
 /// Seconds to wait for the boot end-marker before giving up. Generous because
 /// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
 /// the full bring-up — networking, then seeding + writing the 16 MiB disk image
@@ -468,11 +483,15 @@ fn do_test_kvm() -> ExitCode {
 ///     call *target's* symbol name as part of the instruction text, and that name
 ///     happens to contain the substring `"xrstor"` (a `VECTOR_CLOBBER_MNEMONICS`
 ///     entry), even though no `xrstor` instruction executes in `switch` itself.
-///     Allowlisting the caller (mirroring how `hal::cpu::xrstor`'s own body is
-///     allowlisted) resolves the false positive without weakening the guard —
-///     `switch`'s body still cannot smuggle in an *actual* vector instruction of
-///     its own, since any such instruction would use a genuinely vector-only
-///     mnemonic/register operand this substring match independently catches.
+///     The exemption in [`find_vector_violations`] is **whole-symbol**, not
+///     per-instruction: once `current` (the enclosing function name) matches an
+///     allowlist entry, *every* line until the next function header is skipped,
+///     so an actual vector instruction placed inside `switch` would **not** be
+///     flagged either. This entry is needed only to suppress the `xrstor`-text
+///     false positive above; it is safe to grant precisely because `switch` is
+///     itself audited TCB asm (hal-tcb §9, CX4) reviewed line-by-line, not
+///     because the guard independently re-checks its body for real vector
+///     instructions.
 ///     `hal::cpu::xsave`'s call site does **not** need this treatment: `"xsave"`
 ///     is deliberately absent from `VECTOR_CLOBBER_MNEMONICS` (it only reads
 ///     registers to memory, never clobbers), so a `call ... <hal::cpu::xsave>`
@@ -769,6 +788,28 @@ fn boot_test(kvm: bool) -> ExitCode {
             "TEST FAILED: the interrupts-on GEMM proof did not report '{}' \
              (a timer IRQ corrupted an in-flight GEMM, or the timer never fired).",
             ML_IRQ_OK
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // Guard-paged kernel stacks (design doc item "guard-paged kernel stacks"):
+    // `spawn`'s read-only page-table walk must have reported the guard page
+    // unmapped, and must never have reported it mapped — checked in both
+    // directions so a missing walk and a failed one are equally fatal.
+    if !log.contains(GUARD_PAGE_UNMAPPED_MARKER) {
+        eprintln!(
+            "TEST FAILED: expected '{}' in the [sched] spawn lines (the guard-page \
+             unmapped check did not run, or ran and failed silently).",
+            GUARD_PAGE_UNMAPPED_MARKER
+        );
+        return ExitCode::FAILURE;
+    }
+    if log.contains(GUARD_PAGE_MAPPED_MARKER) {
+        eprintln!(
+            "TEST FAILED: found '{}' in the [sched] spawn lines (the guard page below \
+             a kernel stack is mapped — a stack overflow would silently corrupt memory \
+             instead of faulting).",
+            GUARD_PAGE_MAPPED_MARKER
         );
         return ExitCode::FAILURE;
     }

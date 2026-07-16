@@ -182,9 +182,13 @@ impl Context {
     ///
     /// `rsp` starts at `0` and is filled in by the first `switch` that leaves
     /// this context (`sentinel_gpr_switch` stores the live `rsp` there); until
-    /// then this `Context` must only ever be used as the `next` side of a
-    /// switch never as `prev`, which holds trivially for the adopted context
-    /// since nothing has switched away from it yet.
+    /// then this `Context` must only ever be used as the `prev` side of a
+    /// switch, never as `next` — `sentinel_gpr_switch` overwrites `prev.rsp`
+    /// (`mov [rdi], rsp`) before it ever reads it, so a stale `0` there is
+    /// harmless, whereas loading a `0` `next.rsp` into the live `rsp` register
+    /// (`mov rsp, rsi`) would fault on the very next `pop`. This holds
+    /// trivially for the adopted context since nothing switches into it until
+    /// after it has first switched away.
     #[must_use]
     pub fn adopt_running(xsave: &mut XsaveArea) -> Self {
         Self {
