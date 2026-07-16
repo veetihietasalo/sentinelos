@@ -75,6 +75,27 @@ pub fn enable_interrupts() {
 #[inline]
 pub fn enable_interrupts() {}
 
+/// Read the current interrupt-enable flag (`RFLAGS.IF`).
+///
+/// Returns `true` if maskable interrupts are currently enabled. Exposed so
+/// higher-level safe code — specifically `kernel::sched`'s guard against a
+/// reentrant timer preemption mid-critical-section (the scheduler design
+/// doc's PR-B) — can save the prior interrupt state, disable interrupts for a
+/// short critical section, and restore exactly the prior state afterward,
+/// rather than unconditionally forcing interrupts on or off. This is the same
+/// "read before, restore after" pattern [`crate::serial::with_console`]
+/// already uses to guard the console.
+///
+/// This is a safe wrapper: reading `RFLAGS` cannot, on its own, violate Rust's
+/// memory-safety invariants. It delegates to the existing, already-audited
+/// `pushfq`/`pop` primitive (hal-tcb.md §1, S6) — this function adds no new
+/// `unsafe` operation, only a second public call site.
+#[inline]
+#[must_use]
+pub fn interrupts_enabled() -> bool {
+    crate::serial::interrupts_enabled()
+}
+
 /// Raise a breakpoint exception (`int3`, vector 3) on the current CPU.
 ///
 /// `int3` is a one-byte software interrupt that traps to the IDT's vector-3

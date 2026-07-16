@@ -15,7 +15,7 @@
 //! | 8      | #DF Double Fault   | Print + [`hal::cpu::halt_loop`]. |
 //! | 13     | #GP General Protection | Print error code + RIP + [`hal::cpu::halt_loop`]. |
 //! | 14     | #PF Page Fault     | Decode error-code bits + CR2 faulting address, print, [`hal::cpu::halt_loop`]. |
-//! | 32     | IRQ0 PIT timer     | Bump the tick counter + EOI, then **return** (resumes). |
+//! | 32     | IRQ0 PIT timer     | Bump the tick counter + EOI, then [`crate::sched::on_tick`] (PR-B: may switch away right here), then **return** (whichever task is now current resumes). |
 //! | 33     | IRQ1 PS/2 keyboard | Drain the scancode byte into the ring + EOI, then **return** (resumes). |
 //! | 44     | IRQ12 PS/2 mouse   | Drain a packet byte, reassemble the 3-byte packet into the ring + dual EOI, then **return** (resumes). |
 //! | 255    | LAPIC spurious     | No-op **return** (a spurious interrupt owes no EOI); prevents a boot-halt once the LAPIC is software-enabled. |
@@ -172,11 +172,19 @@ fn handle_page_fault(frame: &InterruptFrame) {
 /// Vector 32 (IRQ0) — the PIT timer tick.
 ///
 /// Delegates to [`hal::pit::on_tick`], which bumps the monotonic tick counter
-/// and signals End-Of-Interrupt to the PIC. Returns normally so the interrupted
-/// code resumes — this is a resumable handler like the breakpoint one. All the
-/// privileged work (the PIC EOI port write) stays inside `hal`.
+/// and signals End-Of-Interrupt to the PIC (so the next tick can be delivered
+/// regardless of what happens below), then to [`crate::sched::on_tick`]
+/// (scheduler design doc, PR-B): decrements the current task's remaining time
+/// slice and, on expiry, either switches away right here at the timer-IRQ
+/// tail or defers to the next `preempt_enable`. Returns normally so the
+/// (possibly different, post-switch) current task resumes — this is a
+/// resumable handler like the breakpoint one. All the privileged work (the
+/// PIC EOI port write) stays inside `hal`; `sched::on_tick` is safe Rust and
+/// never touches the interrupt flag (see its own docs) — the ISR stub's
+/// `iretq` is what restores the resumed task's `IF`.
 fn handle_timer(_frame: &InterruptFrame) {
     hal::pit::on_tick();
+    crate::sched::on_tick();
 }
 
 /// Vector 33 (IRQ1) — the PS/2 keyboard.

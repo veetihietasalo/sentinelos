@@ -177,12 +177,24 @@ pub fn kmain() -> ! {
     // every other proof in `kmain`) so the boot test's log-polling loop — which
     // stops as soon as it sees the end-marker — cannot race ahead of it and
     // tear the VM down before it prints. `task_prologue` unconditionally opens
-    // the interrupt window on a task's first run, which is harmless here: the
-    // PIT/keyboard/mouse/NIC are already fully configured (just not yet
-    // globally unmasked via `sti`), nothing left in `kmain` depends on
-    // interrupts staying off, and this module has no timer hook (PR-B) to race
-    // with anyway.
+    // the interrupt window on the FIRST spawned task's first run — from that
+    // point on, interrupts stay live for the remainder of `kmain` (nothing
+    // turns them back off), and the timer (now wired to `sched::on_tick`,
+    // PR-B) is already programmed + unmasked by this point, so this proof's
+    // handful of print+yield rounds run under a genuinely live timer. Each
+    // task's turn is a few instructions (print, then immediately
+    // `yield_now()`), far shorter than one `TIME_SLICE_TICKS` quantum, so no
+    // task is ever continuously `current` long enough to be preempted here —
+    // the deterministic interleave holds regardless.
     sched::prove_cooperative();
+
+    // PR-B **preemptive**-scheduler boot proof (scheduler design doc, "Boot
+    // proofs — PR-B", the payoff): spawn a compute ("gemm") task that loops a
+    // fixed int8 GEMM and a "spin" task that loops a counter — **neither ever
+    // calls `yield_now`** — so only the timer can switch either of them away.
+    // Runs after `prove_cooperative` has fully drained (so `ready`/`tasks`
+    // start clean) and before the closing banner, same rationale as above.
+    sched::prove_preemptive();
 
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");

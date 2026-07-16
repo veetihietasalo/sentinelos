@@ -239,10 +239,18 @@ pub fn init() {
 
 /// Read the current interrupt-enable flag (RFLAGS.IF) so it can be restored.
 ///
-/// Returns `true` if maskable interrupts were enabled.
+/// Returns `true` if maskable interrupts were enabled. `pub(crate)` (not just
+/// `with_console`-private) since PR-B of the scheduler design doc gave this a
+/// second caller: [`crate::cpu::interrupts_enabled`] re-exposes it publicly so
+/// `kernel::sched` can save/restore the prior interrupt state around its own
+/// short critical sections (guarding `SCHED` against a reentrant timer
+/// preemption) instead of unconditionally forcing interrupts on or off — the
+/// exact same need this function was already serving for [`with_console`].
+/// Adds no new `unsafe` operation, only a second public call site (hal-tcb.md
+/// §1, S6).
 #[cfg(target_os = "none")]
 #[inline]
-fn interrupts_enabled() -> bool {
+pub(crate) fn interrupts_enabled() -> bool {
     let flags: u64;
     // SAFETY: `pushfq` pushes the 64-bit RFLAGS onto the stack and `pop` loads
     // it into `flags`. This reads processor flags and uses the stack in a
@@ -260,10 +268,12 @@ fn interrupts_enabled() -> bool {
 /// cannot interpret inline asm, and on the host the kernel's IF-state model is
 /// meaningless anyway. Returns `false` so [`with_console`] never calls the
 /// (no-op) enable path — matching the interrupts-off convention of the paths
-/// host tests exercise.
+/// host tests exercise. Also what `kernel::sched`'s host-side `cargo test`
+/// build observes through [`crate::cpu::interrupts_enabled`] (its own
+/// interrupt-disable/restore wrapper is likewise a no-op there).
 #[cfg(not(target_os = "none"))]
 #[inline]
-fn interrupts_enabled() -> bool {
+pub(crate) fn interrupts_enabled() -> bool {
     false
 }
 
