@@ -24,7 +24,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 
-use super::sync::SpinMutex;
+use crate::sync::SpinMutex;
 
 /// Base virtual address of the kernel heap window.
 ///

@@ -32,7 +32,6 @@ mod bootinfo;
 mod frame;
 mod heap;
 mod paging;
-mod sync;
 
 pub use addr::{PhysAddr, VirtAddr, PAGE_SIZE};
 pub use bootinfo::{hhdm_offset, usable_regions, UsableRegion};
@@ -172,6 +171,158 @@ impl DmaFrame {
     pub const fn virt(&self) -> VirtAddr {
         self.virt
     }
+}
+
+// ── §5g: guard-paged kernel-thread stacks (`kernel::sched`, PR-A) ──────────────
+//
+// Per-task kernel stacks for the cooperative scheduler. Reuses the same
+// bump-window pattern as `map_mmio` (§5f) but for a dedicated VA range, and
+// deliberately leaves one page unmapped below each stack as an M1 guard: a
+// stack overflow walks straight into a never-present page and `#PF`s into the
+// existing fault handler instead of silently corrupting whatever comes next in
+// the window. See `docs/specs/2026-07-15-scheduler-design.md`.
+
+/// Base of the higher-half virtual window reserved for per-task kernel-thread
+/// stacks (guard-paged; see [`alloc_kernel_stack`]).
+///
+/// Bumped like [`MMIO_WINDOW_BASE`], and chosen well clear of both the heap
+/// ([`HEAP_START`]) and the MMIO window so none ever overlap.
+const STACK_WINDOW_BASE: u64 = 0xFFFF_F200_0000_0000;
+
+/// Bump pointer for the next free stack-window virtual address (see
+/// [`alloc_kernel_stack`]).
+static STACK_WINDOW_NEXT: AtomicUsize = AtomicUsize::new(STACK_WINDOW_BASE as usize);
+
+/// Default number of 4 KiB pages in a kernel-thread stack (16 KiB), **not**
+/// counting the guard page below it. Chosen generously: a task preempted deep
+/// in the timer IRQ (PR-B) holds one `isr_common` frame plus its on-stack
+/// `XSAVE` area, and interrupt gates keep IF clear in the handler so nesting
+/// depth is bounded at 1.
+pub const DEFAULT_STACK_PAGES: usize = 4;
+
+/// Why [`alloc_kernel_stack`] could not allocate a guard-paged kernel stack.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StackAllocError {
+    /// Memory management was not initialised (no HHDM offset available).
+    NotInitialised,
+    /// The frame allocator ran out of physical frames.
+    OutOfFrames,
+    /// A stack page could not be mapped (an unexpected clash — the stack
+    /// window is exclusively bump-allocated, so this should not occur).
+    MapFailed(MapError),
+}
+
+impl From<MapError> for StackAllocError {
+    fn from(e: MapError) -> Self {
+        match e {
+            MapError::OutOfFrames => Self::OutOfFrames,
+            other => Self::MapFailed(other),
+        }
+    }
+}
+
+/// A dynamically frame-allocated, guard-paged kernel-thread stack.
+///
+/// `[bottom, top)` is [`pages`](Self::pages) × 4 KiB of mapped, writable,
+/// non-executable memory (the stack grows *down* from [`top`](Self::top) on
+/// `x86_64`); the single page immediately below `bottom` is deliberately left
+/// **unmapped** — the M1 guard page.
+///
+/// No `unmap` primitive exists yet, so the VA/frames a `KernelStack` holds are
+/// currently **leaked** on drop rather than reclaimed (same posture as
+/// [`DmaFrame`] — see the scheduler design doc's open questions); acceptable
+/// for PR-A/PR-B because the tasks that own one are long-lived, and reclaiming
+/// a *running* task's own stack is never safe anyway (a task never frees the
+/// stack it is executing on).
+#[derive(Debug)]
+pub struct KernelStack {
+    top: VirtAddr,
+    bottom: VirtAddr,
+    pages: usize,
+}
+
+impl KernelStack {
+    /// The top of the stack: one past the highest valid byte, and (since
+    /// `x86_64` stacks grow down) where a fresh switch frame is fabricated.
+    /// Always a multiple of [`PAGE_SIZE`] (hence 16-byte aligned), which is
+    /// exactly the alignment `hal::context::Context::for_new_task`'s
+    /// fabricated frame relies on at the trampoline's first `call`.
+    #[must_use]
+    pub const fn top(&self) -> VirtAddr {
+        self.top
+    }
+
+    /// The lowest mapped address — the guard page starts exactly one page
+    /// below this.
+    #[must_use]
+    pub const fn bottom(&self) -> VirtAddr {
+        self.bottom
+    }
+
+    /// Number of mapped 4 KiB pages (excludes the guard page below `bottom`).
+    #[must_use]
+    pub const fn pages(&self) -> usize {
+        self.pages
+    }
+}
+
+/// Allocate a `pages`-page (4 KiB each) kernel-thread stack with an unmapped
+/// guard page directly below it.
+///
+/// Reserves `pages + 1` pages from the dedicated stack VA window
+/// ([`STACK_WINDOW_BASE`], bumped like [`MMIO_WINDOW_BASE`]): the upper
+/// `pages` are mapped [`PageFlags::kernel_rw`], and the lowest page is left
+/// **unmapped** (never present ⇒ a stack overflow into it `#PF`s into the
+/// existing fault handler rather than corrupting adjacent memory). Must be
+/// called after [`init`] (it needs the HHDM offset and the frame allocator).
+///
+/// # Errors
+///
+/// Returns [`StackAllocError::NotInitialised`] if `init` has not run, or
+/// [`StackAllocError::OutOfFrames`] / [`StackAllocError::MapFailed`] if a page
+/// could not be mapped.
+pub fn alloc_kernel_stack(pages: usize) -> Result<KernelStack, StackAllocError> {
+    let hhdm = hhdm_offset().ok_or(StackAllocError::NotInitialised)?;
+
+    // Reserve pages+1 (guard + the usable stack) from the bump cursor.
+    let span = (pages + 1) * PAGE_SIZE as usize;
+    let base = STACK_WINDOW_NEXT.fetch_add(span, Ordering::Relaxed) as u64;
+
+    let table = ActivePageTable::new(hhdm);
+    let flags = PageFlags::kernel_rw();
+    // The guard page is [base, base + PAGE_SIZE) — deliberately left unmapped.
+    let bottom = base + PAGE_SIZE;
+    for i in 0..pages {
+        let virt = VirtAddr::new(bottom + (i as u64) * PAGE_SIZE);
+        let phys = FRAME_ALLOCATOR
+            .alloc_frame()
+            .ok_or(StackAllocError::OutOfFrames)?;
+        table.map_page(virt, phys, flags, &FRAME_ALLOCATOR)?;
+    }
+
+    Ok(KernelStack {
+        top: VirtAddr::new(bottom + (pages as u64) * PAGE_SIZE),
+        bottom: VirtAddr::new(bottom),
+        pages,
+    })
+}
+
+/// Confirm the guard page directly below `stack` is genuinely unmapped.
+///
+/// A read-only page-table walk ([`ActivePageTable::is_mapped`]) with **no**
+/// side effect — it never maps, unmaps, or faults anything. This is the
+/// non-destructive stand-in for an actual stack-overflow `#PF` test: rather
+/// than deliberately recursing a boot task into its guard page (which would
+/// turn every boot into a fault demonstration), the boot proof calls this to
+/// verify the invariant [`alloc_kernel_stack`] establishes. Returns `false`
+/// (never "unmapped") if memory management was not initialised.
+#[must_use]
+pub fn stack_guard_is_unmapped(stack: &KernelStack) -> bool {
+    let Some(hhdm) = hhdm_offset() else {
+        return false;
+    };
+    let guard = VirtAddr::new(stack.bottom().as_u64() - PAGE_SIZE);
+    !ActivePageTable::new(hhdm).is_mapped(guard)
 }
 
 /// The global physical frame allocator, seeded by [`init`].

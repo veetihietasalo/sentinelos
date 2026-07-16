@@ -74,6 +74,20 @@ pub(crate) fn arm_vector_save() {
     VECTOR_SAVE_ARMED.store(1, Ordering::Relaxed);
 }
 
+/// Read whether the per-IRQ (and, for the cooperative scheduler, per-task)
+/// vector `XSAVE`/`XRSTOR` bracket is armed.
+///
+/// Mirrors [`isr_common`]'s own gate for callers outside this module that need
+/// the same "is it architecturally legal to `xsave`/`xrstor` right now" check —
+/// currently [`crate::context::switch`] (see the scheduler design doc's TCB
+/// delta, CX4), which must skip the eager per-task vector save exactly like
+/// `isr_common` does before [`crate::simd::enable`] has armed it (otherwise
+/// `xsave`/`xrstor` would `#UD` with `CR4.OSXSAVE` unset). A plain relaxed
+/// atomic load; adds no new unsafe op.
+pub(crate) fn vector_state_armed() -> bool {
+    VECTOR_SAVE_ARMED.load(Ordering::Relaxed) != 0
+}
+
 /// A 64-bit IDT gate descriptor (16 bytes), hardware layout.
 ///
 /// Splits the 64-bit handler address across three fields (`offset_low`,

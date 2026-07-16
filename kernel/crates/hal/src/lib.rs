@@ -17,6 +17,13 @@
 //!   and the [`print!`] / [`println!`] macros.
 //! - [`cpu`] — safe wrappers over `hlt`, `cli`, `sti`, the `CR2`/`CR4` reads,
 //!   and the privileged `CR4`/MSR writers used by [`cpu_security`].
+//! - [`context`] — the kernel-thread context switch: a sealed [`context::Context`]
+//!   / [`context::TaskHandle`] pair plus the safe [`context::switch`], backed by
+//!   one `global_asm!` register-switch primitive and a fabricated-frame builder
+//!   ([`context::Context::for_new_task`]) for `kernel::sched`'s cooperative
+//!   scheduler (see `docs/specs/2026-07-15-scheduler-design.md`).
+//! - [`sync`] — a minimal, dependency-free [`sync::SpinMutex`] shared by `mm` and
+//!   `context`/`kernel::sched`.
 //! - [`cpu_security`] — enable hardware W^X + user/kernel isolation
 //!   (`NX`/`SMEP`/`SMAP`/`UMIP`) via [`cpu_security::enable`], gated on `cpuid`.
 //! - [`cpuid`] — a safe wrapper over the `cpuid` instruction returning the CPU
@@ -82,6 +89,13 @@
 //! - [`ata::identify`] / [`ata::read_sectors`] / [`ata::write_sectors`] /
 //!   [`ata::DiskInfo`] / [`ata::AtaError`] — block-level disk access for the
 //!   filesystem persistence layer.
+//! - [`mm::alloc_kernel_stack`] / [`mm::KernelStack`] / [`mm::StackAllocError`] —
+//!   guard-paged, dynamically frame-allocated kernel-thread stacks for
+//!   `kernel::sched`.
+//! - [`context::Context`] / [`context::TaskHandle`] / [`context::XsaveArea`] /
+//!   [`context::switch`] — the cooperative kernel-thread context switch
+//!   `kernel::sched` builds its scheduler on.
+//! - [`sync::SpinMutex`] — the spinlock backing `kernel::sched`'s run-queue state.
 
 #![no_std]
 // `unsafe` is permitted in this crate (and only this crate), but it must always
@@ -93,6 +107,7 @@
 
 pub mod apic;
 pub mod ata;
+pub mod context;
 pub mod cpu;
 pub mod cpu_security;
 pub mod cpuid;
@@ -109,3 +124,4 @@ pub mod pic;
 pub mod pit;
 pub mod serial;
 pub mod simd;
+pub mod sync;

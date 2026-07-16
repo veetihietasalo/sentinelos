@@ -26,6 +26,7 @@ pub mod interrupts;
 pub mod memory;
 pub mod ml;
 pub mod net;
+pub mod sched;
 pub mod shell;
 pub mod wm;
 
@@ -48,6 +49,14 @@ pub fn kmain() -> ! {
     // + global allocator. After this the kernel can heap-allocate. Done before the
     // banner/draw so the heap is ready for everything that follows.
     memory::init_and_prove();
+
+    // Bring up the cooperative kernel-thread scheduler (PR-A of
+    // docs/specs/2026-07-15-scheduler-design.md): adopt this very call stack
+    // (kmain) as the permanent idle task. Needs the heap (just brought up
+    // above) for its `Box`/`BTreeMap`/`VecDeque` state; the actual boot proof
+    // (spawning + interleaving real tasks) runs later, alongside the other
+    // subsystem proofs — see `sched::prove_cooperative()` further down.
+    sched::init();
 
     // Enable hardware W^X + user/kernel isolation (NX / SMEP / SMAP / UMIP) on
     // this CPU, gated on what it advertises via cpuid. Safe at this point: no
@@ -154,6 +163,21 @@ pub fn kmain() -> ! {
     // gracefully — with no disk it logs and uses the in-memory seeded tree.
     fs::prove_persistence();
 
+    // PR-A cooperative-scheduler boot proof (scheduler design doc, "Boot
+    // proofs — PR-A"): spawn two kernel threads that print and voluntarily
+    // yield in a fixed, small loop, and (as the idle task) yield until both
+    // exit and the ready queue drains. Runs here, alongside the other
+    // subsystem proofs, and BEFORE the closing banner/end-marker below (like
+    // every other proof in `kmain`) so the boot test's log-polling loop — which
+    // stops as soon as it sees the end-marker — cannot race ahead of it and
+    // tear the VM down before it prints. `task_prologue` unconditionally opens
+    // the interrupt window on a task's first run, which is harmless here: the
+    // PIT/keyboard/mouse/NIC are already fully configured (just not yet
+    // globally unmasked via `sti`), nothing left in `kmain` depends on
+    // interrupts staying off, and this module has no timer hook (PR-B) to race
+    // with anyway.
+    sched::prove_cooperative();
+
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");
     // Use concat! to bake the version into a literal at compile time, avoiding
@@ -181,6 +205,8 @@ pub fn kmain() -> ! {
     // Now that every handler is registered, open the interrupt window. From here
     // the PIT fires IRQ0 (vector 32) at ~100 Hz; `hlt` in the idle loop wakes on
     // each tick. (Safe wrapper over `sti`; the IDT + handlers are all live.)
+    // A no-op if the cooperative-scheduler proof above already opened it via
+    // `task_prologue` (idempotent — `sti` when IF is already set changes nothing).
     hal::cpu::enable_interrupts();
 
     idle_loop(framebuffer.as_ref())

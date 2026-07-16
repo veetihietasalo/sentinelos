@@ -409,6 +409,19 @@ const ML_MLP_OK: &str = "ok; acc2 checksum=240475";
 /// `-> ok` requires every result held AND the timer actually advanced, so asserting
 /// it proves the interrupts-off precondition is genuinely lifted.
 const ML_IRQ_OK: &str = "timer ticks -> ok";
+/// The PR-A cooperative-scheduler boot-proof marker (see
+/// `kernel::sched::prove_cooperative`): two kernel threads ("A", "B") each
+/// print `<name><i>` then voluntarily yield, a fixed 3 times, interleaved with
+/// the adopted idle task (`kmain`) yielding until both exit and the ready
+/// queue drains. Cooperative round-robin has **no** dependence on wall-clock
+/// timing (no timer hook is wired to the scheduler in PR-A), so the resulting
+/// interleave is fully deterministic and reproducible byte-for-byte — this is
+/// the *exact* expected line, not a loose substring match, which is only sound
+/// because nothing here depends on timing. A mismatch here means either the
+/// round-robin queue policy regressed (Invariant #4) or the register/stack
+/// switch (`hal::context::switch`/`sentinel_gpr_switch`) corrupted a task's
+/// execution.
+const SCHED_COOPERATIVE_OK: &str = "[sched] cooperative: A0 B0 A1 B1 A2 B2 ok";
 /// Seconds to wait for the boot end-marker before giving up. Generous because
 /// under software-emulated QEMU (TCG, no KVM) on CI and Claude Code on the web
 /// the full bring-up — networking, then seeding + writing the 16 MiB disk image
@@ -431,35 +444,54 @@ fn do_test_kvm() -> ExitCode {
 }
 
 /// Symbol-name substrings that may legitimately contain vector instructions: the
-/// **`hal::simd` module**, the **`isr_common`** ISR entry stub, and the
-/// **`hal::cpu::xrstor`** primitive, and nothing else. Vector code is confined to
-/// `hal::simd` (the GEMM `asm!` kernels + the `xsave`/`xrstor` self-test); it must
-/// never appear in interrupt-handler code (in `hal::pit`/`keyboard`/`mouse`/`idt` or
-/// any `kernel` module) — **except** two audited, deliberate cases:
+/// **`hal::simd` module**, the **`isr_common`** ISR entry stub, the
+/// **`hal::cpu::xrstor`** primitive, and **`hal::context::switch`** (the
+/// scheduler's per-task vector-save bracket), and nothing else. Vector code is
+/// confined to `hal::simd` (the GEMM `asm!` kernels + the `xsave`/`xrstor`
+/// self-test); it must never appear in interrupt-handler code (in
+/// `hal::pit`/`keyboard`/`mouse`/`idt` or any `kernel` module) — **except** three
+/// audited, deliberate cases:
 ///   - `isr_common` itself, whose gated per-IRQ `xsave`/`xrstor` (hal-tcb I1) is the
 ///     mechanism that makes the "handlers are vector-free" invariant hold in the
 ///     first place, so it must be allowlisted rather than flagged.
-///   - `hal::cpu::xrstor`, the shared `pub(crate)` primitive (hal-tcb C14) whose
-///     *only* caller is `hal::simd`'s boot-time round-trip self-test
-///     (`xsave_roundtrip_ok`) — in an unoptimized (`cargo build`, no `-O`) kernel
-///     build, `#[inline]` is only a hint, so `xrstor`'s call site stays under
-///     `hal::simd` but the `xrstor` instruction itself is outlined into its own
-///     `hal::cpu::xrstor` symbol, which does not match the `hal::simd` substring.
-///     It is reserved for the same future per-task context-switch save path
-///     documented on `hal::cpu::xsave`/`hal::cpu::xrstor`.
+///   - `hal::cpu::xrstor`, the shared `pub(crate)` primitive (hal-tcb C14): in an
+///     unoptimized (`cargo build`, no `-O`) kernel build, `#[inline]` is only a
+///     hint, so a caller's call site stays under the caller's own symbol but the
+///     `xrstor` instruction itself is outlined into its own `hal::cpu::xrstor`
+///     symbol — whose *body* legitimately contains the literal instruction.
+///   - `hal::context::switch` (hal-tcb CX4, the scheduler design doc's
+///     eager per-task vector-save bracket around `hal::context::switch`'s register
+///     swap): this function does **not** itself contain a vector instruction — it
+///     *calls* the already-audited `cpu::xsave`/`cpu::xrstor` (a real, un-inlined
+///     `call`, not inlined vector asm). The one line this guard would otherwise
+///     flag here is `call ... <hal::cpu::xrstor>` — the disassembler prints the
+///     call *target's* symbol name as part of the instruction text, and that name
+///     happens to contain the substring `"xrstor"` (a `VECTOR_CLOBBER_MNEMONICS`
+///     entry), even though no `xrstor` instruction executes in `switch` itself.
+///     Allowlisting the caller (mirroring how `hal::cpu::xrstor`'s own body is
+///     allowlisted) resolves the false positive without weakening the guard —
+///     `switch`'s body still cannot smuggle in an *actual* vector instruction of
+///     its own, since any such instruction would use a genuinely vector-only
+///     mnemonic/register operand this substring match independently catches.
+///     `hal::cpu::xsave`'s call site does **not** need this treatment: `"xsave"`
+///     is deliberately absent from `VECTOR_CLOBBER_MNEMONICS` (it only reads
+///     registers to memory, never clobbers), so a `call ... <hal::cpu::xsave>`
+///     line never matches in the first place.
 ///
 /// Matching the **module path** (rather than the four specific GEMM symbols) is
 /// robust to the compiler inlining the `#[inline]` `madd` helpers into their
 /// `_impl` callers — the vector instructions stay under a `hal::simd` symbol either
-/// way. Both the mangled (`3hal4simd`, `3hal3cpu6xrstor`) and demangled
-/// (`hal::simd`, `hal::cpu::xrstor`) forms are listed so the guard works whether or
-/// not objdump demangles.
+/// way. Both the mangled (`3hal4simd`, `3hal3cpu6xrstor`, `3hal7context6switch`) and
+/// demangled (`hal::simd`, `hal::cpu::xrstor`, `hal::context::switch`) forms are
+/// listed so the guard works whether or not objdump demangles.
 const VECTOR_CODE_ALLOWLIST: &[&str] = &[
     "3hal4simd",
     "hal::simd",
     "isr_common",
     "3hal3cpu6xrstor",
     "hal::cpu::xrstor",
+    "3hal7context6switch",
+    "hal::context::switch",
 ];
 
 /// Operand-less mnemonics that clobber vector **data**/control state but carry no
@@ -741,18 +773,36 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // PR-A cooperative-scheduler proof: the exact deterministic interleave
+    // line must appear verbatim (see `SCHED_COOPERATIVE_OK`'s docs).
+    if !log.contains(SCHED_COOPERATIVE_OK) {
+        eprintln!(
+            "TEST FAILED: the cooperative-scheduler boot proof did not report \
+             '{}' verbatim (the round-robin queue policy or the register/stack \
+             context switch regressed).",
+            SCHED_COOPERATIVE_OK
+        );
+        return ExitCode::FAILURE;
+    }
+
     if kvm {
         println!(
             "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' — and a \
              vector int8-GEMM tier verified active ('{}' with '{}' in the [ml] line), \
-             plus banner + end-marker '{}'.",
-            SMP_ENABLED_MARKER, SMP_TIMER_LIVE_MARKER, active_tier, ML_GEMM_OK, END_MARKER
+             the cooperative scheduler interleave ('{}'), plus banner + end-marker '{}'.",
+            SMP_ENABLED_MARKER,
+            SMP_TIMER_LIVE_MARKER,
+            active_tier,
+            ML_GEMM_OK,
+            SCHED_COOPERATIVE_OK,
+            END_MARKER
         );
     } else {
         println!(
             "TEST PASSED: full banner, SMP bring-up line, vector tier active ('{}' \
-             with '{}'), and end-marker '{}' confirmed in serial output.",
-            active_tier, ML_GEMM_OK, END_MARKER
+             with '{}'), the cooperative scheduler interleave ('{}'), and end-marker \
+             '{}' confirmed in serial output.",
+            active_tier, ML_GEMM_OK, SCHED_COOPERATIVE_OK, END_MARKER
         );
     }
     ExitCode::SUCCESS
