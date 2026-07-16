@@ -275,6 +275,16 @@ never switches tasks mid-GEMM, so per-task vector-state save/restore across a
 context switch is not yet implemented — that is the next enabling step for
 inference in a live, scheduled system, not interrupts-on GEMM (already lifted).
 
+**Inference workload #2 — quantized transformer block (implemented).** The MLP
+above is workload #1; `kernel::ml` now also composes one full pre-norm quantized
+transformer block (multi-head self-attention over the existing int8 `gemm_i8`,
+plus the existing MLP reused as the position-wise FFN), adding the two
+primitives every transformer needs — libm-free, deterministic scalar `softmax_rows`
+and `layernorm_rows` — on top of the same tiered GEMM/quantization primitives
+above (no new TCB, still safe Rust, still `xtask check-no-vector`-clean). See
+`docs/specs/2026-07-16-inference-workload2-design.md` for the full design,
+boot proof (`infer_block_prove`), and checksum anchor.
+
 ## Testing
 
 - **Phase 1 (now):** host unit tests for `gemm_i8_scalar` (identity, a hand-checked
