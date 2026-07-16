@@ -10,7 +10,7 @@
 //! # Concurrency model
 //!
 //! At bring-up the kernel is single-core. The free-list head and the HHDM offset
-//! live behind a [`super::sync::SpinMutex`] inside the global [`FrameAllocator`]
+//! live behind a [`crate::sync::SpinMutex`] inside the global [`FrameAllocator`]
 //! so the *type* is `Sync`, but no real contention exists yet. All linked-list
 //! pointer writes are confined to two `unsafe` blocks documented below and in
 //! `kernel/docs/hal-tcb.md` (§5b).
@@ -19,7 +19,7 @@ use core::ptr;
 
 use super::addr::{PhysAddr, PAGE_SIZE};
 use super::bootinfo;
-use super::sync::SpinMutex;
+use crate::sync::SpinMutex;
 
 /// Sentinel value for "end of free list" (a physical address no frame can have).
 const NIL: u64 = u64::MAX;

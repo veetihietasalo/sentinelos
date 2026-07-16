@@ -1,14 +1,18 @@
-//! A minimal spin mutex for the memory-management subsystem.
+//! A minimal spin mutex, shared by `mm` and `context` (the scheduler's TCB).
 //!
-//! `mm`'s global statics (the frame allocator and the kernel heap) need interior
-//! mutability behind a `Sync` type so they can live in a `static` and be shared.
-//! At bring-up the kernel is single-core, so this lock never actually spins; it
-//! exists to make the *types* `Sync` and to be correct if/when SMP arrives.
+//! `mm`'s global statics (the frame allocator and the kernel heap) and
+//! `kernel::sched`'s run-queue state (`hal::sync::SpinMutex<SchedState>`, see the
+//! scheduler design doc) both need interior mutability behind a `Sync` type so
+//! they can live in a `static` and be shared. At bring-up (and through the PR-A
+//! cooperative scheduler) the kernel is single-core, so this lock never actually
+//! spins; it exists to make the *types* `Sync` and to be correct if/when SMP
+//! arrives.
 //!
 //! It is a tiny, self-contained implementation (no external `spin` crate) using
 //! [`AtomicBool`] compare-exchange. The only `unsafe` is forming the `&mut` to
 //! the guarded data while the lock is held, which is the standard mutex pattern;
-//! see `kernel/docs/hal-tcb.md` (§5e).
+//! see `kernel/docs/hal-tcb.md` (§5e). Promoted from `mm::sync` to a crate-level
+//! module so `hal::context`/`kernel::sched` can reuse it too — no new `unsafe`.
 
 use core::cell::UnsafeCell;
 use core::hint;

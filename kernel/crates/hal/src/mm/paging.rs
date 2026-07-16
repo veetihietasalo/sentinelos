@@ -275,6 +275,59 @@ impl ActivePageTable {
         Some(child)
     }
 
+    /// Read-only query: is `virt` currently mapped (present)?
+    ///
+    /// Unlike [`map_page`](Self::map_page)/[`next_table_create`](Self::next_table_create),
+    /// this never allocates or creates a missing intermediate table — an absent
+    /// level simply means "not mapped". Used by debug/boot-proof code (the
+    /// scheduler's guard-page check, §5g) to confirm a page is genuinely absent
+    /// without any side effect on the page tables.
+    #[must_use]
+    pub fn is_mapped(&self, virt: VirtAddr) -> bool {
+        let virt = VirtAddr::new(virt.as_u64() & !(PAGE_SIZE - 1));
+        let [i4, i3, i2, i1] = virt.table_indices();
+        let pml4 = self.pml4_phys();
+        // SAFETY: `pml4` is the active top-level table (read from CR3) — a live,
+        // HHDM-mapped table frame — and each `i*` is a 9-bit index (`< 512`) from
+        // `table_indices`, so every `read_entry`/`next_table_walk` call below sees
+        // a valid table + index. We only ever *read* entries here (no writes, no
+        // frame allocation), so an absent level short-circuits to `false` with no
+        // side effect.
+        unsafe {
+            let Some(pdpt) = self.next_table_walk(pml4, i4) else {
+                return false;
+            };
+            let Some(pd) = self.next_table_walk(pdpt, i3) else {
+                return false;
+            };
+            let Some(pt) = self.next_table_walk(pd, i2) else {
+                return false;
+            };
+            self.read_entry(pt, i1) & PRESENT != 0
+        }
+    }
+
+    /// Read-only walk to the next table level; `None` if absent.
+    ///
+    /// The read-only sibling of [`next_table_create`](Self::next_table_create):
+    /// it never allocates a missing table, so it has no allocator dependency and
+    /// no page-table-mutating side effect.
+    ///
+    /// # Safety
+    ///
+    /// `table` must be a live table frame and `index < 512` (same precondition
+    /// as [`read_entry`](Self::read_entry)).
+    unsafe fn next_table_walk(&self, table: PhysAddr, index: usize) -> Option<PhysAddr> {
+        // SAFETY: the caller upholds `read_entry`'s preconditions (documented
+        // above): `table` is a live table frame and `index < 512`.
+        let entry = unsafe { self.read_entry(table, index) };
+        if entry & PRESENT != 0 {
+            Some(PhysAddr::new(entry & ADDR_MASK))
+        } else {
+            None
+        }
+    }
+
     /// Map a single 4 KiB virtual page to a physical frame with `flags`.
     ///
     /// Walks PML4→PDPT→PD→PT from the active CR3, creating any missing
