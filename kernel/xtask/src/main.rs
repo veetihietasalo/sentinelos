@@ -442,6 +442,26 @@ const ML_TFB_OK: &str = "ok; tfb checksum=4332";
 /// switch (`hal::context::switch`/`sentinel_gpr_switch`) corrupted a task's
 /// execution.
 const SCHED_COOPERATIVE_OK: &str = "[sched] cooperative: A0 B0 A1 B1 A2 B2 ok";
+/// The PR-B **preemptive**-scheduler boot-proof marker prefix (see
+/// `kernel::sched::prove_preemptive`): a "gemm" task (loops a fixed int8
+/// GEMM) and a "spin" task (loops a counter) are spawned and **never call
+/// `yield_now`** — only the timer (`on_tick`) can switch either of them away.
+/// Unlike [`SCHED_COOPERATIVE_OK`], this is **not** asserted as an exact
+/// string: the iteration/preemption counts are inherently timing-dependent
+/// (host/TCG speed, scheduling luck), so [`boot_test`] instead checks this
+/// prefix is present, that `gemm-exact=yes` appears (bit-exact GEMM results —
+/// a mismatch would mean a preemption clobbered a live vector accumulator),
+/// and parses out the `preempted=`/`gemm-iters=`/`spin-iters=` counts to
+/// assert `preempted >= 1` and both iteration counts `> 0` — proving BOTH
+/// tasks progressed AND at least one genuine timer-driven preemption occurred
+/// AND the GEMM stayed exact, without depending on exact counts.
+const SCHED_PREEMPTIVE_PREFIX: &str = "[sched] preemptive: ";
+/// Substring present only on `prove_preemptive`'s passing branch (mirrors
+/// `ML_TFB_OK`'s "span the pass/fail branch point" technique): `gemm-exact=`
+/// is printed unconditionally (`yes` or `no`), so requiring the literal
+/// `yes` — not just the field's presence — means this can only match a run
+/// where every GEMM iteration was bit-exact.
+const SCHED_PREEMPTIVE_GEMM_EXACT: &str = "gemm-exact=yes";
 /// The passing form of `spawn`'s guard-page proof line (see
 /// `kernel::sched::spawn`): a read-only page-table walk confirming the guard
 /// page just below a freshly-allocated kernel stack is genuinely unmapped
@@ -464,6 +484,23 @@ const GUARD_PAGE_MAPPED_MARKER: &str = "guard-page unmapped=false";
 /// The poll below exits the instant the marker appears, so a larger cap only
 /// affects the timeout path and never slows a healthy boot.
 const BOOT_TIMEOUT_SECS: u64 = 60;
+
+/// Parse the decimal number immediately following `field` (e.g.
+/// `"preempted="`) in `line`, if present. Used to check the PR-B preemptive
+/// boot proof's (inherently timing-dependent) counters — `preempted >= 1`,
+/// `gemm-iters > 0`, `spin-iters > 0` — rather than an exact string, since
+/// those counts vary run to run (host/TCG speed, scheduling luck). Returns
+/// `None` if `field` is absent or is not followed by at least one ASCII
+/// digit.
+fn parse_u64_after(line: &str, field: &str) -> Option<u64> {
+    let after = line.split_once(field)?.1;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
 
 fn do_test() -> ExitCode {
     boot_test(false)
@@ -858,26 +895,92 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // PR-B preemptive-scheduler proof (the payoff): a compute ("gemm") task
+    // and a "spin" task, neither of which ever voluntarily yields, must both
+    // have progressed, the GEMM must have stayed bit-exact across every
+    // preemption, and at least one genuine timer-driven preemption must have
+    // occurred. Counts are timing-dependent, so we parse fields rather than
+    // match one exact line (see `SCHED_PREEMPTIVE_PREFIX`'s docs).
+    let Some(preempt_line) = log.lines().find(|l| l.contains(SCHED_PREEMPTIVE_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: no line containing '{}' found (the PR-B timer-preemption \
+             boot proof did not run).",
+            SCHED_PREEMPTIVE_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    if !preempt_line.contains(SCHED_PREEMPTIVE_GEMM_EXACT) {
+        eprintln!(
+            "TEST FAILED: the preemptive boot proof did not report '{}' \
+             (a timer preemption clobbered a live vector accumulator, or the \
+             proof failed outright): '{}'",
+            SCHED_PREEMPTIVE_GEMM_EXACT, preempt_line
+        );
+        return ExitCode::FAILURE;
+    }
+    let preempted = parse_u64_after(preempt_line, "preempted=").unwrap_or(0);
+    let gemm_iters = parse_u64_after(preempt_line, "gemm-iters=").unwrap_or(0);
+    let spin_iters = parse_u64_after(preempt_line, "spin-iters=").unwrap_or(0);
+    if preempted < 1 {
+        eprintln!(
+            "TEST FAILED: expected at least 1 timer-driven preemption \
+             ('preempted>=1'), got {}: '{}'",
+            preempted, preempt_line
+        );
+        return ExitCode::FAILURE;
+    }
+    if gemm_iters == 0 || spin_iters == 0 {
+        eprintln!(
+            "TEST FAILED: expected BOTH the gemm and spin tasks to have made \
+             progress (gemm-iters={}, spin-iters={}): '{}'",
+            gemm_iters, spin_iters, preempt_line
+        );
+        return ExitCode::FAILURE;
+    }
+    if !preempt_line.trim_end().ends_with("ok") {
+        eprintln!(
+            "TEST FAILED: the preemptive boot proof line did not end in 'ok' \
+             (individual fields passed but the overall proof still reported \
+             FAIL): '{}'",
+            preempt_line
+        );
+        return ExitCode::FAILURE;
+    }
+
     if kvm {
         println!(
             "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' — and a \
              vector int8-GEMM tier verified active ('{}' with '{}' and '{}' in the \
-             [ml] lines), the cooperative scheduler interleave ('{}'), plus banner + \
-             end-marker '{}'.",
+             [ml] lines), the cooperative scheduler interleave ('{}'), the \
+             preemptive scheduler proof ('{}', preempted={}, gemm-iters={}, \
+             spin-iters={}), plus banner + end-marker '{}'.",
             SMP_ENABLED_MARKER,
             SMP_TIMER_LIVE_MARKER,
             active_tier,
             ML_GEMM_OK,
             ML_TFB_OK,
             SCHED_COOPERATIVE_OK,
+            SCHED_PREEMPTIVE_GEMM_EXACT,
+            preempted,
+            gemm_iters,
+            spin_iters,
             END_MARKER
         );
     } else {
         println!(
             "TEST PASSED: full banner, SMP bring-up line, vector tier active ('{}' \
-             with '{}' and '{}'), the cooperative scheduler interleave ('{}'), and \
-             end-marker '{}' confirmed in serial output.",
-            active_tier, ML_GEMM_OK, ML_TFB_OK, SCHED_COOPERATIVE_OK, END_MARKER
+             with '{}' and '{}'), the cooperative scheduler interleave ('{}'), the \
+             preemptive scheduler proof ('{}', preempted={}, gemm-iters={}, \
+             spin-iters={}), and end-marker '{}' confirmed in serial output.",
+            active_tier,
+            ML_GEMM_OK,
+            ML_TFB_OK,
+            SCHED_COOPERATIVE_OK,
+            SCHED_PREEMPTIVE_GEMM_EXACT,
+            preempted,
+            gemm_iters,
+            spin_iters,
+            END_MARKER
         );
     }
     ExitCode::SUCCESS
@@ -1191,5 +1294,35 @@ ffffffff80105000 <isr_common>:\n\
             find_vector_violations(disasm, VECTOR_CODE_ALLOWLIST).is_empty(),
             "isr_common's audited xrstor is allowlisted, not flagged"
         );
+    }
+
+    // ── `parse_u64_after` (PR-B preemptive-proof marker parsing) ────────────
+
+    #[test]
+    fn parse_u64_after_extracts_the_first_run_of_digits() {
+        use super::parse_u64_after;
+
+        let line = "[sched] preemptive: gemm-iters=123 gemm-exact=yes spin-iters=456 \
+                     preempted=7 ok";
+        assert_eq!(parse_u64_after(line, "gemm-iters="), Some(123));
+        assert_eq!(parse_u64_after(line, "spin-iters="), Some(456));
+        assert_eq!(parse_u64_after(line, "preempted="), Some(7));
+    }
+
+    #[test]
+    fn parse_u64_after_returns_none_when_field_absent() {
+        use super::parse_u64_after;
+
+        let line = "[sched] preemptive: gemm-iters=1 gemm-exact=no spin-iters=2 \
+                     preempted=0 FAIL";
+        assert_eq!(parse_u64_after(line, "preempted="), Some(0));
+        assert_eq!(parse_u64_after(line, "nope="), None);
+    }
+
+    #[test]
+    fn parse_u64_after_returns_none_when_no_digits_follow() {
+        use super::parse_u64_after;
+
+        assert_eq!(parse_u64_after("preempted=ok", "preempted="), None);
     }
 }

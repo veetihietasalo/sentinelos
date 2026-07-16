@@ -67,7 +67,7 @@ documented with a `# Safety` rustdoc section.
 | S3 | `serial.rs` · `Serial::init()` | block of `outb` calls | 8N1 + FIFO programming sequence | Each `outb` targets a constant COM1 register offset with a standard, well-defined value; affects only the UART device, cannot alias Rust memory. Satisfies `outb`'s contract per call. | Reasoned + QEMU (**pending**) |
 | S4 | `serial.rs` · `Serial::is_transmit_ready()` | `inb(base + LSR)` | Poll Transmit-Holding-Register-Empty before writing | Reads the read-only Line Status Register; no side effect relevant to memory safety. Satisfies `inb`'s contract. | Reasoned + QEMU (**pending**) |
 | S5 | `serial.rs` · `Serial::write_byte()` | `outb(base + DATA, byte)` | Transmit one byte | Reached only after the LSR reports THR empty, so no overrun; writes the data register, device-only effect. Satisfies `outb`'s contract. | Reasoned + QEMU (**pending**) |
-| S6 | `serial.rs` · `interrupts_enabled()` | `pushfq; pop {}` (read RFLAGS) | Read IF so the console guard can restore prior interrupt state | Balanced push/pop reads RFLAGS into a register; `nomem`, `preserves_flags`, stack-balanced (no `nostack`). Reading flags cannot violate memory safety. | Reasoned (**pending**) |
+| S6 | `serial.rs` · `interrupts_enabled()` (`pub(crate)`) | `pushfq; pop {}` (read RFLAGS) | Read IF so the console guard can restore prior interrupt state — and, PR-B of the scheduler design doc, so **`kernel::sched`** can save/restore the prior interrupt state around its own short `SCHED`-locking critical sections (re-exposed publicly as [`crate::cpu::interrupts_enabled`], §9). No new `unsafe` op — a second, `pub` call site over the same instruction. | Balanced push/pop reads RFLAGS into a register; `nomem`, `preserves_flags`, stack-balanced (no `nostack`). Reading flags cannot violate memory safety. | Reasoned + QEMU (`kernel::sched`'s `with_interrupts_disabled` guard exercises this read on every `SCHED` accessor call during the PR-B preemptive boot proof, with interrupts genuinely live) |
 
 > **Fault-path printing (no new `unsafe`).** `serial::print_labeled_hex` /
 > `print_labeled_dec` / `print_line` build digits into a fixed stack buffer with
@@ -706,7 +706,7 @@ types) is **entirely safe**, so the `kernel` crate formats the report without an
 > command also prints come from the existing safe `hal::framebuffer::get` (F1) and
 > `hal::mm::stats` accessors.
 
-## 9. `hal::context` — kernel-thread context switch (PR-A of the scheduler design)
+## 9. `hal::context` — kernel-thread context switch (PR-A + PR-B of the scheduler design)
 
 The trusted core of the cooperative kernel-thread scheduler
 (`docs/specs/2026-07-15-scheduler-design.md`, `kernel::sched`): one
@@ -727,7 +727,7 @@ Context` — see the design doc's "sealed capability" argument, mirrored in
 | CX1 | `context.rs` · `sentinel_gpr_switch` (`global_asm!`) | push/pop callee regs, `mov [rdi],rsp` / `mov rsp,rsi`, `ret` | Stable-Rust register switch (no `naked_fn`/`x86-interrupt`) | Saves/restores exactly SysV callee-saved regs (`rbp,rbx,r12-r15`) + `rsp`; caller-saved regs handled by the `extern "C"` boundary; `next.rsp` always a valid fabricated (`for_new_task`) or saved (prior `switch`) frame (sealed `Context`); jumped/`ret`-ed into, never data-deref'd. Contains **no** vector instruction (`cargo xtask check-no-vector` enforces this — confirmed passing). | Reasoned + QEMU (PR-A interleave boot proof: `[sched] cooperative: A0 B0 A1 B1 A2 B2 ok`, deterministic and asserted verbatim by `cargo xtask test`) |
 | CX2 | `context.rs` · `sentinel_task_entry_trampoline` (`global_asm!`) | `mov rdi,r13; call r12; ud2` | Land a first-run task in its shim (`kernel::sched::task_shim`) | `r12`/`r13` are set by the fabricated frame (CX3); the shim is `-> !`, so a return would be a bug — `ud2` traps it instead of falling through to garbage | Reasoned + QEMU (every spawned task's first run in the PR-A boot proof exercises this path) |
 | CX3 | `context.rs` · `Context::for_new_task` | raw `u64` writes of the 7-qword initial frame to `stack.top() - 56` | Seed the fabricated switch frame `sentinel_gpr_switch`'s pop sequence expects | Writes only within the caller-owned, exclusively-mapped `hal::mm::KernelStack` (§5g) below `stack.top()` (a multiple of `PAGE_SIZE`, hence far larger than 56 and 8-byte-aligned); frame layout matches CX1's pop order exactly (r15..rbp then a return address). `stack.top()` being `PAGE_SIZE`-aligned (⇒ 16-byte aligned) is also what makes the trampoline's first `call` (inside CX2) SysV-legal — `switch` reaches the trampoline via `ret`, not `call`, so no extra push shifts alignment before that `call`. | Reasoned + QEMU (fabricated frames run every spawned task correctly in the PR-A boot proof — a wrong layout/alignment would hang or triple-fault, per the design doc's bring-up debugging notes) |
-| CX4 | `context.rs` · `switch` | deref `prev`/`next` `TaskHandle` + `cpu::xsave`/`cpu::xrstor` (C13/C14) | Save/restore per-task vector state around the GP swap | Handles are sealed tokens minted (`TaskHandle::new`, itself safe) from live `&mut Context` references that, by `kernel::sched`'s invariant (a `Box<Task>` is dropped only in the exit/reap path, after the task can never again be a switch target), outlive their uses; single-core + the kernel always calling `switch` with interrupts disabled ⇒ no aliasing. The `xsave`/`xrstor` bracket is gated on `crate::idt::vector_state_armed()` (a new `pub(crate)` getter over the existing `VECTOR_SAVE_ARMED` flag `isr_common` already uses) so it **never** runs before `simd::enable` has set `CR4.OSXSAVE` — byte-for-byte the same gate `isr_common` uses, applied to a second call site. `prev_ctx.xsave`/`next_ctx.xsave` satisfy C13/C14's contract via `XsaveArea`'s runtime-aligned window (CX6). | Reasoned + QEMU + **security-engineer gate for PR-B** (PR-A's tasks do no vector work, so this bracket is exercised — for real, whenever `simd::enable` armed it, e.g. under TCG `-cpu Haswell` — but only ever round-trips an *empty* vector state; the *payoff* proof, an interrupted-mid-GEMM task resuming bit-exact, is PR-B's `gemm-preempted-bitexact` boot proof, per the design doc) |
+| CX4 | `context.rs` · `switch` | deref `prev`/`next` `TaskHandle` + `cpu::xsave`/`cpu::xrstor` (C13/C14) | Save/restore per-task vector state around the GP swap | Handles are sealed tokens minted (`TaskHandle::new`, itself safe) from live `&mut Context` references that, by `kernel::sched`'s invariant (a `Box<Task>` is dropped only in the exit/reap path, after the task can never again be a switch target), outlive their uses; single-core + the kernel always calling `switch` with interrupts disabled ⇒ no aliasing. **PR-B**: this now holds for *two* call paths, not one — the cooperative path (`kernel::sched::reschedule`, which explicitly `cli`s first) and the **timer-preemption** path (`kernel::sched::on_tick` → `reschedule_locked`, called directly from timer-IRQ context where the interrupt gate already cleared `IF`) — both disable interrupts before ever calling `switch`, and neither re-enables them until after it returns (see `kernel::sched`'s interrupt-flag-discipline docs). The `xsave`/`xrstor` bracket is gated on `crate::idt::vector_state_armed()` (a new `pub(crate)` getter over the existing `VECTOR_SAVE_ARMED` flag `isr_common` already uses) so it **never** runs before `simd::enable` has set `CR4.OSXSAVE` — byte-for-byte the same gate `isr_common` uses, applied to a second call site. `prev_ctx.xsave`/`next_ctx.xsave` satisfy C13/C14's contract via `XsaveArea`'s runtime-aligned window (CX6). | Reasoned + QEMU + **security-engineer gate for PR-B: SIGNED OFF** — the combined PR-B review explicitly covered the H2 security angle and verified requirements #1–#5 in code: the eager `xsave`/`xrstor` bracket runs identically (no bypass) on both the cooperative and ISR-tail switch paths, first-run switch-in restores an all-zero image (architectural init — never inherits prior registers), and zeroize-on-Drop still runs for a preempted-then-exited task; the follow-up re-read lifted the unrelated B1 liveness BLOCK (PR-A's tasks do no vector work, so this bracket only round-tripped an *empty* vector state there; the *payoff* proof — a GEMM task's live YMM/ZMM accumulators surviving genuine, timer-driven preemption bit-exact, with a second task also making progress — is PR-B's boot proof, `kernel::sched::prove_preemptive`, marker `[sched] preemptive: gemm-iters=N gemm-exact=yes spin-iters=N preempted=N ok`, asserted by `cargo xtask test`) |
 | CX5 | `context.rs` · `unsafe impl Send for Context` | mark `Context` `Send` | `kernel::sched`'s `hal::sync::SpinMutex<SchedState>` (holding `BTreeMap<TaskId, Box<Task>>`, and `Task` embeds a `Context`) needs `Send` on its contents for the mutex to be `Sync` (mirrors `hal::mm::heap`'s `unsafe impl Send for Heap`, M12) | `Context`'s only non-`Send` field is the `xsave: *mut u8` raw pointer, which addresses a heap allocation (`Box<XsaveArea>`) that is always owned by, and moves as one unit with, the *same* `Task` as this `Context` — never a "shared" pointer in the aliasing sense. Nothing reads/writes through it except `switch` (CX4), called only on a single core, with interrupts disabled, never re-entrantly — so there is never a concurrent access to race. Not a new discovery of concurrency; `Context` is never actually sent between OS threads in PR-A/PR-B (single-core). | Reasoned (not exercised in a way distinguishable from single-threaded use; SMP-forward note in the design doc applies here too — see "SMP-forward" section) |
 | CX6 | `context.rs` · `XsaveArea::as_mut_ptr` | `self.0.as_mut_ptr().add(offset)` — runtime pointer offset to a 64-byte-aligned window inside oversized, default-aligned backing storage | `XsaveArea` cannot be `#[repr(align(64))]`: it is boxed directly by the `forbid(unsafe_code)` `kernel` crate (`Box::new(XsaveArea::new_init())`), and the kernel heap allocator (`hal::mm::heap`, §5d) only honours alignments up to 16 bytes — a 64-byte-aligned `Layout` request would return null (a failed allocation), which is exactly what PR-A's first implementation hit at boot (`memory allocation of 4096 bytes failed`) before this fix. So `XsaveArea` holds `XSAVE_AREA_SIZE + 64` bytes of plain (1-byte-aligned) storage and computes a 64-byte-aligned `XSAVE_AREA_SIZE`-byte window into it on every access — the same "reserve extra, align at runtime" technique `isr_common`'s **on-stack** save area uses (`sub rsp, area_size; and rsp, -64`), just applied to a heap allocation instead of a stack pointer. | `window_offset()` returns `base.wrapping_neg() & 63`, always in `0..64` (a power-of-two mask), so `offset + XSAVE_AREA_SIZE <= 63 + XSAVE_AREA_SIZE < self.0.len()` (`= XSAVE_AREA_SIZE + 64`) — always in bounds; `base + offset` is a multiple of 64 by construction — always aligned. Recomputed from `self`'s **current** address on every call (never cached), so it stays correct across the moves a fresh `XsaveArea` typically undergoes before reaching its final `Box` (a plain byte array's move is a bitwise copy, which changes its address) — only the address at the point of use matters. Host + Miri unit tests (`context::tests::as_mut_ptr_window_is_64_byte_aligned_and_in_bounds`) assert the alignment/bounds property directly. | Reasoned + host tests + Miri (`cargo +nightly miri test -p hal context::`, 0 UB) + QEMU (every `switch` call with the vector bracket armed exercises this pointer) |
 
@@ -754,12 +754,54 @@ Context` — see the design doc's "sealed capability" argument, mirrored in
 > - **`kernel::sched`'s internal task-struct shape** also differs in minor,
 >   non-`unsafe`-relevant ways from the design's sketch (e.g. `Task.stack` is
 >   `Option<hal::mm::KernelStack>` — `None` for the adopted idle task, whose
->   stack was never allocated by `alloc_kernel_stack`; the `handle`/`slice`
->   sketch fields are not stored — `TaskHandle`s are minted fresh from a live
->   `&mut Context` at each use rather than cached, and `slice` is deferred to
->   PR-B, when something will actually decrement it). None of these touch the
->   TCB; they are safe-Rust implementation choices in `#![forbid(unsafe_code)]`
+>   stack was never allocated by `alloc_kernel_stack`; the `handle` sketch
+>   field is not stored — `TaskHandle`s are minted fresh from a live `&mut
+>   Context` at each use rather than cached). None of these touch the TCB;
+>   they are safe-Rust implementation choices in `#![forbid(unsafe_code)]`
 >   `kernel::sched`.
+
+> **PR-B additions (no new TCB `unsafe` op).** Landed entirely in safe
+> `kernel::sched` plus one re-exposed (not new) `hal` primitive:
+> - **`Task.slice: u32`** (deferred from PR-A, per the bullet above) is now
+>   live: initialised to `TIME_SLICE_TICKS` (10 ticks / 100 ms at
+>   `hal::pit::TICK_HZ`) and decremented once per tick by `on_tick`.
+> - **`kernel::interrupts::handle_timer`** now calls `sched::on_tick()` after
+>   `hal::pit::on_tick()` (still safe; no new `unsafe`).
+> - **Interrupt-flag discipline fix** (PR-A combined-review carry-item):
+>   `reschedule` no longer unconditionally `sti`s at its tail. It is split
+>   into `reschedule_locked` (never touches `IF`; the sole caller from
+>   timer-IRQ context, `on_tick`, invokes this directly — it is *already*
+>   running with `IF` clear from the interrupt gate and must return leaving it
+>   clear, so the ISR stub's own `iretq` restores the *interrupted* task's own
+>   saved flags) and `reschedule` (the voluntary/cooperative wrapper used by
+>   `yield_now`/`exit`/the deferred `preempt_enable` drain, which saves the
+>   caller's actual `IF` state via the new `hal::cpu::interrupts_enabled()`
+>   and restores exactly that — not an unconditional `sti` — around
+>   `reschedule_locked`). `task_prologue`'s unconditional `sti` was reviewed
+>   and left unchanged: a freshly-trampolined task never has a pending
+>   `iretq` of its own (whichever stack it lands on is brand new), so
+>   establishing its preemptible baseline there is never "early" relative to
+>   any interrupt return, regardless of whether the switch that started it was
+>   cooperative or timer-driven.
+> - **`hal::cpu::interrupts_enabled()`** (new `pub fn`) is a thin wrapper over
+>   the *already-audited* `serial::interrupts_enabled` primitive (visibility
+>   widened from private to `pub(crate)`; see §1 S6), used by a new private
+>   `kernel::sched::with_interrupts_disabled` helper that guards every other
+>   `SCHED`-locking accessor (`spawn`/`current_id`/`task_ids`/`task_name`/
+>   `task_stack_pages`/`init`) against the same reentrant-timer-preemption
+>   hazard: `hal::sync::SpinMutex` does **not** itself disable interrupts (it
+>   is a plain spinlock), so any of these holding `SCHED`'s lock with
+>   interrupts enabled would otherwise be vulnerable to `on_tick` trying to
+>   re-acquire the same lock from a nested timer IRQ and spinning forever on
+>   the single core that can never release it — a self-deadlock. Adds
+>   **zero** new `unsafe` operations (it is a safe fn calling a safe fn).
+> - **PR-B boot proof** (`kernel::sched::prove_preemptive`): a "gemm" task
+>   (loops a fixed int8 GEMM) and a "spin" task (loops a counter) are spawned
+>   and **never call `yield_now`**; only the timer can switch them. Evidence
+>   line: `[sched] preemptive: gemm-iters=N gemm-exact=yes spin-iters=N
+>   preempted=N ok` — asserted by `cargo xtask test` requiring `gemm-exact=yes`,
+>   `preempted>=1`, and both iteration counts `>0` (not an exact string match,
+>   since iteration/preemption counts are inherently timing-dependent).
 
 ## 3. Verification roadmap (sub-project #2+)
 
