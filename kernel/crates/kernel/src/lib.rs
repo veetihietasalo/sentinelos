@@ -145,6 +145,12 @@ pub fn kmain() -> ! {
     // (CI-enforced) and isr_common per-IRQ-saves vector state. Runs GEMMs in a loop
     // with the PIT firing, then restores the interrupts-off boot state.
     ml::prove_interrupts_on();
+    // ...then run the second inference workload: one full pre-norm quantized
+    // transformer block (layernorm → multi-head attention → residual →
+    // layernorm → FFN → residual), proving the int8 GEMM tiers in the
+    // attention shapes too, plus the two new libm-free primitives softmax and
+    // layernorm need. See docs/specs/2026-07-16-inference-workload2-design.md.
+    ml::infer_block_prove();
 
     // Bring up NETWORKING: find + init the e1000 NIC (heap is ready), read its
     // MAC, set up RX/TX rings, then start the minimal ARP/IPv4/ICMP stack and

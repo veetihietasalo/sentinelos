@@ -409,6 +409,26 @@ const ML_MLP_OK: &str = "ok; acc2 checksum=240475";
 /// `-> ok` requires every result held AND the timer actually advanced, so asserting
 /// it proves the interrupts-off precondition is genuinely lifted.
 const ML_IRQ_OK: &str = "timer ticks -> ok";
+/// The transformer-block inference boot-proof result (see
+/// `kernel::ml::infer_block_prove`, inference workload 2 — see
+/// `docs/specs/2026-07-16-inference-workload2-design.md`): a real quantized
+/// pre-norm transformer block (layernorm → multi-head self-attention with
+/// per-head int8 `QKᵀ`/`P·V` GEMMs → residual → layernorm → the existing FFN →
+/// residual) whose requantized output checksum is a fixed, tier-independent
+/// constant. Asserting the exact checksum proves the attention GEMM shapes
+/// (not just the MLP's plain dense shapes) and the two new libm-free
+/// primitives (softmax, layernorm) all computed the expected result on the
+/// active tier.
+///
+/// Spans `infer_block_prove`'s pass/fail branch point (`" ok"` vs `" FAIL"`)
+/// THROUGH the checksum digits in one contiguous string, exactly like
+/// [`ML_MLP_OK`]: `infer_block_prove` prints `"; tfb checksum=<n>"`
+/// unconditionally (pass or fail), so matching the checksum digits alone would
+/// be a vacuous gate. Requiring the literal text `"ok; tfb checksum=4332"` as
+/// one substring means the log can only contain it if the pass branch was
+/// taken (printing `" ok"`) AND the checksum was exactly 4332 immediately
+/// after — either alone would not satisfy the match.
+const ML_TFB_OK: &str = "ok; tfb checksum=4332";
 /// The PR-A cooperative-scheduler boot-proof marker (see
 /// `kernel::sched::prove_cooperative`): two kernel threads ("A", "B") each
 /// print `<name><i>` then voluntarily yield, a fixed 3 times, interleaved with
@@ -792,6 +812,18 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // The quantized transformer-block proof (inference workload 2) must have run
+    // AND produced the exact expected checksum — proving one full pre-norm block
+    // (attention + FFN), not just the MLP's plain dense shapes, on the active tier.
+    if !log.contains(ML_TFB_OK) {
+        eprintln!(
+            "TEST FAILED: the transformer-block inference proof did not report '{}' \
+             (end-to-end quantized attention+FFN produced a wrong or missing result).",
+            ML_TFB_OK
+        );
+        return ExitCode::FAILURE;
+    }
+
     // Guard-paged kernel stacks (design doc item "guard-paged kernel stacks"):
     // `spawn`'s read-only page-table walk must have reported the guard page
     // unmapped, and must never have reported it mapped — checked in both
@@ -829,21 +861,23 @@ fn boot_test(kvm: bool) -> ExitCode {
     if kvm {
         println!(
             "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' — and a \
-             vector int8-GEMM tier verified active ('{}' with '{}' in the [ml] line), \
-             the cooperative scheduler interleave ('{}'), plus banner + end-marker '{}'.",
+             vector int8-GEMM tier verified active ('{}' with '{}' and '{}' in the \
+             [ml] lines), the cooperative scheduler interleave ('{}'), plus banner + \
+             end-marker '{}'.",
             SMP_ENABLED_MARKER,
             SMP_TIMER_LIVE_MARKER,
             active_tier,
             ML_GEMM_OK,
+            ML_TFB_OK,
             SCHED_COOPERATIVE_OK,
             END_MARKER
         );
     } else {
         println!(
             "TEST PASSED: full banner, SMP bring-up line, vector tier active ('{}' \
-             with '{}'), the cooperative scheduler interleave ('{}'), and end-marker \
-             '{}' confirmed in serial output.",
-            active_tier, ML_GEMM_OK, SCHED_COOPERATIVE_OK, END_MARKER
+             with '{}' and '{}'), the cooperative scheduler interleave ('{}'), and \
+             end-marker '{}' confirmed in serial output.",
+            active_tier, ML_GEMM_OK, ML_TFB_OK, SCHED_COOPERATIVE_OK, END_MARKER
         );
     }
     ExitCode::SUCCESS
