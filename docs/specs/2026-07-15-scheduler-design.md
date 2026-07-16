@@ -243,8 +243,12 @@ is deferred** (needs an `mm` unmap path — open question); PR-A proof tasks are
   **spinner task**. The PIT preempts the GEMM task **mid-computation** (need_resched →
   `schedule()`), the spinner runs, and on resume the GEMM result is **bit-exact vs the
   scalar reference** — a mismatch would mean a lost/clobbered accumulator, so bit-
-  exactness proves eager per-task `xsave`/`xrstor` works. Serial:
-  `[sched] gemm-preempted-bitexact: ok`.
+  exactness proves eager per-task `xsave`/`xrstor` works. As implemented, the serial
+  line is field-based rather than a single fixed marker — more rigorous than a bare
+  `ok`, since `cargo xtask test` parses and asserts each field independently
+  (`gemm-exact=yes`, `preempted>=1`, both iteration counts `>0`) rather than trusting
+  one pass/fail token:
+  `[sched] preemptive: gemm-iters=<N> gemm-exact=yes spin-iters=<N> preempted=<N> ok`.
 
 ## TCB delta (rows to add to `kernel/docs/hal-tcb.md`)
 
