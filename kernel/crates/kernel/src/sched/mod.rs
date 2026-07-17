@@ -831,40 +831,228 @@ fn task_prologue() {
 /// Number of print+[`yield_now`] iterations each cooperative boot-proof task
 /// performs.
 ///
-/// Fixed and small: cooperative round-robin has **no** dependence on
-/// wall-clock timing (there is no timer hook in PR-A), so the resulting
-/// interleave is fully deterministic and [`prove_cooperative`]'s marker line
-/// is reproducible byte-for-byte across runs.
+/// Fixed and small, mostly for a short, readable raw diagnostic sequence
+/// line — **not** because it makes the interleave's starting phase
+/// deterministic. This kernel is preemptive (PR-B): the timer can, in
+/// principle, land at any instruction boundary, including before either
+/// task's very first print (see [`validate_cooperative_sequence`]'s docs —
+/// issue #21 defect 3 — for the full reasoning). What IS still fully
+/// deterministic, regardless of which task's first print happens to win
+/// that race: each task completes exactly this many iterations, in strict
+/// per-task order, alternating with the other task every step — exactly the
+/// properties [`validate_cooperative_sequence`] checks.
 const PROOF_ITERATIONS: u32 = 3;
 
-/// Print `"<letter><i> "` — e.g. `"A0 "` — as one scheduler-atomic unit:
-/// bracketed in [`preempt_disable`]/[`preempt_enable`] so a genuine timer
-/// tick landing between the three separate [`hal::serial::write_str`]/
-/// [`hal::serial::write_dec`] calls below can never let the *other* proof
-/// task's own print interleave into the middle of this one.
+/// Total `(task letter, iteration)` entries the cooperative boot proof's two
+/// tasks are expected to record between them: [`PROOF_ITERATIONS`] each.
+const SEQ_LOG_EXPECTED_ENTRIES: usize = 2 * PROOF_ITERATIONS as usize;
+
+/// Fixed capacity for [`SEQ_LOG`]. [`SEQ_LOG_EXPECTED_ENTRIES`] (6) is all
+/// [`prove_cooperative`] ever needs to record; a little headroom costs
+/// nothing and keeps [`record_seq_entry`] a simple bounds check rather than
+/// a panic path if a future change ever over-runs it.
+const SEQ_LOG_CAP: usize = 8;
+
+/// The cooperative boot proof's recorded `(task letter, iteration)` entries,
+/// in the exact order [`print_marker_atomic`] observed them — the raw
+/// evidence [`validate_cooperative_sequence`] checks. A fixed-size array (no
+/// `alloc`) guarded by its own [`hal::sync::SpinMutex`] (mirrors [`SCHED`]'s
+/// own locking discipline). Entries are appended from inside
+/// [`print_marker_atomic`]'s existing [`preempt_disable`]/[`preempt_enable`]
+/// bracket, so — like that bracket's print calls — a genuine timer tick can
+/// never interleave a partial append from the *other* task into the middle
+/// of this one. Holds `(buffer, length)`; only the first `length` slots are
+/// meaningful.
+static SEQ_LOG: hal::sync::SpinMutex<([(u8, u8); SEQ_LOG_CAP], usize)> =
+    hal::sync::SpinMutex::new(([(0u8, 0u8); SEQ_LOG_CAP], 0));
+
+/// Reset [`SEQ_LOG`] to empty. [`prove_cooperative`]'s sole caller, right
+/// before spawning the two proof tasks, so a stale entry from a
+/// hypothetical earlier call could never leak into this run's validation.
+fn reset_seq_log() {
+    let mut guard = SEQ_LOG.lock();
+    guard.1 = 0;
+}
+
+/// Append `(letter, iter)` to [`SEQ_LOG`], if there is room. Silently drops
+/// anything past [`SEQ_LOG_CAP`] rather than panicking —
+/// [`prove_cooperative`] only ever records exactly
+/// [`SEQ_LOG_EXPECTED_ENTRIES`] entries in practice, so this bound is never
+/// actually reached; [`validate_cooperative_sequence`]'s "exactly N
+/// entries" check is what would catch a run that somehow did overflow it.
+fn record_seq_entry(letter: u8, iter: u8) {
+    let mut guard = SEQ_LOG.lock();
+    let (buf, len) = &mut *guard;
+    if let Some(slot) = buf.get_mut(*len) {
+        *slot = (letter, iter);
+        *len += 1;
+    }
+}
+
+/// Snapshot every entry [`record_seq_entry`] has recorded so far, in order.
+/// Copies out of the lock (the backing type is plain `Copy` data — no
+/// allocation) so callers can inspect it without holding [`SEQ_LOG`]'s lock.
+fn seq_log_snapshot() -> ([(u8, u8); SEQ_LOG_CAP], usize) {
+    let guard = SEQ_LOG.lock();
+    *guard
+}
+
+/// Outcome of [`validate_cooperative_sequence`] — the property-based checks
+/// [`prove_cooperative`]'s verdict line reports, replacing the old
+/// exact-string phase assertion (issue #21 defect 3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CooperativeVerdict {
+    /// Exactly [`SEQ_LOG_EXPECTED_ENTRIES`] entries were recorded — neither
+    /// fewer (a missing print) nor more (e.g. a task's loop somehow running
+    /// twice).
+    entries_ok: bool,
+    /// No task appeared twice in a row, from EITHER starting phase — the
+    /// property this fix replaces the old phase-fixed assertion with.
+    interleave_ok: bool,
+    /// Every entry's task letter was recognised (`A`/`B`) and, within each
+    /// task's own subsequence, its recorded iterations ran `0, 1, 2` in that
+    /// exact order (no gap, repeat, or reorder).
+    order_ok: bool,
+    /// How many entries were attributed to task `A`.
+    count_a: u8,
+    /// How many entries were attributed to task `B`.
+    count_b: u8,
+}
+
+impl CooperativeVerdict {
+    /// Overall pass/fail: every property held AND each task completed
+    /// exactly [`PROOF_ITERATIONS`] iterations.
+    fn ok(&self) -> bool {
+        self.entries_ok
+            && self.interleave_ok
+            && self.order_ok
+            && self.count_a == PROOF_ITERATIONS as u8
+            && self.count_b == PROOF_ITERATIONS as u8
+    }
+}
+
+/// Validate the cooperative boot proof's recorded `(task letter, iteration)`
+/// sequence — a **property-based** check that deliberately does NOT assert
+/// which task's entry comes first.
+///
+/// # Why phase is not asserted (issue #21 defect 3)
+///
+/// This scheduler is preemptive (PR-B), not cooperative-only: a fresh
+/// task's [`task_prologue`] unconditionally resets [`PREEMPT_COUNT`] to `0`
+/// and enables interrupts the instant it starts running, so there is a real
+/// window — between a task's first switch-in and its first
+/// [`preempt_disable`] (inside [`print_marker_atomic`]) — during which a
+/// timer tick can legally preempt it before it ever prints. On a fast host
+/// (observed on real KVM CI) a burst of PIT ticks that piled up while the
+/// guest was descheduled can arrive and drain in exactly that window, right
+/// after task "A" is first switched into but before its first print,
+/// handing task "B" the CPU first. That makes the OVERALL PHASE of the
+/// two-task interleave a genuine race, not a guarantee this preemptive
+/// kernel can make — encoding it as a fixed verbatim string (the original
+/// marker's mistake) was simply wrong.
+///
+/// What a preemptive round-robin scheduler DOES still guarantee, regardless
+/// of which task happens to go first, is: strict alternation (Invariant #4
+/// — `ready` never contains `current`, so the *other* task is always picked
+/// next) and each task's own internal ordering (nothing about preemption can
+/// reorder a single task's own sequential loop iterations). Those are
+/// exactly the properties checked below.
+///
+/// # Checks
+///
+/// - (a) exactly [`SEQ_LOG_EXPECTED_ENTRIES`] entries were recorded at all
+///   ([`CooperativeVerdict::entries_ok`]) — catches both a missing entry and
+///   a run that somehow recorded extras (e.g. a task's loop double-running).
+/// - (b) no task appears twice in a row, checked over the sequence exactly
+///   as recorded — i.e. from WHICHEVER phase actually occurred
+///   ([`CooperativeVerdict::interleave_ok`]).
+/// - (c) each task's own recorded iterations run `0, 1, 2` in exactly that
+///   order, with no unrecognised task letter
+///   ([`CooperativeVerdict::order_ok`]).
+///
+/// Pure and HAL-free (like [`pick_next`]/[`tick_slice`]), so this is
+/// directly host- and Miri-testable — see the `tests` module below.
+fn validate_cooperative_sequence(entries: &[(u8, u8)]) -> CooperativeVerdict {
+    let entries_ok = entries.len() == SEQ_LOG_EXPECTED_ENTRIES;
+    let interleave_ok = entries.windows(2).all(|pair| pair[0].0 != pair[1].0);
+
+    let mut expect_a: u8 = 0;
+    let mut expect_b: u8 = 0;
+    let mut order_ok = true;
+    let mut count_a: u8 = 0;
+    let mut count_b: u8 = 0;
+    for &(letter, iter) in entries {
+        match letter {
+            b'A' => {
+                count_a = count_a.saturating_add(1);
+                if iter == expect_a {
+                    expect_a = expect_a.saturating_add(1);
+                } else {
+                    order_ok = false;
+                }
+            }
+            b'B' => {
+                count_b = count_b.saturating_add(1);
+                if iter == expect_b {
+                    expect_b = expect_b.saturating_add(1);
+                } else {
+                    order_ok = false;
+                }
+            }
+            _ => order_ok = false,
+        }
+    }
+
+    CooperativeVerdict {
+        entries_ok,
+        interleave_ok,
+        order_ok,
+        count_a,
+        count_b,
+    }
+}
+
+/// Print `"<letter><i> "` — e.g. `"A0 "` — and record the same
+/// `(letter, iteration)` pair into [`SEQ_LOG`] ([`record_seq_entry`]), as one
+/// scheduler-atomic unit: bracketed in [`preempt_disable`]/[`preempt_enable`]
+/// so a genuine timer tick landing between the [`hal::serial::write_str`]/
+/// [`hal::serial::write_dec`] calls below — or between them and the
+/// [`record_seq_entry`] call — can never let the *other* proof task's own
+/// print/record interleave into the middle of this one.
 ///
 /// This closes a real combined-review defect: once PR-B wires the timer
 /// live, a tick can land at any instruction boundary (observed on fast KVM,
 /// where host-scheduler jitter can deliver it almost anywhere) — including
 /// between this print's pieces — and without this bracket the resulting
 /// preemption could run the other task's full `"B2 "` print in the gap
-/// between this one's digit and its trailing space, corrupting the exact
-/// interleave line [`prove_cooperative`] asserts (e.g. `"A2B2  ok"` instead
-/// of `"A2 B2 ok"`). A tick landing inside the bracket is never lost —
-/// [`on_tick`] just defers it via [`NEED_RESCHED`] (module docs' "Interrupt-
-/// flag discipline" section) for [`preempt_enable`] to drain immediately
-/// after this function returns, so this only ever delays a real preemption
-/// by a handful of instructions, never skips one — the proof tasks' own
-/// explicit `yield_now()` (called right after, by [`proof_task_a`]/
-/// [`proof_task_b`]) still hands off every iteration regardless. This is
-/// also, incidentally, the first production exercise of that deferred-drain
-/// path at boot (previously covered only by unit/Kani tests) — see
-/// [`prove_cooperative`]'s diagnostic note.
+/// between this one's digit and its trailing space, corrupting the raw
+/// diagnostic sequence line [`prove_cooperative`] prints (e.g. `"A2B2  "`
+/// instead of `"A2 B2 "`) and, worse, letting the two tasks' [`SEQ_LOG`]
+/// entries land out of true program order — which [`validate_cooperative_sequence`]
+/// would then (correctly) flag as broken even though nothing was actually
+/// wrong. A tick landing inside the bracket is never lost — [`on_tick`] just
+/// defers it via [`NEED_RESCHED`] (module docs' "Interrupt-flag discipline"
+/// section) for [`preempt_enable`] to drain immediately after this function
+/// returns, so this only ever delays a real preemption by a handful of
+/// instructions, never skips one — the proof tasks' own explicit
+/// `yield_now()` (called right after, by [`proof_task_a`]/[`proof_task_b`])
+/// still hands off every iteration regardless. This is also, incidentally,
+/// the first production exercise of that deferred-drain path at boot
+/// (previously covered only by unit/Kani tests) — see [`prove_cooperative`]'s
+/// diagnostic note.
+///
+/// Note what this bracket does **not**, and cannot, guarantee: which of the
+/// two tasks' *first* call to this function happens first overall — see
+/// [`validate_cooperative_sequence`]'s docs (issue #21 defect 3) for why
+/// that starting phase is a genuine race, not a bug.
 fn print_marker_atomic(letter: &str, i: u32) {
     preempt_disable();
     hal::serial::write_str(letter);
     hal::serial::write_dec(u64::from(i));
     hal::serial::write_str(" ");
+    let letter_byte = letter.as_bytes().first().copied().unwrap_or(b'?');
+    let iter_byte = u8::try_from(i).unwrap_or(u8::MAX);
+    record_seq_entry(letter_byte, iter_byte);
     preempt_enable();
 }
 
@@ -894,26 +1082,49 @@ fn ready_len() -> usize {
 /// Run the PR-A cooperative-scheduling boot proof (scheduler design doc,
 /// "Boot proofs — PR-A").
 ///
-/// Spawns two kernel threads ("A", "B") that each print and [`yield_now`] in
-/// a fixed, small loop, then (as the adopted idle task) yields until both have
-/// exited and the ready queue drains. Because cooperative round-robin is
-/// fully deterministic, the resulting interleave — and hence the printed
-/// marker line — is reproducible verbatim across runs; with
-/// [`PROOF_ITERATIONS`] = 3 it is:
+/// Spawns two kernel threads ("A", "B") that each print-and-record
+/// ([`print_marker_atomic`]) then [`yield_now`] in a fixed, small loop, then
+/// (as the adopted idle task) yields until both have exited and the ready
+/// queue drains. Prints two lines:
+///
+/// - a **diagnostic-only** raw sequence line, e.g. `[sched] cooperative: A0
+///   B0 A1 B1 A2 B2 (raw sequence above; not the pass/fail gate)` — never
+///   asserted verbatim by `cargo xtask test` (see below for why),
+/// - the **asserted verdict** line, computed by
+///   [`validate_cooperative_sequence`] over the very same run's
+///   [`SEQ_LOG`]:
 ///
 /// ```text
-/// [sched] cooperative: A0 B0 A1 B1 A2 B2 ok
+/// [sched] cooperative: interleave=strict per-task-order=ok iters=3/3 ok
 /// ```
 ///
-/// Each task's own print is atomic w.r.t. the scheduler
-/// ([`print_marker_atomic`]), so this line is reproducible verbatim even now
-/// that PR-B's timer is live and can, in principle, tick at any instant.
+/// # Why the raw line's starting phase is diagnostic-only (issue #21 defect 3)
+///
+/// This kernel is preemptive (PR-B), not cooperative-only: the timer can, in
+/// principle, fire at any instant, including in the narrow window between a
+/// freshly-spawned task's first switch-in and its first
+/// [`preempt_disable`] (inside its first [`print_marker_atomic`] call) —
+/// [`task_prologue`] unconditionally resets [`PREEMPT_COUNT`] for every
+/// fresh task, so nothing the *spawning* context did with
+/// `preempt_disable`/`preempt_enable` reaches across that window to cover
+/// it. On real KVM hardware (this defect's origin) a burst of PIT ticks that
+/// piled up while the guest was descheduled has been observed to drain
+/// exactly there, preempting task "A" before its very first print and
+/// letting "B" print first — a legitimate, uninvited outcome for a
+/// preemptive kernel to produce, not a bug. The original implementation
+/// wrongly encoded the "A always goes first" phase as part of one verbatim
+/// string assertion; this version instead asserts only the properties a
+/// preemptive round-robin scheduler genuinely does guarantee, regardless of
+/// which task happens to go first: strict alternation and each task's own
+/// internal ordering — see [`validate_cooperative_sequence`]'s docs for the
+/// full reasoning and its host tests for both-phase coverage.
 ///
 /// Uses only the `fmt`-free [`hal::serial::write_str`]/[`hal::serial::write_dec`]
 /// helpers throughout — integer `println!` faults on this target (see
 /// `kernel/docs/hal-tcb.md` §5e). Call once, after [`init`].
 pub fn prove_cooperative() {
     let before = PREEMPT_EVENTS.load(Ordering::Relaxed);
+    reset_seq_log();
 
     spawn("A", proof_task_a);
     spawn("B", proof_task_b);
@@ -922,10 +1133,31 @@ pub fn prove_cooperative() {
     while ready_len() > 0 {
         yield_now();
     }
-    hal::serial::write_str("ok\n");
+    // Diagnostic only — see this function's docs for why the raw sequence's
+    // starting phase is never the pass/fail gate. The verdict line below,
+    // computed over this very run's `SEQ_LOG`, is.
+    hal::serial::write_str("(raw sequence above; not the pass/fail gate)\n");
 
-    // Informational only — never asserted by `cargo xtask test` (the exact
-    // interleave line above is the actual pass/fail gate). Whether a genuine
+    let (seq_buf, seq_len) = seq_log_snapshot();
+    let verdict = validate_cooperative_sequence(&seq_buf[..seq_len]);
+
+    hal::serial::write_str("[sched] cooperative: interleave=");
+    hal::serial::write_str(if verdict.interleave_ok {
+        "strict"
+    } else {
+        "broken"
+    });
+    hal::serial::write_str(" per-task-order=");
+    hal::serial::write_str(if verdict.order_ok { "ok" } else { "fail" });
+    hal::serial::write_str(" iters=");
+    hal::serial::write_dec(u64::from(verdict.count_a));
+    hal::serial::write_str("/");
+    hal::serial::write_dec(u64::from(verdict.count_b));
+    hal::serial::write_str(" ");
+    hal::serial::write_str(if verdict.ok() { "ok\n" } else { "FAIL\n" });
+
+    // Informational only — never asserted by `cargo xtask test` (the
+    // verdict line above is the actual pass/fail gate). Whether a genuine
     // timer tick landed inside one of `print_marker_atomic`'s
     // `preempt_disable`/`preempt_enable` brackets during this run, and was
     // drained end-to-end through `preempt_enable`'s deferred-reschedule
@@ -1345,6 +1577,226 @@ mod tests {
         reserve_ready_capacity(&mut ready, 5);
         assert!(ready.capacity() >= 5);
         assert!(ready.len() < ready.capacity());
+    }
+
+    // ── Defect fix (issue #21, defect 3): `validate_cooperative_sequence`
+    // — property-based cooperative-proof verdict, not a fixed-phase exact
+    // string. See the function's own docs for the full KVM-observed
+    // scenario this replaces. ─────────────────────────────────────────────
+
+    #[test]
+    fn cooperative_sequence_passes_on_the_a_first_phase() {
+        use super::validate_cooperative_sequence;
+
+        // The "queue-policy-only" phase: task A happened to be first
+        // switched into and print before any preemption could intervene.
+        let seq: [(u8, u8); 6] = [
+            (b'A', 0),
+            (b'B', 0),
+            (b'A', 1),
+            (b'B', 1),
+            (b'A', 2),
+            (b'B', 2),
+        ];
+        let verdict = validate_cooperative_sequence(&seq);
+        assert!(verdict.entries_ok);
+        assert!(verdict.interleave_ok);
+        assert!(verdict.order_ok);
+        assert_eq!(verdict.count_a, 3);
+        assert_eq!(verdict.count_b, 3);
+        assert!(verdict.ok());
+    }
+
+    #[test]
+    fn cooperative_sequence_passes_on_the_kvm_observed_b_first_phase() {
+        use super::validate_cooperative_sequence;
+
+        // Issue #21 defect 3: the exact interleave observed on KVM CI — a
+        // burst of caught-up PIT ticks preempted task A between its first
+        // switch-in and its first `preempt_disable`, so task B's own first
+        // print won the race. Strict alternation and each task's own
+        // per-task order are both still intact, so this must still pass —
+        // this is the whole point of the fix (the old verbatim-string
+        // marker asserted only the A-first phase and would have wrongly
+        // failed this legitimate run).
+        let seq: [(u8, u8); 6] = [
+            (b'B', 0),
+            (b'A', 0),
+            (b'B', 1),
+            (b'A', 1),
+            (b'B', 2),
+            (b'A', 2),
+        ];
+        let verdict = validate_cooperative_sequence(&seq);
+        assert!(verdict.entries_ok);
+        assert!(verdict.interleave_ok);
+        assert!(verdict.order_ok);
+        assert_eq!(verdict.count_a, 3);
+        assert_eq!(verdict.count_b, 3);
+        assert!(verdict.ok());
+    }
+
+    #[test]
+    fn cooperative_sequence_fails_on_a_double_run() {
+        use super::validate_cooperative_sequence;
+
+        // Defect scenario: the proof somehow ran twice (e.g. `prove_cooperative`
+        // called twice without a `reset_seq_log`, or a task's loop looping
+        // twice) — 12 entries instead of 6.
+        let seq: [(u8, u8); 12] = [
+            (b'A', 0),
+            (b'B', 0),
+            (b'A', 1),
+            (b'B', 1),
+            (b'A', 2),
+            (b'B', 2),
+            (b'A', 0),
+            (b'B', 0),
+            (b'A', 1),
+            (b'B', 1),
+            (b'A', 2),
+            (b'B', 2),
+        ];
+        let verdict = validate_cooperative_sequence(&seq);
+        assert!(
+            !verdict.entries_ok,
+            "12 entries must not satisfy the exact-6 check"
+        );
+        // The second run's `(A, 0)` arrives right after the first run's
+        // `(A, 2)`, where task A's own expected next iteration is `3` — a
+        // mismatch, so per-task order must also be flagged broken.
+        assert!(!verdict.order_ok);
+        assert!(!verdict.ok());
+    }
+
+    #[test]
+    fn cooperative_sequence_fails_on_out_of_order_iteration() {
+        use super::validate_cooperative_sequence;
+
+        // Defect scenario: task A's own iterations arrive out of order
+        // (0, 2, 1 instead of 0, 1, 2) — interleave (no task twice in a row)
+        // is still fine, but per-task order is broken.
+        let seq: [(u8, u8); 6] = [
+            (b'A', 0),
+            (b'B', 0),
+            (b'A', 2),
+            (b'B', 1),
+            (b'A', 1),
+            (b'B', 2),
+        ];
+        let verdict = validate_cooperative_sequence(&seq);
+        assert!(verdict.entries_ok);
+        assert!(verdict.interleave_ok, "no task appears twice in a row here");
+        assert!(!verdict.order_ok);
+        assert!(!verdict.ok());
+    }
+
+    #[test]
+    fn cooperative_sequence_fails_on_a_missing_entry() {
+        use super::validate_cooperative_sequence;
+
+        // Defect scenario: task B's final entry never got recorded (e.g. a
+        // lost print, or `record_seq_entry` never reached).
+        let seq: [(u8, u8); 5] = [(b'A', 0), (b'B', 0), (b'A', 1), (b'B', 1), (b'A', 2)];
+        let verdict = validate_cooperative_sequence(&seq);
+        assert!(
+            !verdict.entries_ok,
+            "5 entries must not satisfy the exact-6 check"
+        );
+        assert_eq!(verdict.count_a, 3);
+        assert_eq!(verdict.count_b, 2, "B is missing its final iteration");
+        assert!(!verdict.ok());
+    }
+
+    #[test]
+    fn cooperative_sequence_fails_when_a_task_runs_twice_in_a_row() {
+        use super::validate_cooperative_sequence;
+
+        // Defect scenario: broken alternation (e.g. a `pick_next` regression)
+        // — A's own iterations are still perfectly in order, so this
+        // specifically isolates `interleave_ok` from `order_ok`.
+        let seq: [(u8, u8); 6] = [
+            (b'A', 0),
+            (b'A', 1),
+            (b'B', 0),
+            (b'B', 1),
+            (b'A', 2),
+            (b'B', 2),
+        ];
+        let verdict = validate_cooperative_sequence(&seq);
+        assert!(verdict.entries_ok);
+        assert!(!verdict.interleave_ok, "A ran twice in a row");
+        assert!(
+            verdict.order_ok,
+            "each task's own iterations are still 0,1,2 in order"
+        );
+        assert!(!verdict.ok());
+    }
+
+    #[test]
+    fn cooperative_sequence_fails_on_an_unrecognised_task_letter() {
+        use super::validate_cooperative_sequence;
+
+        // Defensive: a corrupted/garbage entry (neither `A` nor `B`) must
+        // never be silently ignored into an accidental pass.
+        let seq: [(u8, u8); 6] = [
+            (b'A', 0),
+            (b'B', 0),
+            (b'A', 1),
+            (b'B', 1),
+            (b'C', 0),
+            (b'B', 2),
+        ];
+        let verdict = validate_cooperative_sequence(&seq);
+        assert!(
+            !verdict.order_ok,
+            "an unrecognised task letter must fail per-task-order"
+        );
+        assert!(!verdict.ok());
+    }
+
+    #[test]
+    fn cooperative_sequence_empty_is_not_ok_but_does_not_panic() {
+        use super::validate_cooperative_sequence;
+
+        let verdict = validate_cooperative_sequence(&[]);
+        assert!(!verdict.entries_ok);
+        assert!(verdict.interleave_ok, "vacuously true over zero pairs");
+        assert!(verdict.order_ok, "vacuously true: no entry violates order");
+        assert_eq!(verdict.count_a, 0);
+        assert_eq!(verdict.count_b, 0);
+        assert!(!verdict.ok());
+    }
+
+    #[test]
+    fn record_and_reset_seq_log_round_trip() {
+        use super::{
+            record_seq_entry, reset_seq_log, seq_log_snapshot, validate_cooperative_sequence,
+        };
+
+        // Exercise the actual recording plumbing end-to-end (not just the
+        // pure validator), mirroring how `print_marker_atomic`/
+        // `prove_cooperative` drive it in production.
+        reset_seq_log();
+        let (_, len0) = seq_log_snapshot();
+        assert_eq!(len0, 0, "reset_seq_log must clear any prior entries");
+
+        record_seq_entry(b'B', 0);
+        record_seq_entry(b'A', 0);
+        record_seq_entry(b'B', 1);
+        record_seq_entry(b'A', 1);
+        record_seq_entry(b'B', 2);
+        record_seq_entry(b'A', 2);
+
+        let (buf, len) = seq_log_snapshot();
+        assert_eq!(len, 6);
+        assert!(validate_cooperative_sequence(&buf[..len]).ok());
+
+        // A later `reset_seq_log` must not leak this run's entries into the
+        // next one.
+        reset_seq_log();
+        let (_, len_after_reset) = seq_log_snapshot();
+        assert_eq!(len_after_reset, 0);
     }
 }
 
