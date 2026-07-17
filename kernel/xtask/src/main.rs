@@ -429,25 +429,71 @@ const ML_IRQ_OK: &str = "timer ticks -> ok";
 /// taken (printing `" ok"`) AND the checksum was exactly 4332 immediately
 /// after — either alone would not satisfy the match.
 const ML_TFB_OK: &str = "ok; tfb checksum=4332";
-/// The PR-A cooperative-scheduler boot-proof marker (see
-/// `kernel::sched::prove_cooperative`): two kernel threads ("A", "B") each
-/// print `<name><i>` then voluntarily yield, a fixed 3 times, interleaved with
-/// the adopted idle task (`kmain`) yielding until both exit and the ready
-/// queue drains. Cooperative round-robin has **no** dependence on wall-clock
-/// timing (no timer hook is wired to the scheduler in PR-A), so the resulting
-/// interleave is fully deterministic and reproducible byte-for-byte — this is
-/// the *exact* expected line, not a loose substring match, which is only sound
-/// because nothing here depends on timing. A mismatch here means either the
-/// round-robin queue policy regressed (Invariant #4) or the register/stack
-/// switch (`hal::context::switch`/`sentinel_gpr_switch`) corrupted a task's
-/// execution.
-const SCHED_COOPERATIVE_OK: &str = "[sched] cooperative: A0 B0 A1 B1 A2 B2 ok";
+/// The PR-A/PR-B cooperative-scheduler boot-proof's **verdict-line prefix**
+/// (see `kernel::sched::prove_cooperative` /
+/// `kernel::sched::validate_cooperative_sequence`): two kernel threads ("A",
+/// "B") each print-and-record then voluntarily yield, a fixed 3 times each,
+/// interleaved with the adopted idle task (`kmain`) yielding until both exit
+/// and the ready queue drains. `prove_cooperative` prints THREE lines sharing
+/// the `"[sched] cooperative: "` text — a diagnostic raw sequence line, this
+/// verdict line, and a diagnostic deferred-tick-preemptions line — so this
+/// longer prefix (through `"interleave="`) is what actually locates the one
+/// that matters here.
+///
+/// # Why phase is not asserted (issue #21 defect 3)
+///
+/// The original marker asserted one fixed, exact string —
+/// `"[sched] cooperative: A0 B0 A1 B1 A2 B2 ok"` — reasoning that
+/// cooperative round-robin has no dependence on wall-clock timing. That
+/// reasoning stopped being true the moment PR-B wired the timer live: this
+/// is a genuinely **preemptive** kernel, and a freshly-spawned task's
+/// `task_prologue` unconditionally resets its preempt-disable depth to `0`
+/// and opens the interrupt window the instant it starts running — before
+/// its own first `print_marker_atomic` call ever reaches its own
+/// `preempt_disable`. On real KVM CI (this defect's origin — issue #21,
+/// defect 3) a burst of PIT ticks that piled up while the guest was
+/// descheduled was observed to land and drain in exactly that window,
+/// preempting task "A" before its very first print and handing task "B" the
+/// CPU first — producing the still-valid, still-strictly-alternating,
+/// still-correctly-per-task-ordered sequence `B0 A0 B1 A1 B2 A2` instead of
+/// `A0 B0 A1 B1 A2 B2`. A preemptive kernel simply does not guarantee which
+/// task's first print wins that race, so asserting one fixed phase was
+/// wrong.
+///
+/// What a round-robin scheduler DOES still guarantee regardless of phase —
+/// strict alternation (Invariant #4) and each task's own internal iteration
+/// order — is exactly what this verdict line's individual fields assert
+/// instead, mirroring [`SCHED_PREEMPTIVE_PREFIX`]'s field-based style
+/// ([`SCHED_COOPERATIVE_INTERLEAVE_OK`]/[`SCHED_COOPERATIVE_ORDER_OK`]/
+/// [`SCHED_COOPERATIVE_ITERS_OK`] below) rather than one exact-string phase
+/// assertion. A mismatch on any field still means either the round-robin
+/// queue policy regressed (Invariant #4) or the register/stack switch
+/// (`hal::context::switch`/`sentinel_gpr_switch`) corrupted a task's
+/// execution — the same failure modes the old marker caught, just without
+/// the spurious phase requirement.
+const SCHED_COOPERATIVE_PREFIX: &str = "[sched] cooperative: interleave=";
+/// Required substring of a **passing** cooperative verdict line: strict
+/// alternation — no task appeared twice in a row, checked from EITHER
+/// starting phase. See [`SCHED_COOPERATIVE_PREFIX`]'s docs.
+const SCHED_COOPERATIVE_INTERLEAVE_OK: &str = "interleave=strict";
+/// Required substring of a **passing** cooperative verdict line: each task's
+/// own recorded iterations ran `0, 1, 2` in exactly that order (no gap,
+/// repeat, or reorder), and no unrecognised task letter was recorded.
+const SCHED_COOPERATIVE_ORDER_OK: &str = "per-task-order=ok";
+/// Required substring of a **passing** cooperative verdict line: both proof
+/// tasks completed exactly 3 iterations each. Unlike
+/// [`SCHED_PREEMPTIVE_PREFIX`]'s counters, this one IS asserted as a fixed
+/// value: PR-A's proof tasks always run exactly `PROOF_ITERATIONS` (3)
+/// iterations by construction, so — phase aside — this count is not
+/// timing-dependent.
+const SCHED_COOPERATIVE_ITERS_OK: &str = "iters=3/3";
 /// The PR-B **preemptive**-scheduler boot-proof marker prefix (see
 /// `kernel::sched::prove_preemptive`): a "gemm" task (loops a fixed int8
 /// GEMM) and a "spin" task (loops a counter) are spawned and **never call
 /// `yield_now`** — only the timer (`on_tick`) can switch either of them away.
-/// Unlike [`SCHED_COOPERATIVE_OK`], this is **not** asserted as an exact
-/// string: the iteration/preemption counts are inherently timing-dependent
+/// Unlike [`SCHED_COOPERATIVE_ITERS_OK`]'s fixed count, this is **not**
+/// asserted as an exact string: the iteration/preemption counts here are
+/// inherently timing-dependent
 /// (host/TCG speed, scheduling luck), so [`boot_test`] instead checks this
 /// prefix is present, that `gemm-exact=yes` appears (bit-exact GEMM results —
 /// a mismatch would mean a preemption clobbered a live vector accumulator),
@@ -500,6 +546,28 @@ fn parse_u64_after(line: &str, field: &str) -> Option<u64> {
     } else {
         digits.parse().ok()
     }
+}
+
+/// Check whether a cooperative-scheduler boot-proof **verdict** line (see
+/// [`SCHED_COOPERATIVE_PREFIX`]'s docs) reports every required field
+/// passing: strict interleave, in-order per-task iterations, and the
+/// expected iteration count for both tasks — deliberately NOT checking which
+/// task's entries came first (issue #21 defect 3: phase is a genuine race
+/// on a preemptive kernel, not something this test can or should pin down).
+///
+/// Pure string logic, so this is directly unit-testable without booting a
+/// kernel (mirrors [`parse_u64_after`]'s host-testability rationale). The
+/// three required substrings and the trailing `"ok"` cannot simultaneously
+/// hold on a line the kernel-side verdict logic considers failing (see
+/// `kernel::sched::validate_cooperative_sequence`'s `ok()` gate) — so this
+/// check is two-sided in effect even though it is written as one positive
+/// substring/suffix test, exactly like the individual-field checks already
+/// used for [`SCHED_PREEMPTIVE_PREFIX`].
+fn coop_verdict_passed(line: &str) -> bool {
+    line.contains(SCHED_COOPERATIVE_INTERLEAVE_OK)
+        && line.contains(SCHED_COOPERATIVE_ORDER_OK)
+        && line.contains(SCHED_COOPERATIVE_ITERS_OK)
+        && line.trim_end().ends_with("ok")
 }
 
 fn do_test() -> ExitCode {
@@ -883,14 +951,28 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // PR-A cooperative-scheduler proof: the exact deterministic interleave
-    // line must appear verbatim (see `SCHED_COOPERATIVE_OK`'s docs).
-    if !log.contains(SCHED_COOPERATIVE_OK) {
+    // PR-A/PR-B cooperative-scheduler proof: a property-based verdict, NOT a
+    // fixed-phase exact string (see `SCHED_COOPERATIVE_PREFIX`'s docs — issue
+    // #21 defect 3: on a preemptive kernel, which task's first print wins the
+    // race is not a guarantee this test can make).
+    let Some(coop_line) = log.lines().find(|l| l.contains(SCHED_COOPERATIVE_PREFIX)) else {
         eprintln!(
-            "TEST FAILED: the cooperative-scheduler boot proof did not report \
-             '{}' verbatim (the round-robin queue policy or the register/stack \
-             context switch regressed).",
-            SCHED_COOPERATIVE_OK
+            "TEST FAILED: no line containing '{}' found (the cooperative-scheduler \
+             boot proof's verdict line did not print).",
+            SCHED_COOPERATIVE_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    if !coop_verdict_passed(coop_line) {
+        eprintln!(
+            "TEST FAILED: the cooperative-scheduler boot proof's verdict line did not \
+             report every field passing (expected '{}', '{}', and '{}', ending in \
+             'ok' — the round-robin queue policy (Invariant #4) or the register/stack \
+             context switch regressed): '{}'",
+            SCHED_COOPERATIVE_INTERLEAVE_OK,
+            SCHED_COOPERATIVE_ORDER_OK,
+            SCHED_COOPERATIVE_ITERS_OK,
+            coop_line
         );
         return ExitCode::FAILURE;
     }
@@ -951,7 +1033,7 @@ fn boot_test(kvm: bool) -> ExitCode {
         println!(
             "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' — and a \
              vector int8-GEMM tier verified active ('{}' with '{}' and '{}' in the \
-             [ml] lines), the cooperative scheduler interleave ('{}'), the \
+             [ml] lines), the cooperative scheduler verdict ('{}'), the \
              preemptive scheduler proof ('{}', preempted={}, gemm-iters={}, \
              spin-iters={}), plus banner + end-marker '{}'.",
             SMP_ENABLED_MARKER,
@@ -959,7 +1041,7 @@ fn boot_test(kvm: bool) -> ExitCode {
             active_tier,
             ML_GEMM_OK,
             ML_TFB_OK,
-            SCHED_COOPERATIVE_OK,
+            coop_line,
             SCHED_PREEMPTIVE_GEMM_EXACT,
             preempted,
             gemm_iters,
@@ -969,13 +1051,13 @@ fn boot_test(kvm: bool) -> ExitCode {
     } else {
         println!(
             "TEST PASSED: full banner, SMP bring-up line, vector tier active ('{}' \
-             with '{}' and '{}'), the cooperative scheduler interleave ('{}'), the \
+             with '{}' and '{}'), the cooperative scheduler verdict ('{}'), the \
              preemptive scheduler proof ('{}', preempted={}, gemm-iters={}, \
              spin-iters={}), and end-marker '{}' confirmed in serial output.",
             active_tier,
             ML_GEMM_OK,
             ML_TFB_OK,
-            SCHED_COOPERATIVE_OK,
+            coop_line,
             SCHED_PREEMPTIVE_GEMM_EXACT,
             preempted,
             gemm_iters,
@@ -1324,5 +1406,93 @@ ffffffff80105000 <isr_common>:\n\
         use super::parse_u64_after;
 
         assert_eq!(parse_u64_after("preempted=ok", "preempted="), None);
+    }
+
+    // ── `coop_verdict_passed` (issue #21 defect 3: property-based
+    // cooperative-proof verdict, not a fixed-phase exact string) ───────────
+
+    #[test]
+    fn coop_verdict_passed_accepts_the_expected_passing_line() {
+        use super::coop_verdict_passed;
+
+        let line = "[sched] cooperative: interleave=strict per-task-order=ok iters=3/3 ok";
+        assert!(coop_verdict_passed(line));
+    }
+
+    #[test]
+    fn coop_verdict_line_is_found_and_passes_regardless_of_the_raw_lines_phase() {
+        use super::{coop_verdict_passed, SCHED_COOPERATIVE_PREFIX};
+
+        // Mirrors two real serial logs: the deterministic-queue-policy phase
+        // (task A prints first) and the KVM-observed phase (issue #21
+        // defect 3: a burst of caught-up PIT ticks preempts task A before
+        // its first print, so B goes first). The verdict line is identical
+        // either way — that is the whole point of this fix, so both logs
+        // must be found and pass.
+        let a_first_log = "\
+[sched] cooperative: A0 B0 A1 B1 A2 B2 (raw sequence above; not the pass/fail gate)
+[sched] cooperative: interleave=strict per-task-order=ok iters=3/3 ok
+[sched] cooperative: deferred-tick-preemptions observed=0
+";
+        let b_first_log = "\
+[sched] cooperative: B0 A0 B1 A1 B2 A2 (raw sequence above; not the pass/fail gate)
+[sched] cooperative: interleave=strict per-task-order=ok iters=3/3 ok
+[sched] cooperative: deferred-tick-preemptions observed=1
+";
+        for log in [a_first_log, b_first_log] {
+            let line = log
+                .lines()
+                .find(|l| l.contains(SCHED_COOPERATIVE_PREFIX))
+                .expect("verdict line present");
+            assert!(coop_verdict_passed(line));
+        }
+    }
+
+    #[test]
+    fn coop_verdict_passed_rejects_broken_interleave() {
+        use super::coop_verdict_passed;
+
+        let line = "[sched] cooperative: interleave=broken per-task-order=ok iters=3/3 FAIL";
+        assert!(!coop_verdict_passed(line));
+    }
+
+    #[test]
+    fn coop_verdict_passed_rejects_broken_per_task_order() {
+        use super::coop_verdict_passed;
+
+        let line = "[sched] cooperative: interleave=strict per-task-order=fail iters=2/3 FAIL";
+        assert!(!coop_verdict_passed(line));
+    }
+
+    #[test]
+    fn coop_verdict_passed_rejects_a_short_iteration_count() {
+        use super::coop_verdict_passed;
+
+        let line = "[sched] cooperative: interleave=strict per-task-order=ok iters=2/3 FAIL";
+        assert!(!coop_verdict_passed(line));
+    }
+
+    #[test]
+    fn coop_verdict_passed_rejects_a_line_that_ends_in_fail() {
+        use super::coop_verdict_passed;
+
+        // Defensive: even if every field substring matched, the line must
+        // still end in "ok", not "FAIL".
+        let line = "[sched] cooperative: interleave=strict per-task-order=ok iters=3/3 FAIL";
+        assert!(!coop_verdict_passed(line));
+    }
+
+    #[test]
+    fn sched_cooperative_prefix_does_not_match_the_raw_diagnostic_line() {
+        use super::SCHED_COOPERATIVE_PREFIX;
+
+        // The raw sequence line and the deferred-tick-preemptions line share
+        // the short `"[sched] cooperative: "` text but not the longer
+        // verdict-line prefix (through `"interleave="`) — `boot_test` must
+        // only ever match the verdict line, never these diagnostic ones.
+        let raw = "[sched] cooperative: (raw sequence above; not the pass/fail gate)";
+        let deferred = "[sched] cooperative: deferred-tick-preemptions observed=0";
+        assert!(!raw.contains(SCHED_COOPERATIVE_PREFIX));
+        assert!(!deferred.contains(SCHED_COOPERATIVE_PREFIX));
     }
 }
