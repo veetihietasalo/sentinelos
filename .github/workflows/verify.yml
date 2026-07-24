@@ -73,6 +73,13 @@ jobs:
     name: Kani (proof harnesses) [experimental]
     runs-on: ubuntu-latest
     continue-on-error: true
+    # The first real run (2026-07-24) showed `cargo kani -p hal` discharges in
+    # ~21 min but `cargo kani -p kernel` ran 100+ min without terminating. Cap
+    # the job so a runaway proof cannot occupy a runner for the 6 h default;
+    # 90 min comfortably covers the proven hal step plus setup. If the kernel
+    # step keeps timing out, make its harnesses tractable (or split it out)
+    # before promoting anything beyond the hal proofs to gating.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable toolchain (from rust-toolchain.toml)
