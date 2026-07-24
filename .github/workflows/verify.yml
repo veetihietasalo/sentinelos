@@ -55,20 +55,20 @@ jobs:
       # prohibitively slow under Miri's interpreter, so we scope this to `ml::` —
       # the int8-quantised GEMM/MLP arithmetic that most benefits from Miri's
       # UB/pointer-provenance checking. Do not widen this to the whole suite.
-      - name: cargo +nightly miri test -p kernel ml::
+      - name: "cargo +nightly miri test -p kernel ml::"
         working-directory: kernel
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
-        run: cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu ml::
+        run: "cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu ml::"
 
   # EXPERIMENTAL — non-gating. The in-tree Kani harnesses (`capability_from_flags_
   # is_total` in kernel::ml, `vnni_bias_correction_is_exact` in hal::simd, plus the
-  # apic decode proofs in hal::apic/cpuid/ata) have never been discharged in CI: the
-  # Kani toolchain cannot fetch its setup bundle in the dev sandbox this repo was
-  # authored in, so `cargo kani setup` and the proofs themselves are UNTESTED here.
+  # apic decode proofs in hal::apic/cpuid/ata) have never been discharged in CI.
+  # `cargo kani setup` itself is proven to work on the runners (first real run,
+  # 2026-07-24), but the harnesses themselves have not yet passed a full run.
   # `continue-on-error: true` keeps this job from blocking merges until a real CI
-  # run proves the setup + harnesses actually pass; once that is confirmed, promote
-  # this job to gating by deleting `continue-on-error`.
+  # run proves the harnesses actually pass; once that is confirmed, promote this
+  # job to gating by deleting `continue-on-error`.
   kani:
     name: Kani (proof harnesses) [experimental]
     runs-on: ubuntu-latest
@@ -84,9 +84,15 @@ jobs:
         run: cargo install --locked kani-verifier
       - name: cargo kani setup
         run: cargo kani setup
+      # `--ignore-global-asm` is REQUIRED: hal's context.rs defines the context-
+      # switch primitive in `global_asm!`, which Kani cannot model — without the
+      # flag it refuses to compile the crate at all (and `-p kernel` inherits the
+      # same failure through its hal dependency). The in-tree harnesses verify
+      # pure decode/arithmetic logic, not the asm, so ignoring it does not weaken
+      # what these specific proofs claim.
       - name: cargo kani -p hal
         working-directory: kernel
-        run: cargo kani -p hal
+        run: cargo kani -p hal -Z unstable-options --ignore-global-asm
       - name: cargo kani -p kernel
         working-directory: kernel
-        run: cargo kani -p kernel
+        run: cargo kani -p kernel -Z unstable-options --ignore-global-asm
