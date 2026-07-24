@@ -55,11 +55,11 @@ jobs:
       # prohibitively slow under Miri's interpreter, so we scope this to `ml::` —
       # the int8-quantised GEMM/MLP arithmetic that most benefits from Miri's
       # UB/pointer-provenance checking. Do not widen this to the whole suite.
-      - name: cargo +nightly miri test -p kernel ml::
+      - name: "cargo +nightly miri test -p kernel ml::"
         working-directory: kernel
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
-        run: cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu ml::
+        run: "cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu ml::"
 
   # EXPERIMENTAL — non-gating. The in-tree Kani harnesses (`capability_from_flags_
   # is_total` in kernel::ml, `vnni_bias_correction_is_exact` in hal::simd, plus the
