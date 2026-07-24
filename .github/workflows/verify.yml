@@ -73,12 +73,20 @@ jobs:
     name: Kani (proof harnesses) [experimental]
     runs-on: ubuntu-latest
     continue-on-error: true
-    # The first real run (2026-07-24) showed `cargo kani -p hal` discharges in
-    # ~21 min but `cargo kani -p kernel` ran 100+ min without terminating. Cap
-    # the job so a runaway proof cannot occupy a runner for the 6 h default;
-    # 90 min comfortably covers the proven hal step plus setup. If the kernel
-    # step keeps timing out, make its harnesses tractable (or split it out)
-    # before promoting anything beyond the hal proofs to gating.
+    # Real-run data (2026-07-24): `cargo kani -p hal` discharges in 18-21 min;
+    # `cargo kani -p kernel` ran 3 h 45 min+ without terminating. The caps below
+    # keep a runaway proof from occupying a runner for the 6 h default.
+    #
+    # The caps live on the STEPS, not the job: a job-level timeout marks the job
+    # `cancelled`, which `continue-on-error` does NOT neutralize (proven by run
+    # 30108091090 — the whole workflow went `cancelled`), whereas a step-level
+    # timeout FAILS the step, and a failed job IS neutralized (proven by run
+    # 30099347652). The job-level cap stays only as a backstop for hangs outside
+    # the kani steps (checkout/install); if it ever fires, the run shows
+    # `cancelled` — acceptable for that rare case.
+    #
+    # If the kernel step keeps timing out, make its harnesses tractable (or
+    # split them out) before promoting anything beyond the hal proofs to gating.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -99,7 +107,9 @@ jobs:
       # what these specific proofs claim.
       - name: cargo kani -p hal
         working-directory: kernel
+        timeout-minutes: 45
         run: cargo kani -p hal -Z unstable-options --ignore-global-asm
       - name: cargo kani -p kernel
         working-directory: kernel
+        timeout-minutes: 30
         run: cargo kani -p kernel -Z unstable-options --ignore-global-asm
