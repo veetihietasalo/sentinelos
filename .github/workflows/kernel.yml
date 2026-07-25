@@ -29,6 +29,13 @@ jobs:
   kernel-ci:
     name: Build · Lint · Boot-test
     runs-on: ubuntu-latest
+    # No job here should ever approach this: the whole build+lint+boot pipeline
+    # runs in ~2 min. The cap exists because GitHub's default is 6 HOURS, and a
+    # hung QEMU boot test does not fail — it sits there looking busy. That is not
+    # hypothetical: two `cargo kani -p kernel` runs burned 5 h 38 min and
+    # 5 h 41 min each against that default before anyone could tell they were
+    # never going to finish (2026-07-24). Every job in this repo gets a cap.
+    timeout-minutes: 20
 
     steps:
       # ── 1. Source ──────────────────────────────────────────────────────────

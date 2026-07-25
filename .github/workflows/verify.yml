@@ -6,11 +6,10 @@ name: Verify (Miri + Kani)
 # (out-of-bounds/misaligned pointer use, use-after-free, data races).
 #
 # Kani proof harnesses live in-tree (`#[cfg(kani)]` in hal's cpuid.rs / ata.rs /
-# simd.rs / apic.rs, and kernel's ml.rs) and are run by the `kani` job below with
-# `cargo kani -p hal` and `cargo kani -p kernel`. That job is EXPERIMENTAL
-# (`continue-on-error: true`): the harnesses have never been discharged in CI, only
-# written in-tree and reasoned about locally, since the Kani toolchain cannot fetch
-# its bundle in the dev sandbox. See the `kani` job below for the promotion plan.
+# simd.rs / apic.rs, and kernel's ml.rs / sched/mod.rs) and run in two jobs below:
+# `kani-hal` (GATING — promoted 2026-07-24 after three consecutive real CI runs
+# discharged every hal harness in 14-21 min) and `kani-kernel` (EXPERIMENTAL,
+# `continue-on-error: true` — see that job's comment for its promotion plan).
 on:
   # Scoped to main: an unscoped `push:` also fires on PR branches, duplicating
   # every PR's run (the `push` and `pull_request` events have different
@@ -33,6 +32,11 @@ jobs:
   miri:
     name: Miri (hal UB check)
     runs-on: ubuntu-latest
+    # ~2 min in practice. Miri interprets rather than executes, so a pathological
+    # test does not crash — it crawls. Capped for the same reason every other job
+    # in this repo is: GitHub's default is 6 HOURS (see the Kani job's 5 h 38 min
+    # / 5 h 41 min silent burns, 2026-07-24).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install nightly + miri
@@ -61,33 +65,32 @@ jobs:
           MIRIFLAGS: -Zmiri-disable-isolation
         run: "cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu ml::"
 
-  # EXPERIMENTAL — non-gating. The in-tree Kani harnesses (`capability_from_flags_
-  # is_total` in kernel::ml, `vnni_bias_correction_is_exact` in hal::simd, plus the
-  # apic decode proofs in hal::apic/cpuid/ata) have never been discharged in CI.
-  # `cargo kani setup` itself is proven to work on the runners (first real run,
-  # 2026-07-24), but the harnesses themselves have not yet passed a full run.
-  # `continue-on-error: true` keeps this job from blocking merges until a real CI
-  # run proves the harnesses actually pass; once that is confirmed, promote this
-  # job to gating by deleting `continue-on-error`.
-  kani:
-    name: Kani (proof harnesses) [experimental]
+  # GATING — promoted from experimental on 2026-07-24, per the original promotion
+  # plan: three consecutive real CI runs discharged every hal harness (apic/cpuid/
+  # ata decode, plus simd's VNNI bias-correction proofs). A failure or timeout
+  # here now blocks merge, exactly like Miri.
+  #
+  # Runtime note: this job used to take 14-21 min, of which 93% was ONE harness
+  # (`vnni_bias_correction_is_exact`, a 4-lane multiplier equivalence) whose SAT
+  # solve swung ±50% run to run. Splitting it into a one-lane base case + an
+  # inductive step (see hal::simd::proofs) cut that to ~47 s and made the runtime
+  # stable — which is what makes gating on this job safe. Keep it that way: a
+  # harness that bit-blasts several simultaneous multipliers does not belong in a
+  # gating job. Measure before adding one (`cargo kani -p hal --harness NAME`).
+  #
+  # `--ignore-global-asm` is REQUIRED: hal's context.rs defines the context-switch
+  # primitive in `global_asm!`, which Kani cannot model — without the flag it
+  # refuses to compile the crate at all. The harnesses verify pure decode/
+  # arithmetic logic, not the asm, so ignoring it does not weaken these proofs.
+  #
+  # A job-level timeout is fine on a GATING job: `cancelled` and `failure` both
+  # hold the gate. (The cancelled-vs-failure distinction only matters on the
+  # non-gating `kani-kernel` job below, where `continue-on-error` neutralizes
+  # failures but NOT cancellations — proven by runs 30108091090 / 30116133334.)
+  kani-hal:
+    name: Kani (hal proofs)
     runs-on: ubuntu-latest
-    continue-on-error: true
-    # Real-run data (2026-07-24): `cargo kani -p hal` discharges in 18-21 min;
-    # `cargo kani -p kernel` ran 3 h 45 min+ without terminating. The caps below
-    # keep a runaway proof from occupying a runner for the 6 h default.
-    #
-    # The caps live on the STEPS, not the job: a job-level timeout marks the job
-    # `cancelled`, which `continue-on-error` does NOT neutralize (proven by run
-    # 30108091090 — the whole workflow went `cancelled`), whereas a step-level
-    # timeout FAILS the step, and a failed job IS neutralized (proven by run
-    # 30099347652). The job-level cap stays only as a backstop for hangs outside
-    # the kani steps (checkout/install); if it ever fires, the run shows
-    # `cancelled` — acceptable for that rare case.
-    #
-    # If the kernel step keeps timing out, make its harnesses tractable (or
-    # split them out) before promoting anything beyond the hal proofs to gating.
-    timeout-minutes: 90
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable toolchain (from rust-toolchain.toml)
@@ -99,16 +102,39 @@ jobs:
         run: cargo install --locked kani-verifier
       - name: cargo kani setup
         run: cargo kani setup
-      # `--ignore-global-asm` is REQUIRED: hal's context.rs defines the context-
-      # switch primitive in `global_asm!`, which Kani cannot model — without the
-      # flag it refuses to compile the crate at all (and `-p kernel` inherits the
-      # same failure through its hal dependency). The in-tree harnesses verify
-      # pure decode/arithmetic logic, not the asm, so ignoring it does not weaken
-      # what these specific proofs claim.
       - name: cargo kani -p hal
         working-directory: kernel
-        timeout-minutes: 45
         run: cargo kani -p hal -Z unstable-options --ignore-global-asm
+
+  # EXPERIMENTAL — non-gating. The kernel-crate harnesses (ml.rs, sched/mod.rs).
+  # Real-run data (2026-07-24): two uncapped runs of `cargo kani -p kernel` died
+  # at GitHub's 6 h job ceiling after 5 h 38 min / 5 h 41 min in the step.
+  # The step-level cap keeps a runaway proof from occupying a runner: a step
+  # timeout FAILS the step, and `continue-on-error` neutralizes the failed job
+  # (workflow stays green — proven by run 30116133334). The job-level cap is only
+  # a backstop for hangs outside the kani step (checkout/install); if it ever
+  # fires the run shows `cancelled` — acceptable for that rare case.
+  #
+  # Promote to gating (delete `continue-on-error`) once a real CI run discharges
+  # every kernel harness inside the step cap.
+  kani-kernel:
+    name: Kani (kernel proofs) [experimental]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy,llvm-tools
+          targets: x86_64-unknown-none
+      - name: Install kani-verifier
+        run: cargo install --locked kani-verifier
+      - name: cargo kani setup
+        run: cargo kani setup
+      # `--ignore-global-asm`: same requirement as kani-hal — `-p kernel` inherits
+      # hal's `global_asm!` through its dependency on the hal crate.
       - name: cargo kani -p kernel
         working-directory: kernel
         timeout-minutes: 30

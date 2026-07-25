@@ -41,6 +41,11 @@ jobs:
   kvm-smp:
     name: KVM boot (x2APIC enable proof)
     runs-on: ubuntu-latest
+    # ~1 min in practice. Capped because GitHub's default is 6 HOURS and a KVM
+    # boot that never reaches its serial marker hangs rather than failing — the
+    # same silent-burn failure mode that cost 5 h 38 min and 5 h 41 min of runner
+    # time on the Kani job (2026-07-24). Every job in this repo gets a cap.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout SentinelOS
