@@ -32,6 +32,11 @@ jobs:
   miri:
     name: Miri (hal UB check)
     runs-on: ubuntu-latest
+    # ~2 min in practice. Miri interprets rather than executes, so a pathological
+    # test does not crash — it crawls. Capped for the same reason every other job
+    # in this repo is: GitHub's default is 6 HOURS (see the Kani job's 5 h 38 min
+    # / 5 h 41 min silent burns, 2026-07-24).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install nightly + miri
