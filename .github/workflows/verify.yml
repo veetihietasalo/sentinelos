@@ -67,8 +67,16 @@ jobs:
 
   # GATING — promoted from experimental on 2026-07-24, per the original promotion
   # plan: three consecutive real CI runs discharged every hal harness (apic/cpuid/
-  # ata decode, simd's `vnni_bias_correction_is_exact`) in 14-21 min. A failure or
-  # timeout here now blocks merge, exactly like Miri.
+  # ata decode, plus simd's VNNI bias-correction proofs). A failure or timeout
+  # here now blocks merge, exactly like Miri.
+  #
+  # Runtime note: this job used to take 14-21 min, of which 93% was ONE harness
+  # (`vnni_bias_correction_is_exact`, a 4-lane multiplier equivalence) whose SAT
+  # solve swung ±50% run to run. Splitting it into a one-lane base case + an
+  # inductive step (see hal::simd::proofs) cut that to ~47 s and made the runtime
+  # stable — which is what makes gating on this job safe. Keep it that way: a
+  # harness that bit-blasts several simultaneous multipliers does not belong in a
+  # gating job. Measure before adding one (`cargo kani -p hal --harness NAME`).
   #
   # `--ignore-global-asm` is REQUIRED: hal's context.rs defines the context-switch
   # primitive in `global_asm!`, which Kani cannot model — without the flag it

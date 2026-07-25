@@ -326,11 +326,14 @@ boot proof (`infer_block_prove`), and checksum anchor.
   novel part — the unsigned/signed **bias-correction ring identity** — also gets an
   *always-on, hardware-independent* guard: a pure model (`vnni_cell_bias`, no `asm!`)
   checked equal to the scalar dot product by host tests that run on **every**
-  runner and under Miri (a 2000-shape sweep + a wrap case). A Kani harness
-  (`vnni_bias_correction_is_exact`, symbolic bytes) is also written in-tree
-  (`#[cfg(kani)]`), but it is discharged only by the experimental CI Kani job —
-  it has never been proven live in CI, so it is not yet the enforced guard; the
-  always-on host tests + Miri are. TCG cannot execute the kernel, so the always-on
+  runner and under Miri (a 2000-shape sweep + a wrap case). Kani harnesses
+  (`#[cfg(kani)]`) cover the same identity symbolically and, as of 2026-07-25, are
+  **enforced** by the gating `kani-hal` CI job: `vnni_bias_correction_one_lane_is_exact`
+  (real functions, one lane, all 2^16 byte pairs) plus `vnni_bias_correction_step_is_exact`
+  (the inductive step over an arbitrary accumulator, extending the result to every
+  lane count). They replaced a fixed `K = 4` equivalence that cost 858 s of SAT
+  solving and was never discharged live. The always-on host tests + Miri remain a
+  parallel multi-lane guard on the real functions. TCG cannot execute the kernel, so the always-on
   Kernel CI shows
   `active=avx2`; the KVM boot job asserts `active=avx512-vnni` + `int8 GEMM ok` on
   runners that expose VNNI — **observed** on the tier's first CI run (serial log

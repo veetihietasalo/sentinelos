@@ -750,8 +750,10 @@ unsafe fn vnni_dp16(a_dword: u32, b: *const u8, c: *mut i32) {
 /// signed, wrapping, *not* saturating) plus the column-sum correction, but with **no
 /// `asm!`**. Extracted so the **ring identity** that makes it equal the signed scalar
 /// dot product — `Σ (a+128)·b − 128·Σ b = Σ a·b` (mod 2³²) — can be checked
-/// exhaustively/independently of any AVX-512 hardware: by the Kani proof
-/// [`proofs::vnni_bias_correction_is_exact`] (symbolic bytes) and the always-on host
+/// exhaustively/independently of any AVX-512 hardware: by the Kani proofs
+/// [`proofs::vnni_bias_correction_one_lane_is_exact`] +
+/// [`proofs::vnni_bias_correction_step_is_exact`] (symbolic bytes, all lane
+/// counts by induction) and the always-on host
 /// test [`tests::vnni_bias_model_matches_scalar`] (both run on **any** CPU, unlike
 /// the hardware differential tests which need `avx512vnni`). This is a re-derivation
 /// of the kernel's arithmetic, not the code path itself; the hardware differential
@@ -991,10 +993,12 @@ mod tests {
     // (SM1/SM2). The two tests below check it on the **pure model** (`vnni_cell_bias`,
     // no `asm!`), so they run on **every** host — including Miri and non-`avx512vnni`
     // CI runners where the hardware differential tests skip the VNNI kernel — giving
-    // the ring identity an always-on, hardware-independent regression guard. (A Kani
-    // harness — `proofs::vnni_bias_correction_is_exact`, symbolic over the byte
-    // space — is in-tree; it is discharged by the experimental CI Kani job once that
-    // is proven live. Until then these host tests are the enforced guard.)
+    // the ring identity an always-on, hardware-independent regression guard. Kani
+    // harnesses cover the same identity symbolically — `proofs::vnni_bias_correction_
+    // one_lane_is_exact` (real functions, one lane) plus `..._step_is_exact` (the
+    // inductive step, giving all lane counts) — and are enforced by the GATING
+    // `kani-hal` CI job. These host tests remain the multi-lane guard on the real
+    // functions: see the step harness's docs for why that split matters.
 
     #[test]
     fn vnni_bias_model_matches_scalar() {
@@ -1119,11 +1123,68 @@ mod tests {
 mod proofs {
     use super::{scalar_cell, vnni_cell_bias};
 
+    /// Kani proof (base case) — one full lane of the real [`vnni_cell_bias`]
+    /// against the real [`scalar_cell`] oracle, symbolic over both bytes (all
+    /// 2¹⁶ pairs). This is the harness that pins the *actual functions*: the
+    /// `^ 0x80` unsigned-bias trick, the `wrapping` accumulation, and the final
+    /// `− 128·Σb` correction are all exercised as written.
+    ///
+    /// Together with [`vnni_bias_correction_step_is_exact`] below this gives the
+    /// identity for **every** `K` by induction, which is strictly stronger than
+    /// the single fixed `K = 4` instance this harness replaced — and 18× cheaper
+    /// (7.8 s + 39.6 s, vs 858 s for `K = 4`).
     #[kani::proof]
-    fn vnni_bias_correction_is_exact() {
-        const K: usize = 4;
-        let a: [i8; K] = kani::any();
-        let b: [i8; K] = kani::any();
+    fn vnni_bias_correction_one_lane_is_exact() {
+        let a: [i8; 1] = kani::any();
+        let b: [i8; 1] = kani::any();
         assert_eq!(vnni_cell_bias(&a, &b), scalar_cell(&a, &b));
+    }
+
+    /// Kani proof (inductive step) — folding one more lane into an ARBITRARY
+    /// accumulator state preserves the ring identity: for any `(acc, colsum)`
+    /// and any byte pair `(av, bv)`,
+    ///
+    /// ```text
+    /// (acc + au·bv) − 128·(colsum + bv)  ==  (acc − 128·colsum) + av·bv
+    /// ```
+    ///
+    /// where `au = av + 128`. The two sides are exactly [`vnni_cell_bias`]'s and
+    /// [`scalar_cell`]'s loop bodies. With the base case above, induction over
+    /// the lane count gives `vnni_cell_bias == scalar_cell` for all `K`.
+    ///
+    /// WHY THIS SHAPE, AND WHAT IT DOES NOT COVER. The direct `K`-lane
+    /// equivalence forces CBMC to bit-blast `K` simultaneous multiplier
+    /// equivalences, which explodes: measured 2026-07-25 on a 15 GiB machine
+    /// (same class as the CI runners) at 7.8 s / 155 s / 572 s / 858 s for
+    /// `K` = 1 / 2 / 3 / 4 — the last of which was 93% of the entire gating hal
+    /// job and swung 14→21 min run to run on solver luck alone. This harness
+    /// carries ONE multiplier pair and a fixed cost independent of `K`.
+    ///
+    /// The trade: this step states the loop bodies inline rather than calling
+    /// the functions, so it proves the *algebra* is right, not that
+    /// `vnni_cell_bias`'s loop still implements this algebra. That coupling is
+    /// held by the base case above (real functions, symbolic) and by the
+    /// always-on host test [`tests::vnni_bias_model_matches_scalar`] (real
+    /// functions, multi-lane, concrete — 2000-shape sweep). Keep all three: if
+    /// the loop body in `vnni_cell_bias` is edited, this harness must be edited
+    /// to match, and the host test is what catches the mismatch if it is not.
+    #[kani::proof]
+    fn vnni_bias_correction_step_is_exact() {
+        let acc: i32 = kani::any();
+        let colsum: i32 = kani::any();
+        let av: i8 = kani::any();
+        let bv: i8 = kani::any();
+
+        // `vnni_cell_bias`'s loop body, then its final correction.
+        let au = ((av as u8) ^ 0x80) as i32;
+        let acc_next = acc.wrapping_add(au * (bv as i32));
+        let colsum_next = colsum.wrapping_add(bv as i32);
+        let vnni_next = acc_next.wrapping_sub(128i32.wrapping_mul(colsum_next));
+
+        // The same state advanced through `scalar_cell`'s loop body instead.
+        let vnni_prev = acc.wrapping_sub(128i32.wrapping_mul(colsum));
+        let scalar_next = vnni_prev.wrapping_add((av as i32) * (bv as i32));
+
+        assert_eq!(vnni_next, scalar_next);
     }
 }
