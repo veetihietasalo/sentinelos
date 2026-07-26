@@ -1,0 +1,46 @@
+name: Workflow hygiene
+
+# Guards the CI configuration itself. Today it enforces one rule: no job may
+# inherit GitHub's 6-hour default timeout.
+#
+# The rule exists because two `cargo kani -p kernel` runs sat on a runner for
+# 5 h 38 min and 5 h 41 min (2026-07-24) before that default killed them — they
+# never failed, they just looked busy. Every job was then capped by hand, but a
+# hand-checked invariant is one PR away from being false again, which is how the
+# gap appeared in the first place. This makes it machine-checked.
+#
+# Scoped to `.github/**`: a workflow's job list cannot change without touching
+# it, so running this on unrelated PRs would only burn runner time.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/**"
+  pull_request:
+    paths:
+      - ".github/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  job-timeouts:
+    name: Every job declares a timeout
+    runs-on: ubuntu-latest
+    # Dogfooding: this job is subject to the rule it enforces. Seconds of real
+    # work, so the cap is only a hang backstop.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # PyYAML is present on the standard ubuntu-latest image; install only if
+      # a future image drops it, rather than paying for a pip run every time.
+      - name: Ensure PyYAML
+        run: python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+      # Check the checker first: a guard that only ever passes is
+      # indistinguishable from no guard, so its negative cases are verified on
+      # every run rather than trusted from a one-off manual test.
+      - name: Self-test the guard
+        run: python3 .github/scripts/check-job-timeouts.py --selftest
+      - name: Assert no job inherits the 6-hour default
+        run: python3 .github/scripts/check-job-timeouts.py
