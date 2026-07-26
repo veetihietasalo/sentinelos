@@ -469,6 +469,28 @@ fn with_interrupts_disabled<R>(f: impl FnOnce() -> R) -> R {
 
 // ── Scheduling core ──────────────────────────────────────────────────────────
 
+/// The entire queue interface [`pick_next`] needs: take the head, put a task
+/// on the tail. Deliberately this small — it exists so the round-robin policy
+/// can be stated independently of the *container*, which is what lets the Kani
+/// harness verify the real [`pick_next`] over an allocation-free queue instead
+/// of over `VecDeque`'s heap model. Production uses the `VecDeque` impl below
+/// and monomorphises to identical code.
+trait ReadyQueue {
+    /// Remove and return the task at the head, or `None` if empty.
+    fn pop_front(&mut self) -> Option<TaskId>;
+    /// Append a task to the tail.
+    fn push_back(&mut self, id: TaskId);
+}
+
+impl ReadyQueue for VecDeque<TaskId> {
+    fn pop_front(&mut self) -> Option<TaskId> {
+        VecDeque::pop_front(self)
+    }
+    fn push_back(&mut self, id: TaskId) {
+        VecDeque::push_back(self, id)
+    }
+}
+
 /// Pure round-robin scheduling decision, decoupled from any HAL/heap resource
 /// (`Task`/`Context`/`KernelStack`) so the entire queue **policy** — rotation,
 /// exit bookkeeping, and Invariant #4 (`ready` never contains `current`; no id
@@ -481,8 +503,18 @@ fn with_interrupts_disabled<R>(f: impl FnOnce() -> R) -> R {
 /// records `prev_id` into `*zombie` instead — an exited task is never
 /// requeued, it is reaped later. Returns `None` (queue left untouched) if
 /// nothing else is runnable.
-fn pick_next(
-    ready: &mut VecDeque<TaskId>,
+///
+/// Generic over [`ReadyQueue`] rather than taking `&mut VecDeque<TaskId>`
+/// directly, so the Kani harness can drive **this exact function** over an
+/// allocation-free queue. Under CBMC, `VecDeque`'s heap model (`RawVec`,
+/// wrap-around index arithmetic, allocation reasoning) dominated the formula
+/// and capped the bounded proof at 2 scheduler passes — deeper bounds
+/// exhausted 15 GiB with no verdict. With [`proofs::ArrayQueue`] the same
+/// policy is proven to a far greater depth without modelling a model. In
+/// production this monomorphises to the `VecDeque` implementation below, so
+/// codegen is unchanged.
+fn pick_next<Q: ReadyQueue>(
+    ready: &mut Q,
     zombie: &mut Option<TaskId>,
     prev_id: TaskId,
     prev_exiting: bool,
@@ -1940,10 +1972,83 @@ mod tests {
 #[cfg(kani)]
 mod proofs {
     use super::{
-        pick_next, preempt_disable, preempt_enable, tick_action, TaskId, TickAction, PREEMPT_COUNT,
+        pick_next, preempt_disable, preempt_enable, tick_action, ReadyQueue, TaskId, TickAction,
+        PREEMPT_COUNT,
     };
-    use alloc::collections::VecDeque;
     use core::sync::atomic::Ordering;
+
+    /// An allocation-free [`ReadyQueue`] for the proofs: a fixed array plus a
+    /// length, shifted on pop.
+    ///
+    /// This exists to get `VecDeque` out of the formula. CBMC's cost for the
+    /// Invariant #4 proof was dominated not by the scheduling policy but by
+    /// `VecDeque`'s heap model — `RawVec`, allocation reasoning, and
+    /// wrap-around head/tail arithmetic — which capped the bound at 2 symbolic
+    /// scheduler passes; 3 exhausted 15 GiB with no verdict (measured
+    /// 2026-07-25). Everything here is a plain array write CBMC handles
+    /// cheaply.
+    ///
+    /// Crucially this is NOT a re-modelling of the scheduler: [`pick_next`] —
+    /// the real production function, unmodified — is what the harness drives.
+    /// Only the container it pops from is swapped, and the container's contract
+    /// (`pop_front` takes the head, `push_back` appends to the tail) is the
+    /// whole of what [`ReadyQueue`] promises and what `VecDeque` provides.
+    #[derive(Clone, Copy)]
+    struct ArrayQueue<const N: usize> {
+        buf: [TaskId; N],
+        len: usize,
+    }
+
+    impl<const N: usize> ArrayQueue<N> {
+        fn new() -> Self {
+            Self {
+                buf: [TaskId::from_usize(0); N],
+                len: 0,
+            }
+        }
+
+        fn len(&self) -> usize {
+            self.len
+        }
+
+        /// Element at `i`, or `None` past the end. Used only by assertions.
+        fn get(&self, i: usize) -> Option<TaskId> {
+            if i < self.len {
+                Some(self.buf[i])
+            } else {
+                None
+            }
+        }
+    }
+
+    impl<const N: usize> ReadyQueue for ArrayQueue<N> {
+        fn pop_front(&mut self) -> Option<TaskId> {
+            if self.len == 0 {
+                return None;
+            }
+            let head = self.buf[0];
+            // Constant-trip shift: `0..N-1` is a compile-time bound, so CBMC
+            // unrolls a fixed number of copies with no loop guard to refute —
+            // the same reason the assertion scans below use a constant range.
+            for i in 0..N - 1 {
+                if i + 1 < self.len {
+                    self.buf[i] = self.buf[i + 1];
+                }
+            }
+            self.len -= 1;
+            Some(head)
+        }
+
+        fn push_back(&mut self, id: TaskId) {
+            // The harness's universe is `N` ids and `pick_next` never grows the
+            // queue net (one pop per push), so overflow is unreachable; assert
+            // rather than silently drop, so a future harness change that broke
+            // that reasoning would fail the proof instead of weakening it.
+            assert!(self.len < N);
+            self.buf[self.len] = id;
+            self.len += 1;
+        }
+    }
 
     /// Kani proof — Invariant #4 over a bounded, symbolic sequence of
     /// scheduler passes: `ready` never contains the new `current`, and the
@@ -1957,26 +2062,47 @@ mod proofs {
     /// Mirrors the host test `no_lost_or_duplicated_ids_across_many_steps`,
     /// but Kani explores every possible `exiting` choice at every step,
     /// rather than one fixed concrete sequence.
-    /// `STEPS = 2` (was 4): CBMC's cost cliff between depths is extreme —
-    /// measured locally 2026-07-25 (15 GiB machine, same class as the CI
-    /// runners): depth 2 verifies in ~4 s, depth 3 and 4 die in CBMC's
-    /// propositional reduction with "CBMC appears to have run out of memory"
-    /// and no verdict. The `VecDeque`/alloc model (wrap-around index
-    /// arithmetic, allocation reasoning) dominates the formula, so the fix is
-    /// fewer symbolic passes, not a bigger unwind bound. Depth 2 still covers
-    /// the ordering this harness exists to check — a zombie recorded at step 1
-    /// is reaped at step 2, never on its own pass — across every exit/yield
-    /// choice. Deeper bounds need a deque-free harness interface or Kani
-    /// stubbing (future work).
+    /// DEPTH AND WIDTH. This was pinned at `STEPS = 2` over a 4-id universe
+    /// while the harness drove [`pick_next`] through a `VecDeque`: depth 2
+    /// verified in ~4 s, depth 3 exhausted 15 GiB in CBMC's propositional
+    /// reduction with no verdict (measured 2026-07-25). The cost was the
+    /// *container*, not the policy — `RawVec`, allocation reasoning and
+    /// wrap-around index arithmetic dominated the formula. Swapping in the
+    /// allocation-free [`ArrayQueue`], via the [`ReadyQueue`] trait
+    /// [`pick_next`] is now generic over, removes that entirely.
+    ///
+    /// This did NOT weaken the proof. The function under verification is still
+    /// the real, unmodified [`pick_next`]; only the container it pops from
+    /// changed, and that container's contract is the whole of what
+    /// [`ReadyQueue`] promises.
+    ///
+    /// The bound is chosen to SATURATE the reachable state space, not merely
+    /// to be as large as CBMC tolerates. With 6 live ids (1 `current` + 5
+    /// `ready`):
+    ///
+    /// - round-robin rotation has period 6 — after 6 non-exiting passes every
+    ///   task has been `current` once and the configuration repeats, so 8
+    ///   passes covers a full rotation with margin;
+    /// - at most 5 tasks can exit before the queue drains and [`pick_next`]
+    ///   returns `None` (the `break` below), so 8 passes covers every
+    ///   exit-to-empty pattern too.
+    ///
+    /// Kani explores every `exiting` choice at every step, so this is all
+    /// 2⁸ interleavings over that universe. Measured on the same 15 GiB
+    /// machine: 4.8 s here; `STEPS = 16` also passes, in 19.5 s, but only
+    /// re-walks states this bound already reaches — the extra cost buys
+    /// repeats, not coverage.
     #[kani::proof]
-    #[kani::unwind(6)]
+    #[kani::unwind(9)]
     fn invariant4_no_lost_or_duplicated_ids_bounded() {
-        const STEPS: usize = 2;
+        const STEPS: usize = 8;
         // A small, fixed universe: id 0 starts `current`; 1..=3 start `ready`.
-        let mut ready: VecDeque<TaskId> = VecDeque::new();
+        let mut ready: ArrayQueue<6> = ArrayQueue::new();
         ready.push_back(TaskId::from_usize(1));
         ready.push_back(TaskId::from_usize(2));
         ready.push_back(TaskId::from_usize(3));
+        ready.push_back(TaskId::from_usize(4));
+        ready.push_back(TaskId::from_usize(5));
         let mut current = TaskId::from_usize(0);
         let mut zombie: Option<TaskId> = None;
         // Whether each of the 4 universe ids has not yet been reaped — mirrors
@@ -1984,7 +2110,7 @@ mod proofs {
         // picking next (via `reschedule_locked`)" ordering (a zombie is only
         // removed from the live set on the pass *after* the one that recorded
         // it, never the departing pass itself).
-        let mut alive: [bool; 4] = [true, true, true, true];
+        let mut alive: [bool; 6] = [true; 6];
 
         for _ in 0..STEPS {
             // Reap any zombie from a PREVIOUS step first (never the current
@@ -1998,23 +2124,21 @@ mod proofs {
             match pick_next(&mut ready, &mut zombie, current, exiting) {
                 Some(next) => {
                     // Invariant #4: `ready` never contains the new `current`.
-                    // Constant-range indexed scan — NOT `contains`, iterators
-                    // (`iter().take(n).any(..)` included), or even a
-                    // `0..len.min(4)` range: each of those leaves CBMC a loop
-                    // guard it cannot refute, so the unwinding assertion fails
-                    // at every bound tried (6/10/25, measured 2026-07-25).
-                    // `0..4` is a compile-time constant, so CBMC unrolls
-                    // exactly 4 copies; the `i < len` body guard no-ops the
-                    // out-of-range slots, and `VecDeque` indexing itself is
-                    // loop-free wrap-around arithmetic. The 4-id universe caps
-                    // `ready.len()` at 3 (asserted), so the 4-slot scan is
-                    // exhaustive by construction.
+                    // Constant-range indexed scan — NOT `contains` or any
+                    // iterator: each of those leaves CBMC a loop guard it
+                    // cannot refute, so the unwinding assertion fails at every
+                    // bound tried (6/10/25, measured 2026-07-25 against the
+                    // old `VecDeque` harness). `0..4` is a compile-time
+                    // constant, so CBMC unrolls exactly 4 copies and `get`
+                    // no-ops the out-of-range slots. The 4-id universe caps
+                    // `ready.len()` at 3 (asserted), so the scan is exhaustive
+                    // by construction.
                     let len = ready.len();
-                    assert!(len <= 3);
+                    assert!(len <= 5);
                     let mut in_ready = false;
-                    for i in 0..4usize {
-                        if i < len {
-                            in_ready |= ready[i] == next;
+                    for i in 0..6usize {
+                        if let Some(queued) = ready.get(i) {
+                            in_ready |= queued == next;
                         }
                     }
                     assert!(!in_ready);
@@ -2030,7 +2154,7 @@ mod proofs {
                 None => {
                     // Nothing else runnable: `ready` is left empty, exactly as
                     // `pick_next` documents.
-                    assert!(ready.is_empty());
+                    assert!(ready.len() == 0);
                     break;
                 }
             }
