@@ -7,9 +7,10 @@ name: Verify (Miri + Kani)
 #
 # Kani proof harnesses live in-tree (`#[cfg(kani)]` in hal's cpuid.rs / ata.rs /
 # simd.rs / apic.rs, and kernel's ml.rs / sched/mod.rs) and run in two jobs below:
-# `kani-hal` (GATING — promoted 2026-07-24 after three consecutive real CI runs
-# discharged every hal harness in 14-21 min) and `kani-kernel` (EXPERIMENTAL,
-# `continue-on-error: true` — see that job's comment for its promotion plan).
+# `kani-hal` (promoted 2026-07-24) and `kani-kernel` (promoted 2026-07-26). Both
+# now GATE — as of 2026-07-26 every job in this workflow blocks merge on failure,
+# and none carries `continue-on-error`. Each job's comment records the evidence
+# its promotion rested on; read it before adding a harness to either.
 on:
   # Scoped to main: an unscoped `push:` also fires on PR branches, duplicating
   # every PR's run (the `push` and `pull_request` events have different
@@ -84,9 +85,11 @@ jobs:
   # arithmetic logic, not the asm, so ignoring it does not weaken these proofs.
   #
   # A job-level timeout is fine on a GATING job: `cancelled` and `failure` both
-  # hold the gate. (The cancelled-vs-failure distinction only matters on the
-  # non-gating `kani-kernel` job below, where `continue-on-error` neutralizes
-  # failures but NOT cancellations — proven by runs 30108091090 / 30116133334.)
+  # hold the gate. That equivalence is why both Kani jobs can now carry a plain
+  # job-level cap; it did NOT hold while either was non-gating, because
+  # `continue-on-error` neutralizes a failure but not a cancellation (proven by
+  # runs 30108091090 / 30116133334). Re-read that history before ever adding
+  # `continue-on-error` back to a job that has a job-level timeout.
   kani-hal:
     name: Kani (hal proofs)
     runs-on: ubuntu-latest
@@ -106,21 +109,32 @@ jobs:
         working-directory: kernel
         run: cargo kani -p hal -Z unstable-options --ignore-global-asm
 
-  # EXPERIMENTAL — non-gating. The kernel-crate harnesses (ml.rs, sched/mod.rs).
-  # Real-run data (2026-07-24): two uncapped runs of `cargo kani -p kernel` died
-  # at GitHub's 6 h job ceiling after 5 h 38 min / 5 h 41 min in the step.
-  # The step-level cap keeps a runaway proof from occupying a runner: a step
-  # timeout FAILS the step, and `continue-on-error` neutralizes the failed job
-  # (workflow stays green — proven by run 30116133334). The job-level cap is only
-  # a backstop for hangs outside the kani step (checkout/install); if it ever
-  # fires the run shows `cancelled` — acceptable for that rare case.
+  # GATING — promoted from experimental on 2026-07-26, meeting the condition this
+  # comment used to state ("once a real CI run discharges every kernel harness
+  # inside the step cap"). Five consecutive real CI runs did, at job level:
+  # e985494, 31214ab, 764dbd3, f6d1cfb, and main @ 74af523 — 6/6 harnesses in
+  # ~55-105 s, zero failures. A failure or timeout here now blocks merge.
   #
-  # Promote to gating (delete `continue-on-error`) once a real CI run discharges
-  # every kernel harness inside the step cap.
+  # Getting here took removing two intractable harnesses, both of which had been
+  # merged without ever being discharged: `cargo kani -p kernel` previously never
+  # terminated at all, and two uncapped runs died at GitHub's 6 h job ceiling
+  # after 5 h 38 min / 5 h 41 min (2026-07-24). The causes were a symbolic 64x64
+  # multiplier equivalence in `ml`, and `VecDeque`'s heap model swamping the
+  # `sched` Invariant #4 proof. Both were fixed by changing what is proven, not
+  # by weakening it — see `kernel::ml::proofs` and `kernel::sched::proofs`.
+  #
+  # The lesson worth keeping: Kani runs fine locally (`cargo kani -p kernel
+  # -Z unstable-options --ignore-global-asm`, ~60 s for the whole suite). A
+  # harness that has never been discharged locally does not belong in this
+  # gating job. Measure before adding one.
+  #
+  # The step-level cap stays as a hang backstop. It is now redundant with the
+  # job-level cap for gate purposes (a gating job holds the gate whether it ends
+  # `failure` or `cancelled`), but it fails FAST and points at the exact step,
+  # which is worth keeping.
   kani-kernel:
-    name: Kani (kernel proofs) [experimental]
+    name: Kani (kernel proofs)
     runs-on: ubuntu-latest
-    continue-on-error: true
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
