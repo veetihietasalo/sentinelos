@@ -273,6 +273,43 @@ static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
 /// [`yield_now`]/[`exit`].
 static PREEMPT_EVENTS: AtomicU64 = AtomicU64::new(0);
 
+/// While `true`, [`on_tick`] still charges each task's slice but never turns a
+/// slice expiry into a switch — neither immediately nor deferred via
+/// [`NEED_RESCHED`]. Set only by [`prove_cooperative`], for exactly the span
+/// of the PR-A cooperative boot proof, and cleared before it returns.
+///
+/// WHY THIS EXISTS. The cooperative proof asserts that the two proof tasks'
+/// prints strictly alternate. Invariant #4 guarantees the *schedule*
+/// alternates (`ready` never contains `current`), but the recorded sequence
+/// is a record of *prints*, and those two only coincide when nothing but
+/// [`yield_now`] moves the CPU. A fresh task's [`task_prologue`] resets
+/// [`PREEMPT_COUNT`] to `0` and enables interrupts the instant it starts
+/// running, so on every switch-in there is a window — before the task reaches
+/// its first [`print_marker_atomic`] and the `preempt_disable` inside it — in
+/// which a pending PIT tick can preempt it before it prints. When that lands,
+/// the task that just yielded is picked again and prints twice in a row: the
+/// schedule alternated correctly, but the print log does not show it.
+///
+/// Issue #21 defect 3 recognised this race and made the verdict phase-
+/// agnostic, which covered the window on the *first* switch-in. The window is
+/// on *every* switch-in, so the flake survived (observed 2026-07-25 on KVM CI:
+/// `B0 A0 A1 B1 A2 B2`, `interleave=broken`, alongside `deferred-tick-
+/// preemptions observed=3` in the same run).
+///
+/// Suppressing timer-driven switches for the proof's duration makes the phase
+/// genuinely cooperative, so strict alternation becomes a real guarantee
+/// rather than a hoped-for outcome — the assertion stays strong and stops
+/// flaking. Timer preemption itself is not left unproven: [`prove_preemptive`]
+/// is the proof for that, and it runs with this flag clear.
+static COOP_PROOF_NO_PREEMPT: AtomicBool = AtomicBool::new(false);
+
+/// How many slice expiries [`COOP_PROOF_NO_PREEMPT`] suppressed during the
+/// cooperative proof. Reported (informationally) by [`prove_cooperative`]: a
+/// nonzero count is the evidence that real PIT ticks *did* fire during the
+/// proof and that suppression — not luck, and not a phase too short to be
+/// ticked — is what kept the interleave strict.
+static COOP_PROOF_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
 /// Enter a preemption-disabled critical section.
 ///
 /// Increments [`PREEMPT_COUNT`]; pairs with [`preempt_enable`]. While nonzero,
@@ -327,12 +364,51 @@ pub fn on_tick() {
         return;
     }
 
-    if PREEMPT_COUNT.load(Ordering::Relaxed) == 0 {
-        if reschedule_locked(false) {
-            PREEMPT_EVENTS.fetch_add(1, Ordering::Relaxed);
+    match tick_action(
+        COOP_PROOF_NO_PREEMPT.load(Ordering::Relaxed),
+        PREEMPT_COUNT.load(Ordering::Relaxed),
+    ) {
+        TickAction::Suppress => {
+            COOP_PROOF_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
         }
+        TickAction::Switch => {
+            if reschedule_locked(false) {
+                PREEMPT_EVENTS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        TickAction::Defer => NEED_RESCHED.store(true, Ordering::Relaxed),
+    }
+}
+
+/// What [`on_tick`] does about a slice expiry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TickAction {
+    /// Withhold the switch entirely and count it — the cooperative proof is
+    /// running ([`COOP_PROOF_NO_PREEMPT`]).
+    Suppress,
+    /// Switch now: preemption is enabled and nothing is deferring it.
+    Switch,
+    /// Defer via [`NEED_RESCHED`] for [`preempt_enable`] to drain — we are
+    /// inside a [`preempt_disable`] critical section.
+    Defer,
+}
+
+/// Pure slice-expiry *policy*, decoupled from lock/HAL/global state so it is
+/// directly host- and Kani-testable — mirrors how [`tick_slice`] isolates the
+/// countdown and [`pick_next`] isolates the queue policy. The sole production
+/// caller is [`on_tick`], on the expiry path only.
+///
+/// Suppression is checked FIRST, and deliberately does not fall through to
+/// [`TickAction::Defer`]: deferring would merely postpone the same preemption
+/// to the next [`preempt_enable`], which is exactly the flake
+/// [`COOP_PROOF_NO_PREEMPT`] exists to remove.
+fn tick_action(coop_proof_no_preempt: bool, preempt_count: u32) -> TickAction {
+    if coop_proof_no_preempt {
+        TickAction::Suppress
+    } else if preempt_count == 0 {
+        TickAction::Switch
     } else {
-        NEED_RESCHED.store(true, Ordering::Relaxed);
+        TickAction::Defer
     }
 }
 
@@ -833,14 +909,12 @@ fn task_prologue() {
 ///
 /// Fixed and small, mostly for a short, readable raw diagnostic sequence
 /// line — **not** because it makes the interleave's starting phase
-/// deterministic. This kernel is preemptive (PR-B): the timer can, in
-/// principle, land at any instruction boundary, including before either
-/// task's very first print (see [`validate_cooperative_sequence`]'s docs —
-/// issue #21 defect 3 — for the full reasoning). What IS still fully
-/// deterministic, regardless of which task's first print happens to win
-/// that race: each task completes exactly this many iterations, in strict
-/// per-task order, alternating with the other task every step — exactly the
-/// properties [`validate_cooperative_sequence`] checks.
+/// deterministic. The proof runs with timer-driven switching suppressed
+/// ([`COOP_PROOF_NO_PREEMPT`]), which is what makes the interleave itself
+/// deterministic; the starting phase is still deliberately not asserted (see
+/// [`validate_cooperative_sequence`]'s docs). What is deterministic and
+/// asserted: each task completes exactly this many iterations, in strict
+/// per-task order, alternating with the other task every step.
 const PROOF_ITERATIONS: u32 = 3;
 
 /// Total `(task letter, iteration)` entries the cooperative boot proof's two
@@ -940,23 +1014,34 @@ impl CooperativeVerdict {
 /// This scheduler is preemptive (PR-B), not cooperative-only: a fresh
 /// task's [`task_prologue`] unconditionally resets [`PREEMPT_COUNT`] to `0`
 /// and enables interrupts the instant it starts running, so there is a real
-/// window — between a task's first switch-in and its first
-/// [`preempt_disable`] (inside [`print_marker_atomic`]) — during which a
-/// timer tick can legally preempt it before it ever prints. On a fast host
-/// (observed on real KVM CI) a burst of PIT ticks that piled up while the
-/// guest was descheduled can arrive and drain in exactly that window, right
-/// after task "A" is first switched into but before its first print,
-/// handing task "B" the CPU first. That makes the OVERALL PHASE of the
-/// two-task interleave a genuine race, not a guarantee this preemptive
-/// kernel can make — encoding it as a fixed verbatim string (the original
-/// marker's mistake) was simply wrong.
+/// window — between a task's switch-in and its first [`preempt_disable`]
+/// (inside [`print_marker_atomic`]) — during which a timer tick can legally
+/// preempt it before it ever prints. On a fast host (observed on real KVM CI)
+/// a burst of PIT ticks that piled up while the guest was descheduled can
+/// arrive and drain in exactly that window.
 ///
-/// What a preemptive round-robin scheduler DOES still guarantee, regardless
-/// of which task happens to go first, is: strict alternation (Invariant #4
-/// — `ready` never contains `current`, so the *other* task is always picked
-/// next) and each task's own internal ordering (nothing about preemption can
-/// reorder a single task's own sequential loop iterations). Those are
-/// exactly the properties checked below.
+/// That window exists on EVERY switch-in, not just the first. Issue #21
+/// defect 3 addressed only its effect on the starting phase (dropping the
+/// old fixed verbatim string, which was simply wrong), leaving the mid-run
+/// case: if a task is switched in and preempted before it prints, the task
+/// that just yielded runs again and prints twice in a row — the schedule
+/// alternated correctly, but this recorded sequence, which records *prints*,
+/// does not show it. That flaked on KVM CI on 2026-07-25 (`B0 A0 A1 B1 A2 B2`).
+///
+/// The fix is [`COOP_PROOF_NO_PREEMPT`]: [`prove_cooperative`] now withholds
+/// timer-driven switches for its own duration, so during the proof the only
+/// thing that moves the CPU is [`yield_now`] and the print sequence IS the
+/// schedule. Strict alternation is therefore a genuine guarantee here, not a
+/// hoped-for outcome — which is what lets the check below stay strict.
+///
+/// The checks remain phase-AGNOSTIC even so. Suppression makes which task
+/// prints first deterministic in practice, but that ordering is an artifact
+/// of spawn order and pick policy rather than a property worth freezing into
+/// an assertion — re-encoding it would just re-import the brittleness issue
+/// #21 removed. What is asserted is what a round-robin scheduler actually
+/// promises: strict alternation (Invariant #4 — `ready` never contains
+/// `current`, so the *other* task is always picked next) and each task's own
+/// internal ordering.
 ///
 /// # Checks
 ///
@@ -1036,15 +1121,22 @@ fn validate_cooperative_sequence(entries: &[(u8, u8)]) -> CooperativeVerdict {
 /// returns, so this only ever delays a real preemption by a handful of
 /// instructions, never skips one — the proof tasks' own explicit
 /// `yield_now()` (called right after, by [`proof_task_a`]/[`proof_task_b`])
-/// still hands off every iteration regardless. This is also, incidentally,
-/// the first production exercise of that deferred-drain path at boot
-/// (previously covered only by unit/Kani tests) — see [`prove_cooperative`]'s
-/// diagnostic note.
+/// still hands off every iteration regardless.
 ///
-/// Note what this bracket does **not**, and cannot, guarantee: which of the
-/// two tasks' *first* call to this function happens first overall — see
-/// [`validate_cooperative_sequence`]'s docs (issue #21 defect 3) for why
-/// that starting phase is a genuine race, not a bug.
+/// During the cooperative proof no tick requests a switch at all
+/// ([`COOP_PROOF_NO_PREEMPT`]), so this bracket is belt-and-braces there. It
+/// is kept because it is unconditionally correct, because
+/// [`print_marker_atomic`] must stay safe if the suppression is ever narrowed
+/// or removed, and because the serial-output atomicity it provides is
+/// independent of scheduling. Note that with suppression in place this is no
+/// longer a boot-time exercise of `preempt_enable`'s deferred-drain branch —
+/// that path is covered by the host unit tests and the
+/// `preempt_count_nesting_never_underflows` Kani harness.
+///
+/// Note what this bracket does **not**, and cannot, guarantee on its own:
+/// which of the two tasks' *first* call to this function happens first
+/// overall — see [`validate_cooperative_sequence`]'s docs for why that
+/// starting phase is deliberately left unasserted.
 fn print_marker_atomic(letter: &str, i: u32) {
     preempt_disable();
     hal::serial::write_str(letter);
@@ -1123,7 +1215,11 @@ fn ready_len() -> usize {
 /// helpers throughout — integer `println!` faults on this target (see
 /// `kernel/docs/hal-tcb.md` §5e). Call once, after [`init`].
 pub fn prove_cooperative() {
-    let before = PREEMPT_EVENTS.load(Ordering::Relaxed);
+    // Run the proof preemption-free so strict alternation is a real guarantee,
+    // not a race — see [`COOP_PROOF_NO_PREEMPT`]. Cleared before this function
+    // returns, so `prove_preemptive` (which must be preemptible) is unaffected.
+    COOP_PROOF_SUPPRESSED.store(0, Ordering::Relaxed);
+    COOP_PROOF_NO_PREEMPT.store(true, Ordering::Relaxed);
     reset_seq_log();
 
     spawn("A", proof_task_a);
@@ -1137,6 +1233,12 @@ pub fn prove_cooperative() {
     // starting phase is never the pass/fail gate. The verdict line below,
     // computed over this very run's `SEQ_LOG`, is.
     hal::serial::write_str("(raw sequence above; not the pass/fail gate)\n");
+
+    // Restore normal preemption before anything else runs — in particular
+    // before `prove_preemptive`, whose whole point is being preempted. Done
+    // here (not at function end) so it is restored even though the verdict
+    // printing below is itself preemptible.
+    COOP_PROOF_NO_PREEMPT.store(false, Ordering::Relaxed);
 
     let (seq_buf, seq_len) = seq_log_snapshot();
     let verdict = validate_cooperative_sequence(&seq_buf[..seq_len]);
@@ -1156,17 +1258,24 @@ pub fn prove_cooperative() {
     hal::serial::write_str(" ");
     hal::serial::write_str(if verdict.ok() { "ok\n" } else { "FAIL\n" });
 
-    // Informational only — never asserted by `cargo xtask test` (the
-    // verdict line above is the actual pass/fail gate). Whether a genuine
-    // timer tick landed inside one of `print_marker_atomic`'s
-    // `preempt_disable`/`preempt_enable` brackets during this run, and was
-    // drained end-to-end through `preempt_enable`'s deferred-reschedule
-    // branch, is inherently timing-dependent (host/TCG/KVM speed, real PIT
-    // jitter) — this just notes it when cleanly observable via
-    // `PREEMPT_EVENTS`, the same counter `prove_preemptive` uses.
-    let after = PREEMPT_EVENTS.load(Ordering::Relaxed);
-    hal::serial::write_str("[sched] cooperative: deferred-tick-preemptions observed=");
-    hal::serial::write_dec(after.wrapping_sub(before));
+    // Informational only — never asserted by `cargo xtask test` (the verdict
+    // line above is the actual pass/fail gate). Counts the slice expiries
+    // `COOP_PROOF_NO_PREEMPT` withheld during the proof: a nonzero value is
+    // the evidence that real PIT ticks fired throughout, so the strict
+    // interleave above came from suppression rather than from the phase
+    // finishing before the timer ever got a chance to fire. Zero is not a
+    // failure — on a fast host the whole proof can fit inside one quantum.
+    //
+    // This replaces a previous `deferred-tick-preemptions observed=N` line,
+    // which reported whether a tick had landed inside one of
+    // `print_marker_atomic`'s brackets and been drained through
+    // `preempt_enable`'s deferred-reschedule branch. That can no longer happen
+    // here (no switch is requested during the proof at all), so that path's
+    // boot-time exercise is gone; it remains covered by the host unit tests
+    // and the `preempt_count_nesting_never_underflows` Kani harness, and by
+    // `prove_preemptive` for real timer-driven switching.
+    hal::serial::write_str("[sched] cooperative: timer-preemptions suppressed=");
+    hal::serial::write_dec(COOP_PROOF_SUPPRESSED.load(Ordering::Relaxed));
     hal::serial::write_str("\n");
 }
 
@@ -1505,6 +1614,28 @@ mod tests {
         assert_eq!(slice, TIME_SLICE_TICKS);
     }
 
+    /// The three slice-expiry outcomes, including the cooperative-proof
+    /// suppression added to fix the KVM interleave flake (2026-07-25).
+    #[test]
+    fn tick_action_suppresses_only_during_the_cooperative_proof() {
+        use super::{tick_action, TickAction};
+
+        // Normal operation: switch immediately, or defer inside a
+        // `preempt_disable` critical section.
+        assert_eq!(tick_action(false, 0), TickAction::Switch);
+        assert_eq!(tick_action(false, 1), TickAction::Defer);
+        assert_eq!(tick_action(false, 7), TickAction::Defer);
+
+        // During the cooperative proof the switch is withheld outright — at
+        // ANY preempt count. Deferring instead would only postpone the same
+        // preemption to the next `preempt_enable`, which is the very flake
+        // the suppression exists to remove, so suppression must win over the
+        // deferral branch rather than fall through to it.
+        assert_eq!(tick_action(true, 0), TickAction::Suppress);
+        assert_eq!(tick_action(true, 1), TickAction::Suppress);
+        assert_eq!(tick_action(true, u32::MAX), TickAction::Suppress);
+    }
+
     #[test]
     fn tick_slice_never_underflows_from_zero() {
         use super::tick_slice;
@@ -1808,7 +1939,9 @@ mod tests {
 /// `ml.rs`). Run with `cargo kani -p kernel`.
 #[cfg(kani)]
 mod proofs {
-    use super::{pick_next, preempt_disable, preempt_enable, TaskId, PREEMPT_COUNT};
+    use super::{
+        pick_next, preempt_disable, preempt_enable, tick_action, TaskId, TickAction, PREEMPT_COUNT,
+    };
     use alloc::collections::VecDeque;
     use core::sync::atomic::Ordering;
 
@@ -1914,6 +2047,33 @@ mod proofs {
     /// guards against. `NEED_RESCHED` is never set here, so
     /// `preempt_enable`'s deferred-reschedule branch (which would call the
     /// Kani-opaque `hal::context::switch`) is never taken.
+    /// Kani proof — [`tick_action`] is total (never panics) over every
+    /// `(suppressed, preempt_count)` pair, and suppression dominates: whenever
+    /// the cooperative proof is running, NO slice expiry can produce a switch
+    /// or a deferred switch, at any preempt count. That dominance is the
+    /// property the KVM interleave fix rests on — a fall-through to
+    /// [`TickAction::Defer`] would merely postpone the same preemption to the
+    /// next `preempt_enable` and reintroduce the flake. Cheap: two symbolic
+    /// inputs, no loops, no multiplication.
+    #[kani::proof]
+    fn tick_action_suppression_dominates() {
+        let suppressed: bool = kani::any();
+        let preempt_count: u32 = kani::any();
+        let action = tick_action(suppressed, preempt_count);
+        if suppressed {
+            assert!(action == TickAction::Suppress);
+        } else {
+            assert!(action != TickAction::Suppress);
+            // Outside the proof the two normal outcomes are decided solely by
+            // whether we are inside a `preempt_disable` section.
+            if preempt_count == 0 {
+                assert!(action == TickAction::Switch);
+            } else {
+                assert!(action == TickAction::Defer);
+            }
+        }
+    }
+
     #[kani::proof]
     #[kani::unwind(9)]
     fn preempt_count_nesting_never_underflows() {
