@@ -185,10 +185,25 @@ pub fn init() {
 /// iteration count, not a real timer) guarantees boot cannot hang on a quiet
 /// link. Each iteration drains all pending frames via [`poll`].
 fn drain_replies() {
-    // ~a few million spins: plenty for SLIRP's loopback-speed reply under TCG,
-    // and a hard ceiling so a silent NIC never wedges boot.
+    // Poll until the gateway's echo reply lands, then stop. The ICMP reply is
+    // the LAST of the two replies we expect (the ARP reply necessarily precedes
+    // it — the gateway must resolve us before it can answer the ping), so
+    // seeing it means the RX evidence this loop exists to capture is already in
+    // the boot log and every further spin is dead time.
+    //
+    // The iteration count is now a CEILING, not a duration. It used to be run
+    // to completion unconditionally, which cost 13.2 s of a 16.5 s TCG boot —
+    // 80% of it — while the replies had actually arrived ~1 s in (measured
+    // 2026-07-26). A quiet or absent link still cannot wedge boot: it simply
+    // exhausts the ceiling exactly as before.
+    //
+    // `poll()` runs at least once regardless, so a reply that is already
+    // pending when we arrive is still drained into the log.
     for _ in 0..8_000_000u64 {
         poll();
+        if LAST_PING_REPLY.load(Ordering::Relaxed) & PING_SEEN_BIT != 0 {
+            break;
+        }
         core::hint::spin_loop();
     }
 }
