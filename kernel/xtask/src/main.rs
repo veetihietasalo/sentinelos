@@ -27,7 +27,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::{Command, ExitCode, Stdio},
     time::{Duration, Instant},
 };
 
@@ -40,9 +40,15 @@ fn main() -> ExitCode {
         Some("test-kvm") => do_test_kvm(),
         Some("check-no-vector") => do_check_no_vector(),
         Some("screenshot") => do_screenshot(),
+        Some("boot-timing") => {
+            // Default 5 runs: enough for a median plus a visible spread without
+            // making the CI job slow.
+            let runs = args.next().and_then(|a| a.parse::<usize>().ok()).unwrap_or(5);
+            do_boot_timing(runs)
+        }
         other => {
             eprintln!(
-                "Usage: cargo xtask <build|run|test|test-kvm|check-no-vector|screenshot>\n\
+                "Usage: cargo xtask <build|run|test|test-kvm|check-no-vector|screenshot|boot-timing [runs]>\n\
                  Unknown subcommand: {:?}",
                 other
             );
@@ -744,23 +750,13 @@ fn do_check_no_vector() -> ExitCode {
 /// markers. `kvm = false` is the portable TCG test (CI default); `kvm = true`
 /// adds real acceleration + `-cpu host` and additionally requires the x2APIC
 /// **enable** line (proving the SMP AP1 write sequence executed on real silicon).
-fn boot_test(kvm: bool) -> ExitCode {
-    let Some(elf) = build_kernel() else {
-        return ExitCode::FAILURE;
-    };
-    let Some(iso) = build_iso(&elf) else {
-        return ExitCode::FAILURE;
-    };
-
-    let serial_log = kr("target/serial.log");
-    let pcap = kr("target/net.pcap");
-
-    // Remove stale log + pcap from a previous run.
-    let _ = fs::remove_file(&serial_log);
-    let _ = fs::remove_file(&pcap);
-
-    // Base machine args, then the acceleration/CPU model differs by mode.
-    let serial_arg = format!("file:{}", serial_log.display());
+/// The QEMU machine arguments shared by every way this repo boots the kernel
+/// ([`boot_test`] and [`do_boot_timing`]).
+///
+/// Factored out deliberately: a timing harness that constructed its own argument
+/// list would silently drift from the one the boot test actually asserts on, and
+/// then report numbers for a machine nobody ships. One definition, two callers.
+fn qemu_base_args(kvm: bool, iso: &Path, serial_arg: &str) -> Vec<String> {
     let mut qargs: Vec<String> = vec!["-M".into(), "q35".into()];
     if kvm {
         // Real KVM acceleration with host-CPU passthrough: the host advertises
@@ -786,13 +782,33 @@ fn boot_test(kvm: bool) -> ExitCode {
         "-cdrom",
         iso.to_str().unwrap(),
         "-serial",
-        &serial_arg,
+        serial_arg,
         "-display",
         "none",
         "-no-reboot",
     ] {
         qargs.push(a.into());
     }
+    qargs
+}
+
+fn boot_test(kvm: bool) -> ExitCode {
+    let Some(elf) = build_kernel() else {
+        return ExitCode::FAILURE;
+    };
+    let Some(iso) = build_iso(&elf) else {
+        return ExitCode::FAILURE;
+    };
+
+    let serial_log = kr("target/serial.log");
+    let pcap = kr("target/net.pcap");
+
+    // Remove stale log + pcap from a previous run.
+    let _ = fs::remove_file(&serial_log);
+    let _ = fs::remove_file(&pcap);
+
+    let serial_arg = format!("file:{}", serial_log.display());
+    let qargs = qemu_base_args(kvm, &iso, &serial_arg);
 
     println!(
         "Launching QEMU ({}) ...",
@@ -1495,4 +1511,129 @@ ffffffff80105000 <isr_common>:\n\
         assert!(!raw.contains(SCHED_COOPERATIVE_PREFIX));
         assert!(!deferred.contains(SCHED_COOPERATIVE_PREFIX));
     }
+}
+
+/// `cargo xtask boot-timing [runs]` — boot the SAME ISO `runs` times and report
+/// the wall-clock spread from QEMU launch to [`END_MARKER`].
+///
+/// Why this exists: a single boot sample says very little on shared CI hardware,
+/// and the boot cost that matters is not what any one run reports. This builds
+/// once, then re-launches the identical image so only the guest boot varies, and
+/// prints min/median/max so a regression shows up as a moved distribution rather
+/// than a suspicious one-off.
+///
+/// Uses [`qemu_base_args`] — the same arguments [`boot_test`] asserts on — plus
+/// the same NIC and disk, so the number describes the machine the boot test
+/// actually validates. Auto-detects KVM via `/dev/kvm`; the mode is printed,
+/// because TCG and KVM numbers are not comparable.
+///
+/// Polls at 10 ms rather than [`boot_test`]'s 200 ms: at a ~2 s boot, 200 ms
+/// granularity is 10% error, which would swamp exactly the differences this is
+/// meant to detect.
+fn do_boot_timing(runs: usize) -> ExitCode {
+    if runs == 0 {
+        eprintln!("boot-timing: runs must be >= 1");
+        return ExitCode::FAILURE;
+    }
+    let Some(elf) = build_kernel() else {
+        return ExitCode::FAILURE;
+    };
+    let Some(iso) = build_iso(&elf) else {
+        return ExitCode::FAILURE;
+    };
+
+    let kvm = Path::new("/dev/kvm").exists();
+    let mode = if kvm { "KVM + -cpu host" } else { "TCG" };
+    let serial_log = kr("target/serial-timing.log");
+    let pcap = kr("target/net-timing.pcap");
+
+    println!("Timing {runs} boot(s) under {mode} ...");
+
+    let mut samples: Vec<u128> = Vec::with_capacity(runs);
+    let mut last_log = String::new();
+
+    for run in 1..=runs {
+        let _ = fs::remove_file(&serial_log);
+        let _ = fs::remove_file(&pcap);
+        let serial_arg = format!("file:{}", serial_log.display());
+
+        let start = Instant::now();
+        let mut child = Command::new("qemu-system-x86_64")
+            .args(qemu_base_args(kvm, &iso, &serial_arg))
+            .args(e1000_args(pcap.to_str().unwrap()))
+            .args(disk_args())
+            // QEMU's own startup chatter would interleave with the per-run
+            // lines; the serial log is the signal here.
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn qemu-system-x86_64");
+
+        let deadline = start + Duration::from_secs(BOOT_TIMEOUT_SECS);
+        let mut elapsed = None;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            let log = fs::read_to_string(&serial_log).unwrap_or_default();
+            if log.contains(END_MARKER) {
+                elapsed = Some(start.elapsed());
+                last_log = log;
+                break;
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        match elapsed {
+            Some(d) => {
+                // Report the preemption evidence per run, not just at the end:
+                // the question this tool exists to answer is "did a change make
+                // boot faster at the cost of a weaker proof?", and that is only
+                // visible if every run's `preempted=` count is on screen next to
+                // its time.
+                let evidence = last_log
+                    .lines()
+                    .find(|l| l.contains("[sched] preemptive"))
+                    .map(|l| {
+                        l.split_whitespace()
+                            .find(|w| w.starts_with("preempted="))
+                            .unwrap_or("preempted=?")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "preempted=<no line>".to_string());
+                println!("  run {run}: {} ms  ({evidence})", d.as_millis());
+                samples.push(d.as_millis());
+            }
+            None => {
+                eprintln!(
+                    "boot-timing: run {run} never reached '{END_MARKER}' within {BOOT_TIMEOUT_SECS} s"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    samples.sort_unstable();
+    let n = samples.len();
+    println!(
+        "\nboot -> '{}' over {} run(s), {}: min {} ms | median {} ms | max {} ms",
+        END_MARKER,
+        n,
+        if kvm { "KVM" } else { "TCG" },
+        samples[0],
+        samples[n / 2],
+        samples[n - 1]
+    );
+
+    // The tick-bound proofs are the largest remaining cost in a fast boot, so
+    // surface their evidence alongside the timing: a reader can see at a glance
+    // whether a faster number came at the price of a weaker proof.
+    for line in last_log.lines().filter(|l| {
+        l.contains("[sched] preemptive")
+            || l.contains("timer-preemptions suppressed")
+            || l.contains("[sched] cooperative: interleave")
+    }) {
+        println!("last run: {}", line.trim());
+    }
+
+    ExitCode::SUCCESS
 }

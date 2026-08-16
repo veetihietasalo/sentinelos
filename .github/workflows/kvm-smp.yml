@@ -120,3 +120,93 @@ jobs:
           name: smp-x2apic-kvm-serial-log
           path: kernel/target/serial.log
           if-no-files-found: warn
+
+  # NON-GATING timing harness. Boots the SAME image several times on the KVM
+  # runner and reports the min/median/max wall-clock to `boot-bringup-ok`, plus
+  # each run's `preempted=` count.
+  #
+  # Why several boots: a single sample says very little on shared CI hardware.
+  # Measured locally, one run in six came in at 3.5-7 s against a ~2.1 s median
+  # purely from host contention, so a one-shot number would report a regression
+  # that is not there — or hide one that is.
+  #
+  # Why the `preempted=` count sits next to the time: the largest remaining cost
+  # in a fast boot is the tick-bound scheduler proof, so the obvious way to make
+  # this number look better is to weaken that proof. Printing both means such a
+  # trade shows up in the same output rather than silently.
+  #
+  # Deliberately NOT gating: timing on shared runners is noisy, and a boot-time
+  # regression is a thing to investigate, not to block a merge on.
+  # `continue-on-error` neutralizes a FAILED job but NOT a cancelled one, so the
+  # real bound is the step-level cap (which fails); the job-level cap is only a
+  # backstop for a hang outside the timing step. See verify.yml's kani jobs for
+  # the runs that proved that distinction.
+  boot-timing:
+    name: Boot timing (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - name: Checkout SentinelOS
+        uses: actions/checkout@v4
+
+      # Gate the whole proof on KVM availability. If /dev/kvm is absent (a runner
+      # without nested virt), skip the rest with a visible warning instead of a
+      # red failure — the C1 evidence then must come from real hardware.
+      - name: Detect KVM
+        id: kvm
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo "available=yes" >> "$GITHUB_OUTPUT"
+            sudo chmod 666 /dev/kvm || true
+            ls -l /dev/kvm
+            echo "KVM is available on this runner."
+          else
+            echo "available=no" >> "$GITHUB_OUTPUT"
+            echo "::warning title=No KVM::/dev/kvm is not present on this runner; the x2APIC enable-path proof (C1) was not produced. Run 'make test-kvm' on real hardware to capture it (see issue #10)."
+          fi
+
+      - name: Install Rust stable toolchain (from rust-toolchain.toml)
+        if: steps.kvm.outputs.available == 'yes'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy,llvm-tools
+          targets: x86_64-unknown-none
+
+      - name: Cache Cargo registry + build artefacts
+        if: steps.kvm.outputs.available == 'yes'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            kernel/target
+          key: ${{ runner.os }}-cargo-kvm-${{ hashFiles('kernel/Cargo.lock', 'kernel/xtask/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install QEMU and xorriso
+        if: steps.kvm.outputs.available == 'yes'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 xorriso
+
+      - name: Clone Limine ${{ env.LIMINE_TAG }}
+        if: steps.kvm.outputs.available == 'yes'
+        run: |
+          git clone \
+            --branch ${{ env.LIMINE_TAG }} \
+            --depth 1 \
+            ${{ env.LIMINE_REPO }} \
+            kernel/limine
+          make -C kernel/limine
+
+      # Boot under KVM + -cpu host and assert the x2APIC ENABLE line. Fails if the
+      # enable path did not run (e.g. x2APIC somehow not exposed) — that is a real
+      # signal to investigate, not an infra skip.
+      - name: Time repeated boots
+        if: steps.kvm.outputs.available == 'yes'
+        working-directory: kernel
+        timeout-minutes: 12
+        run: make boot-timing RUNS=7
