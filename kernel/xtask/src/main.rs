@@ -421,6 +421,20 @@ const TIMER_LAPIC_EVERY_CORE: &str = "scheduler tick on every core";
 /// like the BSP line: `gemm-exact=yes`, both iteration counts `> 0`,
 /// `tick-preempted >= 1`, trailing `ok`.
 const SCHED_AP_PREEMPTIVE_PREFIX: &str = "[sched] ap-preemptive: ";
+
+/// Component model PR-1 (`docs/specs/2026-09-18-component-model-design.md`
+/// §14): the host verified the embedded `hello` component's framed SHA-256 id,
+/// refused a one-bit-wrong id before anything ran, instantiated on the native
+/// runtime, and got `hello, sentinelos` back through the inbox ring and the
+/// envelope codec with the kernel stamping `from` both ways.
+const COMP_HELLO_PREFIX: &str = "[comp] hello: ";
+/// Every field the `[comp] hello:` line must carry, plus a trailing `ok`.
+const COMP_HELLO_REQUIRED: &[&str] = &[
+    "verified=yes",
+    "wrong-id=refused",
+    "runtime=native",
+    "reply=ok",
+];
 /// The `[ml]` `active=` values that mean a *vector* tier is live — a real SIMD
 /// int8-GEMM kernel runs (its boot self-test passed), not the scalar fallback. We
 /// accept **any** implemented vector tier because the runner fleet is heterogeneous:
@@ -1042,6 +1056,27 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Component model PR-1: the hello component must verify, the wrong id must
+    // be refused, and the reply must come back through the codec.
+    let Some(comp_line) = log.lines().find(|l| l.contains(COMP_HELLO_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: component host proof line '{}…' missing (did \
+             `kernel::host::prove_hello` run?).",
+            COMP_HELLO_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    if COMP_HELLO_REQUIRED.iter().any(|f| !comp_line.contains(f))
+        || !comp_line.trim_end().ends_with(" ok")
+    {
+        eprintln!(
+            "TEST FAILED: the component host proof did not pass (expected {:?} and a \
+             trailing 'ok'): '{}'",
+            COMP_HELLO_REQUIRED, comp_line
+        );
+        return ExitCode::FAILURE;
+    }
+
     // A vector int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is a
     // real SIMD kernel — proving the hand-written `asm!` kernels execute and compute
     // correctly. `-cpu Haswell` (TCG) exposes avx2; `-cpu host` (KVM) exposes avx2
@@ -1235,8 +1270,8 @@ fn boot_test(kvm: bool) -> ExitCode {
              the per-CPU scheduler proven ('{}'), the per-core LAPIC tick proven \
              ('{}'), vector tier active ('{}' with '{}' and '{}'), the cooperative \
              scheduler verdict ('{}'), the preemptive scheduler proof ('{}', \
-             preempted={}, gemm-iters={}, spin-iters={}), and end-marker '{}' \
-             confirmed in serial output.",
+             preempted={}, gemm-iters={}, spin-iters={}), the component host proven \
+             ('{}'), and end-marker '{}' confirmed in serial output.",
             smp_line,
             tracked,
             aps_ok,
@@ -1250,6 +1285,7 @@ fn boot_test(kvm: bool) -> ExitCode {
             preempted,
             gemm_iters,
             spin_iters,
+            comp_line,
             END_MARKER
         );
     }

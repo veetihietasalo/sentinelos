@@ -2,7 +2,7 @@
 
 One page for a fresh session (or a fresh container) to pick the kernel work back
 up without re-deriving state from git. Update it at the end of any session that
-changes direction; keep it short. Last updated **2026-09-18** (component-model review round 1: consensus on what is next).
+changes direction; keep it short. Last updated **2026-09-18** (component model PR-1 shipped).
 
 ## Landed (main)
 
@@ -28,6 +28,13 @@ changes direction; keep it short. Last updated **2026-09-18** (component-model r
   every core (vector 0xF1) driving `sched::on_tick`; the PIT is wall clock only;
   `[sched] ap-preemptive: cpu1 … tick-preempted=N ok` proves timer preemption
   on an AP with bit-exact GEMM state.
+- **Component model PR-1 (native).** `kernel::hash` (SHA-256, framed
+  `ComponentId`), `kernel::host`: `ComponentRuntime` trait + `native::NativeRuntime`,
+  envelope codec (60-byte header, ≤256 B payload), per-instance `InboxRing<Wire, 8>`,
+  fixed 16-slot instance table. Boot proof `[comp] hello: id=9c1877d2 verified=yes
+  wrong-id=refused runtime=native reply=ok ok` asserted by `make test`. Five new Kani
+  harnesses (framing injective, codec round-trip, decode total, ring FIFO/no-loss,
+  SHA padding). Zero `hal` delta; zero time-dependent semantics.
 - **Verification.** Miri (hal + kernel ml/sched) and Kani (hal + kernel) are
   **gating** CI; every workflow job carries a timeout, machine-checked. Boot
   timing harness (`make boot-timing`) is informational.
@@ -36,33 +43,29 @@ changes direction; keep it short. Last updated **2026-09-18** (component-model r
 
 ## Next (in sequencing order — consensus of 2026-09-18, spec §19)
 
-0. **Component-model PR-1, native-only.** `kernel::hash` (SHA-256, framed id), `kernel::host`
-   with the `ComponentRuntime` trait and a `NativeRuntime`, an embedded native "hello"
-   component: id verified, one export called through the envelope codec. No interpreter, no
-   time-dependent semantics (budgets by count). Kani: id framing, codec round-trip, inbox
-   ring never overwrites or loses. Boot line
-   `[comp] hello: id=… verified=yes runtime=native reply=ok`. Amendment A4 (§16 rewrite for
-   an authority-not-memory boundary) lands here.
-1. **Core-independent monotonic clock** (SMP 3b-i). LAPIC-tick or TSC derived; retires
+0. **Core-independent monotonic clock** (SMP 3b-i). LAPIC-tick or TSC derived; retires
    hal-tcb invariant 4.15 (`pit::ticks()` stalls when the BSP is not servicing IRQ0). Small,
-   no IOAPIC, no MADT walk. Must land before PR-2 because `expires` and reply timeouts must
-   not tick off a counter another core can stall.
-2. **Component-model PR-2** bus + capabilities (denials logged, `required`/`optional` caps),
-   then **PR-3** delegates with an **ephemeral memory-only key**
+   no IOAPIC, no MADT walk. Must land before component PR-2 because `expires` and reply
+   timeouts must not tick off a counter another core can stall.
+1. **Component-model PR-2** bus + capabilities: `kernel::cap` fixed slab, `bus::send(cap,
+   payload)` (the sender never names a target), `Host` becomes kernel-wide, two components +
+   one with no cap, denials logged rate-limited, `required`/`optional` caps in manifests.
+   Boot line `[cap] attested-from=yes deny-by-default=yes forge-attempt=refused
+   denies-logged=N ok`. Then **PR-3** delegates with an **ephemeral memory-only key**
    (`sealing=none secrets-persist=no`). fs key file refused 4/4.
-3. **Memory-boundary gate** (docs, before PR-3 merges): wasm via `wasmi` under the §12
+2. **Memory-boundary gate** (docs, before PR-3 merges): wasm via `wasmi` under the §12
    conditions vs ring-3 ELF. Preconditions either way: a gating fuzz lane (none exists),
    `kernel/docs/external-tcb.md` + hal-tcb §1 amendment. Spike baseline in spec §19:
    `wasmi` 2.0 builds for the target, 10 crates, ~135 k lines, 303 `unsafe` sites in `wasmi`
    alone.
-4. **IOAPIC** (SMP 3b-ii) — ACPI MADT walk as a pure `&[u8] -> Result` parser (Kani + fuzz),
+3. **IOAPIC** (SMP 3b-ii) — ACPI MADT walk as a pure `&[u8] -> Result` parser (Kani + fuzz),
    explicit device-IRQ routing, PIC masked. Blocks nothing above; after PR-3. Then: load
    balancing / stealing is a product decision, not a default.
-5. **Component-model PR-4** state objects (signing-key id in records), **PR-5** Sentinel as
+4. **Component-model PR-4** state objects (signing-key id in records), **PR-5** Sentinel as
    components.
-6. **AMX tier / inference workload 2** — `docs/specs/2026-07-16-inference-workload2-design.md`.
-7. **Tiered memory** — `docs/specs/2026-07-14-tiered-memory-design.md` (design only).
-8. **CPU security step 2** — `docs/specs/2026-07-14-cpu-security-features-design.md`.
+5. **AMX tier / inference workload 2** — `docs/specs/2026-07-16-inference-workload2-design.md`.
+6. **Tiered memory** — `docs/specs/2026-07-14-tiered-memory-design.md` (design only).
+7. **CPU security step 2** — `docs/specs/2026-07-14-cpu-security-features-design.md`.
 
 ## Decisions worth remembering
 

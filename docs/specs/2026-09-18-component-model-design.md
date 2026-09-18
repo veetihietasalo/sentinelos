@@ -1,7 +1,8 @@
 # Component Model — attested messaging, delegates, and content-addressed components
 
-Status: **proposed · review round 1 complete (2026-09-18)** — sequencing and the three open
-decisions settled in §19; amendments A4–A10 land with the PRs named there · Tracks A (kernel core)
+Status: **PR-1 implemented (2026-09-18)** — `kernel::hash`, `kernel::host` (native runtime,
+envelope codec, inbox ring), boot line asserted; review round 1 complete, sequencing and the
+three open decisions settled in §19; amendments A5–A10 land with the PRs named there · Tracks A (kernel core)
 + D (security subsystem) · Author: kernel-architect
 Depends on: SMP phases 1–3a (shipped: per-CPU scheduler, IPIs, per-core tick), `kernel::fs`
 (persistence), `kernel::sched` (`spawn_on`, pinned tasks), `sentinel-core` (the portable
@@ -347,6 +348,11 @@ envelope codec is a few hundred lines we can prove. Revisit when the ecosystem s
 | `kernel::services::*` | compute (`ml`), compositor (`wm`/`ui`), storage (`fs`), net, clock, integrity vectors | thin capability-checked shims over existing modules |
 | `crates/host` | the component runtime crate (ours + `wasmi`) | external TCB; gated |
 
+PR-1 as shipped: `kernel::hash` and `kernel::host::{codec, inbox, native}` inside the `kernel`
+crate (`#![forbid(unsafe_code)]`); `Host<R: ComponentRuntime>` is built by the boot proof and
+becomes a kernel-wide instance in PR-2 when the bus needs it. `crates/host` appears at the gate,
+when there is a dependency to isolate.
+
 **`hal` delta: none** for PR-1 through PR-5. Ring-3 support (GDT user segments, TSS `rsp0`,
 `syscall`/`sysret` or `int` gate, user-pointer validation) is *only* needed if native
 processes come later, and stays a separate spec.
@@ -357,7 +363,7 @@ Each PR is independently bootable and adds one hard assertion to `cargo xtask te
 
 | PR | Lands | Boot-proof line (asserted) |
 |---|---|---|
-| **PR-1** hash + host (native) | `kernel::hash` (SHA-256, framed id §6), `kernel::host` with `ComponentRuntime` + `NativeRuntime`, an embedded native "hello" component: id verified, one export called through the envelope codec. **Zero time-dependent semantics** (budgets by count, no expiry). Kani: id framing, codec round-trip, inbox ring never overwrites or loses. | `[comp] hello: id=<first 8 hex> verified=yes runtime=native reply=ok` |
+| **PR-1** hash + host (native) — **shipped 2026-09-18** | `kernel::hash` (SHA-256, framed id §6), `kernel::host` with `ComponentRuntime` + `native::NativeRuntime`, the embedded native `hello` component: a one-bit-wrong id refused before the runtime sees the bytes, the honest id verified, `greet` called through the inbox ring and the envelope codec with the kernel stamping `from` on request and reply. **Zero time-dependent semantics.** Kani (4 new harnesses): id framing injective, codec round-trip, decode total, inbox ring FIFO / never loses / never overwrites; plus SHA-256 padding. | `[comp] hello: id=<first 8 hex> verified=yes wrong-id=refused runtime=native reply=ok ok` |
 | **PR-1b** clock (SMP 3b-i) | A core-independent monotonic clock (LAPIC-tick or TSC derived) so `pit::ticks()` is no longer the only clock; hal-tcb invariant 4.15 retired. No IOAPIC, no MADT walk. **Lands before PR-2** because `expires` and reply timeouts must not tick off a counter another core can stall. | `[clock] mono: source=<lapic\|tsc> cores=N skew-max=N ok` |
 | **PR-2** bus + capabilities | `kernel::bus`, `kernel::cap`; two components; one holds a Send cap to the other, a third holds none. `expires` on the mono clock. **Denials logged, rate-limited.** Manifests declare `required` vs `optional` caps: a component missing a required cap refuses to start. | `[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=N ok` |
 | **PR-3** delegates + secrets | `kernel::secrets`, **KeyAgent** with an **ephemeral, memory-only key** (§18.1); zeroization of payload arenas on revoke/exit; a component requests a signature and verifies it; a probe tries to read the secret. | `[delegate] keyagent: signed=ok verified=yes secret-readable=no sealing=none secrets-persist=no ok` |
@@ -383,16 +389,49 @@ Every PR: host tests for the pure parts, Kani where the design names it (§8, §
 - **Threat-model probes as boot proofs**: every "cannot" in §16 is a probe component in the
   boot test that tries it and is refused.
 
-## 16. Threat model (what a malicious component can and cannot do)
+## 16. Threat model (what a component can and cannot do)
 
-Can: consume its own fuel and memory budget; send to targets it holds capabilities for;
-refuse to answer; lie in its own payloads.
-Cannot: forge `from`; reach a target without a capability; amplify a capability; read another
-instance's memory or a delegate's secret; touch hardware; exhaust the machine (fuel, memory,
-inbox all bounded); escape its identity (the host hashed what it runs).
-Trusted: `hal`, the safe kernel, the component runtime (external TCB), the KeyAgent's
-policy. A bug there is a bug in the root of trust and is handled by the existing TCB
-discipline, not by this model.
+**Assumption (Kerckhoffs).** The adversary knows every byte of the kernel and of every
+component; the only secrets are the delegates' keys. Nothing below depends on obscurity.
+
+**Two boundaries, landed one at a time.**
+
+- *Authority boundary* (PR-1 onward, every runtime): a component is confined by what it can
+  **name** (`CapIndex`) and **reach** (the bus). The kernel stamps `from`; deny by default;
+  silence is denial. PR-1 already proves the first half: the wrong id is refused before any
+  runtime sees the bytes, and `from` on both request and reply is written by the kernel.
+- *Memory boundary* (the gate before PR-3): whether a component can touch memory it was not
+  handed. **Native components have none.** A native component runs in ring 0 in the kernel
+  address space, so the authority boundary stops a *confused* component, not a *malicious*
+  one. Therefore only **first-party** components (compiled into the image, reviewed as kernel
+  code) run on the native runtime, and **no non-first-party component runs anywhere** until
+  the gate lands a memory boundary (wasm under the §12 conditions, or ring-3).
+
+**A component can:** consume its own budgets (by count now; fuel and memory once a metering
+runtime exists); send to targets it holds capabilities for; refuse to answer; lie in its own
+payloads; on the native runtime, do anything kernel code can — which is exactly why that
+runtime is first-party only.
+
+**A component cannot, on any runtime (authority):** forge `from`; reach a target without a
+capability; amplify a capability; make the kernel fabricate a reply; escape its identity (the
+host hashed what it runs).
+
+**A component cannot, after the gate (memory):** read another instance's memory or a
+delegate's secret; touch hardware; overrun its linear memory or its stack.
+
+**What "cannot exhaust the machine" honestly means today.** Inboxes are bounded (`Busy`,
+never growth), instance tables are fixed slabs, payload arenas are pre-sized. But the kernel
+runs `panic = "abort"` with an infallible allocator over a 4 MiB heap and 16 KiB guard-paged
+thread stacks, so an allocation failure or a stack overrun **halts the machine** rather than
+corrupting it. A wasm runtime must therefore cap linear memory *before* it allocates and prove
+its stack high-water mark stays under the guard page (§12 conditions). Until then the claim
+is: *bounded by construction where we allocate; halt, not corrupt, where we cannot.*
+
+**Trusted:** `hal`; the safe kernel, `kernel::host` included; the component runtime (native:
+the kernel itself; external: the gated external TCB). Delegates are components under the same
+rules, but the KeyAgent and PolicyAgent are first-party and reviewed as TCB; they get registry
+rows when `external-tcb.md` lands (A5, A9). A bug in any of these is a bug in the root of
+trust, handled by the TCB discipline, not by this model.
 
 ## 17. What this changes in the roadmap
 
@@ -458,10 +497,10 @@ third-party crate (`limine`). This is the baseline the §18.6 trigger is measure
 | A1 | §6 | `H(code ‖ params)` unframed: `(A, BC)` and `(AB, C)` collide, so the id does not bind the split. Domain tag + length prefixes. | applied |
 | A2 | §7 vs §4/§9 | Envelope carried only `InstanceId`; attestation and delegate allow-lists need `ComponentId`. Kernel stamps both. | applied |
 | A3 | §12/§14 | `wasmi` out of PR-1; PR-1 native-only; PR-1b clock inserted; memory-boundary gate before PR-3; IOAPIC after PR-3. | applied |
-| A4 | §13/§16 | "hal delta: none" is TCB accounting, not reduction. §16 "cannot exhaust the machine" is false under `panic = "abort"`, an infallible allocator, a 4 MiB heap and 16 KiB stacks. Rewrite §16 for native-first: confines confused components, not malicious ones; non-first-party components barred until the gate; state the Kerckhoffs assumption. | PR-1 |
+| A4 | §13/§16 | "hal delta: none" is TCB accounting, not reduction. §16 "cannot exhaust the machine" is false under `panic = "abort"`, an infallible allocator, a 4 MiB heap and 16 KiB stacks. Rewrite §16 for native-first: confines confused components, not malicious ones; non-first-party components barred until the gate; state the Kerckhoffs assumption. | applied (PR-1) |
 | A5 | hal-tcb §1 | External dependencies need their own class: `kernel/docs/external-tcb.md`, admitted by an amendment to hal-tcb §1. `crates/host` own code `#![forbid(unsafe_code)]`; only the dependency is exempt. | gate |
 | A6 | §10 vs §18.1 | An ephemeral key means IntegrityLog `validate` against "the KeyAgent's public key" quarantines the previous boot's log on reload. Records carry a signing-key id resolved through IdentityDir, or PR-4's log is explicitly in-memory. | PR-4 |
-| A7 | §15 | No fuzz lane exists (hal-tcb §3: **pending**); nothing that depends on fuzz merges before the lane gates. "Differential host vs kernel" is one hand-picked vector, not a property; say so or drop it. The upstream `wasmi` suite is `std`-only. Missing: a Kani ring harness (full → `Err(Busy)`, never overwrite, never lose) and a host-side threaded model of the bus rings for data races (Miri only sees host threads). | PR-1 (ring harness), gate (fuzz, race model) |
+| A7 | §15 | No fuzz lane exists (hal-tcb §3: **pending**); nothing that depends on fuzz merges before the lane gates. "Differential host vs kernel" is one hand-picked vector, not a property; say so or drop it. The upstream `wasmi` suite is `std`-only. Missing: a Kani ring harness (full → `Err(Busy)`, never overwrite, never lose) and a host-side threaded model of the bus rings for data races (Miri only sees host threads). | ring harness applied (PR-1); fuzz + race model at the gate |
 | A8 | §8/§11 | Denials are asserted but never logged; §11 sells the capability log as an integrity vector. Log denies, rate-limited. Manifests need `required` vs `optional` caps: refuse to start rather than run degraded. | PR-2 |
 | A9 | §7/§9 | Zeroization: payload arenas are reused, so signatures and plaintext replies linger; zero on revoke and exit. Delegates are either TCB with registry rows or not trusted — §16 currently assumes both. | PR-3 |
 | A10 | §16 | Eight lines in a design doc is not a threat model; `docs/security/` does not exist. Split §16 out when PR-2 lands. | PR-2 |

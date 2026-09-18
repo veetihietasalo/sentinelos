@@ -26,9 +26,9 @@ SentinelOS is built **from scratch in Rust** (x86_64 first, Limine boot). This *
 1. **Boot bring-up** — serial, panic, framekernel HAL ← *in progress*
 2. Core kernel — memory (paging/heap), interrupts, scheduler
 3. Drivers — serial → timer → keyboard → storage/display
-4. Userland + syscalls
+4. Component model — content-addressed components, kernel-attested messaging, capabilities (replaces "userland + syscalls"; `docs/specs/2026-09-18-component-model-design.md`) ← *PR-1 landed*
 5. Display/compositor → GUI (the polished UI)
-6. Port the Sentinel security subsystem (`sentinel-core` native)
+6. Sentinel as components — `sentinel-core` unchanged as a component; the OS provider is a native service
 … then the long road toward apps, games, and compatibility.
 
 ## Hardware & compatibility (Path A reality — reaffirmed 2026-06-03)
