@@ -2,7 +2,7 @@
 
 One page for a fresh session (or a fresh container) to pick the kernel work back
 up without re-deriving state from git. Update it at the end of any session that
-changes direction; keep it short. Last updated **2026-09-18** (component model PR-1 + clock 3b-i shipped).
+changes direction; keep it short. Last updated **2026-09-18** (SentinelFS spec review round 1).
 
 ## Landed (main)
 
@@ -54,15 +54,20 @@ changes direction; keep it short. Last updated **2026-09-18** (component model P
 next big tracks — "aim for perfection".** Today's `kernel::fs` is a toy (one heap tree
 serialised as a single CRC-32-guarded image over ATA PIO, rewritten whole; a crash mid-write
 loses everything to the seeded fallback) and the Cyber Dusk lock screen checks nothing
-(right arrow unlocks). Plan: two specs through the four-role review first — **SentinelFS**
-(copy-on-write, extent-based, per-block checksums, Merkle-hashed metadata to a root the
-IntegrityLog signs, atomic root switch between two generation-numbered superblocks, no
-journal replay; DMA via NVMe/virtio-blk is a separate `hal` spec after it proves itself on
-ATA) and **Identity/Login** (device-bound asymmetric credentials held by the KeyAgent,
-Argon2id-derived unlock secret as fallback, rate-limited; the lock screen becomes the
-IdentityAgent's UI component; the user secret also resolves §18 key sealing without a TPM).
-Build FS first — it is the substrate for component blobs, the IntegrityLog, secrets and
-credentials — then login on FS + KeyAgent. Component PR-2 continues in parallel.
+(right arrow unlocks). **SentinelFS spec written and through review round 1**
+(`docs/specs/2026-09-18-sentinelfs-design.md`, §15): copy-on-write, whole-block SHA-256
+hashes on every pointer, two generation-numbered superblock slots (no journal), per-domain
+content-addressed blobs, logged privileged snapshots/rollback, one 64-block cache slab, an
+`sfs-commit` task that does all I/O (never PIO under the lock), deterministic allocation,
+metadata reserve. **Zero new `hal` rows** (`FLUSH CACHE` already exists; FS-1b splits the
+API). Staging: **FS-1a** (blk + superblocks + `MemDevice` with the unflushed-subset crash
+model + cap lattice) → **FS-1b** (CoW tree + transactions + torn-commit proof + flush split)
+→ **FS-2** (files + facade; `read_file` becomes into-buffer, `Corrupt`/`NoSpace` errors;
+fuzz lane lands) → **FS-4** (blobs, snapshots, cap enforcement) → **identity spec** →
+**FS-5** (superblock hash signed into the IntegrityLog). Login/identity spec next: it must
+solve Argon2id's ≥19 MiB vs the 4 MiB heap, wrap both the tree key and the KeyAgent key from
+one unlock secret (resolving component §18.1), and decide the rollback anchor. Component
+PR-2 continues in parallel.
 
 0. **Component-model PR-2** bus + capabilities: `kernel::cap` fixed slab, `bus::send(cap,
    payload)` (the sender never names a target), `Host` becomes kernel-wide, two components +

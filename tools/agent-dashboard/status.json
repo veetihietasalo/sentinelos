@@ -163,8 +163,8 @@
       "name": "security-engineer",
       "role": "sentinel-core integration, capabilities, sandbox",
       "model": "opus",
-      "status": "working",
-      "task": "Security review of SentinelFS design spec",
+      "status": "done",
+      "task": "Security-seat review of SentinelFS design (attestation record, threat-model gaps, encryption placement)",
       "history": [
         {
           "ts": "2026-09-18T16:28:41",
@@ -183,6 +183,12 @@
           "kind": "status",
           "status": "working",
           "task": "Security review of SentinelFS design spec"
+        },
+        {
+          "ts": "2026-09-18T17:25:17",
+          "kind": "status",
+          "status": "done",
+          "task": "Security-seat review of SentinelFS design (attestation record, threat-model gaps, encryption placement)"
         }
       ]
     },
@@ -208,5 +214,5 @@
       "task": "\u2014"
     }
   ],
-  "updatedAt": "2026-09-18T17:23:50"
+  "updatedAt": "2026-09-18T17:25:17"
 }
