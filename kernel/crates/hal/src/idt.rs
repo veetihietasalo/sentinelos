@@ -32,7 +32,6 @@ use crate::gdt::{DOUBLE_FAULT_IST_INDEX, KERNEL_CODE_SELECTOR};
 use crate::interrupts::{handler_for, InterruptFrame};
 use core::arch::global_asm;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Number of IDT entries. The architecture defines 256 vectors; we install stubs
 /// for the 32 CPU-exception vectors (0–31) and leave the rest pointing at a
@@ -41,52 +40,30 @@ const IDT_ENTRIES: usize = 256;
 
 /// Bytes reserved on the interrupt stack for the per-IRQ `XSAVE` area, sized for
 /// x87 + SSE + AVX + AVX-512 (~2.7 KiB) with margin, and a multiple of 64 (`XSAVE`
-/// requires 64-byte alignment). [`crate::simd::enable`] validates the CPU's actual
-/// `cpuid`-leaf-`0xD` size fits this before arming the save (see [`arm_vector_save`]).
+/// requires 64-byte alignment).
+///
+/// [`crate::simd::enable`] **refuses** to leave `CR4.OSXSAVE` set on a core whose
+/// `cpuid`-leaf-`0xD` `XSAVE` size exceeds this (it clears the bit again and
+/// reports vector state unavailable), which is what makes the live-`CR4` gate in
+/// `isr_common` sufficient: `OSXSAVE = 1` on a core *implies* its save fits here.
 pub(crate) const VECTOR_SAVE_AREA_MAX: usize = 4096;
 
-/// Whether [`isr_common`] performs the per-IRQ vector `XSAVE`/`XRSTOR`.
-///
-/// `0` until [`crate::simd::enable`] turns on `CR4.OSXSAVE` + `XCR0` and validates
-/// the save area, then `1`. `isr_common` reads it on entry and skips the save
-/// entirely when `0` — so `xsave` is executed **only** when it is architecturally
-/// legal (after `OSXSAVE`), and the interrupt path is byte-for-byte unchanged on a
-/// CPU without vector state. `enable` runs in the interrupts-off boot window, so the
-/// `0 → 1` transition is never observed part-way through an interrupt.
-///
-/// **SMP hazard — must fix before AP interrupt bring-up.** This is a single **global**
-/// flag, but `CR4.OSXSAVE` is **per-core**. Once APs start, if the BSP has armed this
-/// and an AP takes *any* interrupt before running its own [`crate::simd::enable`],
-/// `isr_common` on that AP would execute `xsave` with `OSXSAVE` unset → `#UD`. So each
-/// AP must set `OSXSAVE` (via `simd::enable`) **before enabling interrupts**, and this
-/// flag must then become per-core (or the `xsave` gate a per-core check). Not
-/// triggerable today (single-core; no AP handler path). See the vector-state design
-/// doc. Referenced from `isr_common`'s `global_asm!` via `sym` (works with the mangled
-/// name — no `#[no_mangle]` needed).
-static VECTOR_SAVE_ARMED: AtomicU8 = AtomicU8::new(0);
-
-/// Arm the per-IRQ vector save in [`isr_common`]. Called once by
-/// [`crate::simd::enable`] after it has enabled vector state and confirmed both the
-/// `XSAVE` area size fits [`VECTOR_SAVE_AREA_MAX`] and the `xsave`/`xrstor`
-/// round-trip self-test passes. Idempotent; a plain relaxed store (single writer at
-/// boot, interrupts off).
-pub(crate) fn arm_vector_save() {
-    VECTOR_SAVE_ARMED.store(1, Ordering::Relaxed);
-}
-
-/// Read whether the per-IRQ (and, for the cooperative scheduler, per-task)
-/// vector `XSAVE`/`XRSTOR` bracket is armed.
-///
-/// Mirrors [`isr_common`]'s own gate for callers outside this module that need
-/// the same "is it architecturally legal to `xsave`/`xrstor` right now" check —
-/// currently [`crate::context::switch`] (see the scheduler design doc's TCB
-/// delta, CX4), which must skip the eager per-task vector save exactly like
-/// `isr_common` does before [`crate::simd::enable`] has armed it (otherwise
-/// `xsave`/`xrstor` would `#UD` with `CR4.OSXSAVE` unset). A plain relaxed
-/// atomic load; adds no new unsafe op.
-pub(crate) fn vector_state_armed() -> bool {
-    VECTOR_SAVE_ARMED.load(Ordering::Relaxed) != 0
-}
+// ── Per-IRQ vector save: why the gate is a live `CR4` read, not a flag ────────
+//
+// `isr_common` brackets the handler call with `xsave`/`xrstor` of the full vector
+// state (defense-in-depth on top of the CI-enforced "no vector instructions in
+// compiled handlers" invariant). `xsave` `#UD`s unless `CR4.OSXSAVE` is set, and
+// OSXSAVE is a **per-core** bit: the BSP sets it in `simd::enable` at boot, and
+// every application processor sets its own in its `hal::smp::ap_entry` sequence.
+// An earlier revision gated the save on a single global `VECTOR_SAVE_ARMED` flag,
+// which had a documented SMP hazard — an AP taking an interrupt after the BSP had
+// armed the flag but before its own `simd::enable` would have executed `xsave`
+// with OSXSAVE clear and died with `#UD`. The stub now reads `CR4` itself
+// (`mov rbx, cr4; test ebx, OSXSAVE`) on every entry: the exact architectural
+// precondition, read from the hardware of the core that is about to execute the
+// instruction, so it cannot desynchronise and there is no ordering obligation
+// between cores. `crate::context::switch` uses the same test via
+// `crate::cpu::osxsave_enabled`.
 
 /// A 64-bit IDT gate descriptor (16 bytes), hardware layout.
 ///
@@ -198,17 +175,19 @@ isr_common:
     // rbp = frame base; the general-purpose register restore returns rsp here.
     mov rbp, rsp
 
-    // ── Per-IRQ vector save (gated on VECTOR_SAVE_ARMED) ──────────────────────
+    // ── Per-IRQ vector save (gated on the LIVE CR4.OSXSAVE bit of this core) ──
     // Belt-and-suspenders: on this soft-float target compiled handlers contain no
     // vector instructions (CI-enforced), so they cannot clobber an interrupted
     // GEMM's YMM/ZMM state — but we also save it here so even a (guard-forbidden)
-    // vector-using handler is safe. If not armed (before simd::enable, or a CPU
-    // without xsave), skip: r15 = 0 marks "nothing saved" and drives the exit path
-    // to skip the restore too, so save and restore are decided by the SAME value
-    // and can never mismatch.
-    lea rbx, [rip + {armed}]
-    cmp byte ptr [rbx], 0
-    jne 1f
+    // vector-using handler is safe. The gate is the architectural precondition
+    // itself, read from THIS core's CR4 (per-core, so SMP-correct with no flag to
+    // keep in sync): if OSXSAVE is clear (before simd::enable on this core, or a
+    // CPU without xsave), skip: r15 = 0 marks "nothing saved" and drives the exit
+    // path to skip the restore too, so save and restore are decided by the SAME
+    // value and can never mismatch. rbx is scratch here (re-assigned below).
+    mov rbx, cr4
+    test ebx, {osxsave}
+    jnz 1f
     xor r15, r15
     jmp 2f
 1:
@@ -310,7 +289,7 @@ isr_stub_\num:
 .noaltmacro
 "#,
     trampoline = sym isr_trampoline,
-    armed = sym VECTOR_SAVE_ARMED,
+    osxsave = const crate::cpu::CR4_OSXSAVE,
     area_size = const VECTOR_SAVE_AREA_MAX,
 );
 
@@ -456,14 +435,49 @@ pub fn init() {
             vector += 1;
         }
 
-        let idtr = DescriptorTablePointer {
-            limit: (IDT_ENTRIES * size_of::<GateDescriptor>() - 1) as u16,
-            base: idt_ptr as u64,
-        };
-        // SAFETY: `lidt [mem]` loads the IDTR from a 10-byte pointer whose `base`
-        // is our fully-initialised `IDT` and whose `limit` is its exact byte
-        // length − 1. The operand is read-only (`readonly`); loading a valid IDT
-        // arms fault delivery without changing any register or memory.
+        // SAFETY: every gate above is now written; `IDT` is fully initialised, which
+        // is `lidt_idt`'s precondition.
+        lidt_idt();
+    }
+}
+
+/// Load the **already-built** IDT on the calling core (`lidt` only).
+///
+/// For application processors: the BSP's [`init`] filled the shared `static`
+/// `IDT` once at boot, and the table is never written again — it is immutable
+/// shared data every core can point its IDTR at. Each AP calls this from
+/// `hal::smp::ap_entry` (interrupts still masked) so exceptions on that core are
+/// routed through the same stubs and registered handlers as on the BSP, instead
+/// of the undefined IDT Limine leaves an AP with.
+///
+/// Must be called only after [`init`] has completed on the BSP; `hal::smp` starts
+/// no AP before `kmain` has run `interrupts::init`, which is what guarantees it.
+pub fn load() {
+    // SAFETY: `init` ran to completion on the BSP before any AP exists (the kernel
+    // brings APs up strictly after `interrupts::init`), so `IDT` is fully
+    // initialised and thereafter read-only — the precondition of `lidt_idt`.
+    unsafe { lidt_idt() }
+}
+
+/// `lidt` the shared static `IDT` on the calling core.
+///
+/// # Safety
+///
+/// `IDT` must be fully initialised (every gate written by [`init`]) and must not
+/// be written concurrently — true after `init` returns, since nothing writes the
+/// table again.
+unsafe fn lidt_idt() {
+    let idtr = DescriptorTablePointer {
+        limit: (IDT_ENTRIES * size_of::<GateDescriptor>() - 1) as u16,
+        base: core::ptr::addr_of!(IDT) as u64,
+    };
+    // SAFETY: `lidt [mem]` loads the IDTR from a 10-byte pointer whose `base` is
+    // our fully-initialised `IDT` (caller's precondition) and whose `limit` is its
+    // exact byte length − 1. The operand is read-only (`readonly`); loading a valid
+    // IDT arms fault delivery on this core without changing any register or
+    // memory. The table is shared read-only across cores, so a second core loading
+    // the same base is exactly as sound as the first.
+    unsafe {
         core::arch::asm!(
             "lidt [{ptr}]",
             ptr = in(reg) &idtr,

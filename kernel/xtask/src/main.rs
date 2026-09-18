@@ -374,6 +374,23 @@ const SMP_ENABLED_MARKER: &str = "[smp] x2APIC enabled";
 /// The timer-liveness substring the enable line carries — its presence with a
 /// non-empty tick count proves the PIT kept ticking through LINT0=ExtINT.
 const SMP_TIMER_LIVE_MARKER: &str = "timer live";
+/// Logical CPUs every QEMU invocation here is given (`-smp 4`), and therefore the
+/// exact CPU count the SMP phase-2 bring-up summary must report as online.
+const QEMU_SMP_CPUS: u64 = 4;
+/// Prefix of the SMP phase-2 bring-up **summary** line written by
+/// `kernel::smp::bring_up_aps` once every application processor has been started
+/// (or given up on): `[smp] online=A/B bsp-apic-id=N aps-ok=K aps-failed=F
+/// skipped=S`. `A` = CPUs running kernel code, `B` = CPUs tracked (BSP included),
+/// `K` = APs that came online **on the expected core** and passed the int8 GEMM
+/// proof there. The boot test requires `B == QEMU_SMP_CPUS`, `A == B`, and
+/// `K == B - 1`: every AP the bootloader parked is now in the kernel and its own
+/// vector state is live and bit-exact. This is the phase-2 proof and it runs
+/// under **TCG** (the bootloader's xAPIC INIT-SIPI-SIPI works there), so `make
+/// test` — not just the KVM job — gates it.
+const SMP_ONLINE_PREFIX: &str = "[smp] online=";
+/// Substring of a per-AP failure line (`[smp] cpuN FAILED to start (timeout …)`
+/// or `[smp] cpuN NOT started (…)`) — any occurrence fails the boot test.
+const SMP_AP_FAILED_MARKERS: [&str; 2] = ["FAILED to start", "NOT started"];
 /// The `[ml]` `active=` values that mean a *vector* tier is live — a real SIMD
 /// int8-GEMM kernel runs (its boot self-test passed), not the scalar fallback. We
 /// accept **any** implemented vector tier because the runner fleet is heterogeneous:
@@ -552,6 +569,16 @@ fn parse_u64_after(line: &str, field: &str) -> Option<u64> {
     } else {
         digits.parse().ok()
     }
+}
+
+/// Parse the SMP bring-up summary (`[smp] online=A/B … aps-ok=K …`, see
+/// [`SMP_ONLINE_PREFIX`]) into `(A, B, K)`; `None` if any field is malformed.
+fn parse_smp_summary(line: &str) -> Option<(u64, u64, u64)> {
+    let online = parse_u64_after(line, "online=")?;
+    let after_online = line.split_once("online=")?.1;
+    let tracked = parse_u64_after(after_online, "/")?;
+    let aps_ok = parse_u64_after(line, "aps-ok=")?;
+    Some((online, tracked, aps_ok))
 }
 
 /// Check whether a cooperative-scheduler boot-proof **verdict** line (see
@@ -885,6 +912,42 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // SMP phase 2: every application processor the bootloader parked must have
+    // come online in the kernel, on the core we expected, and passed the int8 GEMM
+    // proof on that core. `-smp 4` fixes the expected counts exactly.
+    let Some(smp_line) = log.lines().find(|l| l.contains(SMP_ONLINE_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: SMP bring-up summary line '{}…' missing (did \
+             `kernel::smp::bring_up_aps` run?).",
+            SMP_ONLINE_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some((online, tracked, aps_ok)) = parse_smp_summary(smp_line) else {
+        eprintln!(
+            "TEST FAILED: could not parse the SMP bring-up summary: '{}'",
+            smp_line
+        );
+        return ExitCode::FAILURE;
+    };
+    if tracked != QEMU_SMP_CPUS || online != tracked || aps_ok != tracked - 1 {
+        eprintln!(
+            "TEST FAILED: expected every CPU online and every AP verified \
+             (online={0}/{0}, aps-ok={1}) under `-smp {0}`, got: '{2}'",
+            QEMU_SMP_CPUS,
+            QEMU_SMP_CPUS - 1,
+            smp_line
+        );
+        return ExitCode::FAILURE;
+    }
+    if let Some(bad) = log
+        .lines()
+        .find(|l| l.contains("[smp] cpu") && SMP_AP_FAILED_MARKERS.iter().any(|m| l.contains(m)))
+    {
+        eprintln!("TEST FAILED: an application processor failed to start: '{}'", bad);
+        return ExitCode::FAILURE;
+    }
+
     // A vector int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is a
     // real SIMD kernel — proving the hand-written `asm!` kernels execute and compute
     // correctly. `-cpu Haswell` (TCG) exposes avx2; `-cpu host` (KVM) exposes avx2
@@ -1047,13 +1110,17 @@ fn boot_test(kvm: bool) -> ExitCode {
 
     if kvm {
         println!(
-            "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' — and a \
-             vector int8-GEMM tier verified active ('{}' with '{}' and '{}' in the \
-             [ml] lines), the cooperative scheduler verdict ('{}'), the \
-             preemptive scheduler proof ('{}', preempted={}, gemm-iters={}, \
-             spin-iters={}), plus banner + end-marker '{}'.",
+            "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' — SMP \
+             phase 2 proven ('{}': all {} CPUs online, {} APs GEMM-verified on \
+             their own cores), a vector int8-GEMM tier verified active ('{}' with \
+             '{}' and '{}' in the [ml] lines), the cooperative scheduler verdict \
+             ('{}'), the preemptive scheduler proof ('{}', preempted={}, \
+             gemm-iters={}, spin-iters={}), plus banner + end-marker '{}'.",
             SMP_ENABLED_MARKER,
             SMP_TIMER_LIVE_MARKER,
+            smp_line,
+            tracked,
+            aps_ok,
             active_tier,
             ML_GEMM_OK,
             ML_TFB_OK,
@@ -1066,10 +1133,15 @@ fn boot_test(kvm: bool) -> ExitCode {
         );
     } else {
         println!(
-            "TEST PASSED: full banner, SMP bring-up line, vector tier active ('{}' \
-             with '{}' and '{}'), the cooperative scheduler verdict ('{}'), the \
-             preemptive scheduler proof ('{}', preempted={}, gemm-iters={}, \
-             spin-iters={}), and end-marker '{}' confirmed in serial output.",
+            "TEST PASSED: full banner, SMP bring-up line, SMP phase 2 proven \
+             ('{}': all {} CPUs online, {} APs GEMM-verified on their own cores), \
+             vector tier active ('{}' with '{}' and '{}'), the cooperative \
+             scheduler verdict ('{}'), the preemptive scheduler proof ('{}', \
+             preempted={}, gemm-iters={}, spin-iters={}), and end-marker '{}' \
+             confirmed in serial output.",
+            smp_line,
+            tracked,
+            aps_ok,
             active_tier,
             ML_GEMM_OK,
             ML_TFB_OK,
@@ -1395,6 +1467,20 @@ ffffffff80105000 <isr_common>:\n\
     }
 
     // ── `parse_u64_after` (PR-B preemptive-proof marker parsing) ────────────
+
+    #[test]
+    fn parse_smp_summary_reads_online_tracked_and_aps_ok() {
+        use super::parse_smp_summary;
+
+        let line = "[smp] online=4/4 bsp-apic-id=0 aps-ok=3 aps-failed=0 skipped=0";
+        assert_eq!(parse_smp_summary(line), Some((4, 4, 3)));
+        let partial = "[smp] online=3/4 bsp-apic-id=0 aps-ok=2 aps-failed=1 skipped=0";
+        assert_eq!(parse_smp_summary(partial), Some((3, 4, 2)));
+        let single = "[smp] online=1/1 bsp-apic-id=0 aps-ok=0 aps-failed=0 skipped=0";
+        assert_eq!(parse_smp_summary(single), Some((1, 1, 0)));
+        assert_eq!(parse_smp_summary("[smp] online=4/4"), None);
+        assert_eq!(parse_smp_summary("[smp] x2APIC not advertised"), None);
+    }
 
     #[test]
     fn parse_u64_after_extracts_the_first_run_of_digits() {

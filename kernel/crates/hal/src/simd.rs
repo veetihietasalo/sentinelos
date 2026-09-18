@@ -42,25 +42,30 @@
 //! compiled code emits **no** vector instructions outside these three kernels — so a
 //! compiled interrupt handler cannot clobber `XMM`/`YMM`/`ZMM`; this is machine-
 //! checked by `cargo xtask check-no-vector`, which fails the build if any non-audited
-//! function gains a vector instruction; and (2) [`crate::idt::isr_common`]
-//! additionally `XSAVE`s/`XRSTOR`s the full vector state per IRQ once [`enable`] arms
-//! it. `kernel::ml::prove_interrupts_on` proves a GEMM stays bit-exact with the PIT
-//! firing. (A future *preemptive* context switch is the one remaining case needing
-//! per-task save — via [`crate::cpu::xsave`]/[`crate::cpu::xrstor`] — since a switch
-//! resumes a different task's vector code; no preemptive scheduler exists yet.)
+//! function gains a vector instruction; and (2) `isr_common` (in [`crate::idt`])
+//! additionally `XSAVE`s/`XRSTOR`s the full vector state per IRQ whenever the
+//! executing core's **live `CR4.OSXSAVE`** bit is set — which [`enable`] leaves set
+//! only after verifying the save area fits and round-trips on that core.
+//! `kernel::ml::prove_interrupts_on` proves a GEMM stays bit-exact with the PIT
+//! firing, and the preemptive scheduler's per-task save
+//! ([`crate::context::switch`], via [`crate::cpu::xsave`]/[`crate::cpu::xrstor`])
+//! uses the same per-core gate.
 //!
-//! **SMP note.** Vector state (`CR4.OSXSAVE` + `XCR0`) is **per-core**; [`enable`]
-//! must run on each AP before any GEMM on that AP once SMP lands (the `*_ready`
-//! flags are global, so an AP must not run a kernel on the BSP's flag before
-//! enabling its own vector state).
+//! **SMP.** Vector state (`CR4.OSXSAVE` + `XCR0`) is **per-core**. Every
+//! application processor runs [`enable`] itself, as a fixed step of its
+//! `hal::smp::ap_entry` sequence, *before* it can enable interrupts or reach any
+//! kernel code that consults the `*_ready` flags. Those flags stay global because
+//! they encode a machine-homogeneous fact ("this tier is verified usable on this
+//! CPU model"); an AP re-running the self-tests re-derives the same values.
 
 use crate::cpu;
 use crate::cpuid;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 /// `CR4.OSXSAVE` (bit 18): enables `xgetbv`/`xsetbv` and OS management of XSAVE
-/// state components (a prerequisite for using AVX `YMM` registers).
-const CR4_OSXSAVE: u64 = 1 << 18;
+/// state components (a prerequisite for using AVX `YMM` registers). Shared with
+/// the live per-core gate in `isr_common` / [`cpu::osxsave_enabled`].
+const CR4_OSXSAVE: u64 = cpu::CR4_OSXSAVE;
 
 /// `XCR0` bit 0 — x87 FPU state (architecturally always enabled; must stay set).
 const XCR0_X87: u64 = 1 << 0;
@@ -92,9 +97,11 @@ const CPUID_ECX7_AVX512VNNI: u32 = 1 << 11;
 
 /// Cached AVX2 usability: `0` = unverified / unavailable, `1` = verified usable.
 /// Set to `1` by [`enable`] **only** after the boot-time self-test passes; read by
-/// [`avx2_ready`]. A single-writer-at-boot atomic. **SMP:** this is global but AVX
-/// state is per-core, so once SMP lands each AP must call [`enable`] before running
-/// the kernel — it must not act on the BSP-set flag with its own AVX state off.
+/// [`avx2_ready`]. **SMP:** this is global but AVX state is per-core; every AP
+/// calls [`enable`] as a fixed step of its `hal::smp::ap_entry` sequence before
+/// any kernel code runs on it, so it never acts on the BSP-set flag with its own
+/// AVX state off (cores are homogeneous, so the re-derived value is identical —
+/// benign duplicate stores of `1`).
 static AVX2_STATUS: AtomicU8 = AtomicU8::new(0);
 
 /// Cached AVX-512F usability, same contract as [`AVX2_STATUS`] but for the 512-bit
@@ -126,6 +133,7 @@ pub fn enable() -> bool {
         return false;
     }
     let want_avx512 = avx512f_advertised();
+    let cr4 = cpu::read_cr4();
     // SAFETY: `xsave` + `avx` are confirmed present via cpuid above. Setting
     // `CR4.OSXSAVE` only enables `xgetbv`/`xsetbv` and OS XSAVE management (it
     // preserves every other CR4 bit — read-modify-write). After it, `xgetbv(0)` is
@@ -136,7 +144,6 @@ pub fn enable() -> bool {
     // Enabling vector state only makes the registers usable/saveable — it cannot
     // alias or corrupt Rust-managed memory. Registered in hal-tcb.md.
     unsafe {
-        let cr4 = cpu::read_cr4();
         cpu::write_cr4(cr4 | CR4_OSXSAVE);
         let xcr0 = cpu::xgetbv(0);
         let mut new = xcr0 | XCR0_X87 | XCR0_SSE | XCR0_AVX;
@@ -145,8 +152,32 @@ pub fn enable() -> bool {
         }
         cpu::xsetbv(0, new);
     }
-    // Vector state is on. Enable each tier only if the CPU advertises it AND the
-    // kernel passes its differential self-test on this (possibly emulated) core.
+    // The per-IRQ save in `isr_common` and the per-task save in `context::switch`
+    // are both gated on the LIVE `CR4.OSXSAVE` bit of the executing core (see
+    // `hal::idt`), so leaving that bit set is a promise: "this core's `xsave` fits
+    // the reserved `VECTOR_SAVE_AREA_MAX` on-stack area and round-trips". Verify the
+    // promise NOW, before any tier is trusted. `xsave_area_size` is read after
+    // `XCR0` is set, so it reflects the enabled components. If either check fails
+    // we take vector state back down (clear `OSXSAVE` again — architecturally
+    // permitted; `XCR0` keeps its value but becomes inaccessible and AVX `#UD`s as
+    // before) and report `false`: every tier stays scalar on this core, and the
+    // interrupt path is byte-for-byte the no-vector-state path. Structurally sound
+    // by construction, per core, with no global flag to keep in sync — which is
+    // what lets application processors run this independently of the BSP.
+    if cpu::xsave_area_size() as usize > crate::idt::VECTOR_SAVE_AREA_MAX || !xsave_roundtrip_ok() {
+        // SAFETY: restores the exact CR4 value read above (every other bit
+        // preserved) — a read-modify-write that only *clears* `OSXSAVE`, the bit
+        // this function set. Clearing `OSXSAVE` disables OS XSAVE management and
+        // makes AVX `#UD` again; it cannot alias or corrupt Rust-managed memory.
+        unsafe {
+            cpu::write_cr4(cr4 & !CR4_OSXSAVE);
+        }
+        return false;
+    }
+    // Vector state is on and its save contract holds. Enable each tier only if the
+    // CPU advertises it AND the kernel passes its differential self-test on this
+    // (possibly emulated) core. Idempotent and per-core: an AP re-running this
+    // re-derives the same machine-homogeneous answers the BSP stored.
     if avx2_advertised() && self_test(gemm_i8_avx2_impl) {
         AVX2_STATUS.store(1, Ordering::Relaxed);
     }
@@ -160,23 +191,13 @@ pub fn enable() -> bool {
     if want_avx512 && avx512vnni_advertised() && self_test(gemm_i8_avx512vnni_impl) {
         AVX512VNNI_STATUS.store(1, Ordering::Relaxed);
     }
-    // Arm the per-IRQ vector save in the interrupt path (defense-in-depth) — but only
-    // once we confirm the CPU's `XSAVE` area fits the reserved on-stack area AND
-    // `xsave`/`xrstor` demonstrably round-trip here. If either check fails we leave it
-    // disarmed; GEMM is **still** safe with interrupts enabled, because the
-    // load-bearing guarantee is that compiled handlers contain no vector instructions
-    // (CI-checked by `xtask check-no-vector`) — this per-IRQ save only hardens against
-    // a hypothetical vector-using handler. `xsave_area_size` is read now, after `XCR0`
-    // is set, so it reflects the enabled components.
-    if cpu::xsave_area_size() as usize <= crate::idt::VECTOR_SAVE_AREA_MAX && xsave_roundtrip_ok() {
-        crate::idt::arm_vector_save();
-    }
     true
 }
 
 /// Boot-time round-trip self-test of [`cpu::xsave`]/[`cpu::xrstor`]: stash a known
 /// pattern in `xmm0`, save all enabled vector state, clobber `xmm0`, restore, and
-/// confirm the pattern came back bit-for-bit. Gates arming the per-IRQ vector save
+/// confirm the pattern came back bit-for-bit. Gates leaving `CR4.OSXSAVE` set (and
+/// with it the per-IRQ / per-task vector save on this core)
 /// (and validates the very primitives a future context switch will use) — we trust
 /// the save/restore machinery only if it demonstrably round-trips on this core. Runs
 /// after [`enable`] set `CR4.OSXSAVE` + `XCR0`, so `xsave`/`xrstor` are legal.

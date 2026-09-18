@@ -1,6 +1,6 @@
 # SMP Application-Processor Bring-up — Design
 
-Status: **proposed** · Track A (SMP), phase 2 · Author: kernel-architect
+Status: **PR-1 implemented (Limine MP variant — see the 2026-09-18 amendment at the end); PR-2 proposed** · Track A (SMP), phase 2 · Author: kernel-architect
 Depends on: phase 1 (x2APIC BSP enable, shipped: `hal::apic::{enable_bsp,id,logical_cpu_count}`),
 `hal::mm` (frame allocator + `map_page`), `hal::simd::enable` (per-core vector state), `hal::gdt`/
 `hal::idt` (BSP tables), the scheduler design (`docs/specs/2026-07-15-scheduler-design.md`, its
@@ -249,3 +249,42 @@ single-core via the phase-1 fallback).
    over-estimate is safe. Acceptable, or calibrate against the PIT once at boot?
 4. **AP idle in phase 2.** Before PR-2, APs `hlt`-loop after their GEMM proof — confirm that parked
    state vs. immediately entering an empty per-CPU scheduler.
+
+## Amendment — 2026-09-18: PR-1 landed on the bootloader's AP path, not a trampoline
+
+Open question #1 asked whether a bootloader guarantee lets us drop the AP bootstrap
+page tables (SMP3). Resolving it went further: the **Limine MP protocol** (the
+`limine` crate's `MpRequest`, honoured by the v11.4.1 bootloader CI already pins)
+performs INIT–SIPI–SIPI and the 16→32→64 walk for every AP *before* `_start`, parks
+each one in 64-bit mode on the kernel's own page tables (kernel + HHDM), interrupts
+masked, on a private 64 KiB stack in bootloader-reclaimable memory, and releases it
+into any function we write to its `goto_address` slot with `rdi = &Cpu`. We already
+trust Limine for the BSP's mode switch, page tables, HHDM and memory map; its AP
+path is the same code, exercised by every Limine kernel, and it runs under QEMU
+**TCG** — so phase 2 is asserted by `make test` on every push, not only by the KVM job.
+
+**What this replaced (never landed):** the 16-bit `global_asm!` trampoline (SMP1),
+its copy/patch into a reserved low page (SMP2), the `< 1 MiB` frame exclusion, the
+AP bootstrap page tables (SMP3), the ICR INIT-SIPI-SIPI writes (SMP4), `cpu::udelay`,
+`hal::acpi` + the MADT parser (ACPI1–2). That was six unverifiable TCB rows and the
+largest asm since the ISR stubs; the residual TCB is three small rows that reuse
+audited primitives and add **no new instruction** (`kernel/docs/hal-tcb.md` §2k).
+
+**What landed (PR-1), mapped to the checklist above:**
+
+| checklist item | outcome |
+|---|---|
+| 1 low-memory exclusion, 2 `read_cr3`/`udelay`, 3–4 `hal::acpi` + MADT, 6–8 trampoline / page tables / ICR | **dropped** — Limine MP supplies enumeration (`hal::smp::cpus`, `CpuDesc{lapic_id, acpi_id, is_bsp}`) and the start mechanism (`hal::smp::start_cpu`) |
+| 5 `kernel::smp` per-CPU state | as designed: `static CPUS: [PerCpu; MAX_CPUS]` (atomics only), dense index, `by_index` / `this_cpu_index` (via the new safe `hal::apic::cpuid_apic_id`, valid in any LAPIC mode — needed because `apic::id()` is `None` under TCG). `MAX_CPUS = 32` (open question #2). Plan function `plan(descs)` is pure and host-tested; `dense_index` is Kani-proved. |
+| 8 `apic::enable_ap` | as designed (LINT0 masked, LINT1 NMI, SVR) — row AP3 |
+| 9 `run_ap` | is `hal::smp::ap_entry`: per-AP **GDT + TSS + IST stack** (`gdt::init_ap`, new — a TSS goes busy on `ltr`, so the design's "lgdt(shared)" needed refinement) → `idt::load` (shared IDT) → `simd::enable` → `apic::enable_ap` → kernel `ap_main`. No `sti` in the sequence; the kernel `sti`s after publishing `online` (invariant §4.10 in hal-tcb). |
+| 10–11 delete `VECTOR_SAVE_ARMED`; live `CR4.OSXSAVE` gate | as designed (mechanism (b)), in `isr_common` **and** `context::switch` (`cpu::osxsave_enabled`). Strengthened: `simd::enable` now *clears* `OSXSAVE` again if the xsave size or round-trip check fails, so a set bit is the complete save-contract precondition per core (hal-tcb §4.11). |
+| 12 `bring_up_aps` | serial: start → wait `online` (**1 s** PIT timeout, not 100 ms — a TCG AP thread on a contended CI host can be descheduled far longer than its ~ms entry sequence; open question #3 is moot without `udelay`) → report → next. A dead AP is logged `FAILED to start` and skipped; the machine stays up. |
+| 13 `kmain` | `smp::bring_up_aps()` right after `apic::enable_bsp`, in both the `Some` and `None` branches — APs come up under TCG too (`x2apic=no` per AP there). |
+| boot proof / 14 xtask | **only the BSP prints** (the serial guard is not a multi-core lock); APs publish into `PerCpu`. Per AP: `[smp] cpuN online: apic-id=N lapic-match=yes x2apic=… simd=yes gemm=ok` (the GEMM is the identity int8 proof run on the AP's own core; `lapic-match` = the AP's `cpuid` APIC ID equals the slot it was started as). Summary `[smp] online=4/4 bsp-apic-id=0 aps-ok=3 aps-failed=0 skipped=0`, asserted exactly by `cargo xtask test` (TCG **and** KVM). |
+| 15 hal-tcb | §2k SMP1–3, G6, I6, AP3; I1/CX4 rewritten for the live gate; invariants §4.5/10/11/12. |
+
+**Open question #4 (AP idle before PR-2):** APs park in `sti; hlt` after their
+proof. They receive no interrupts (LINT0 masked, no IOAPIC, no LAPIC timer), so
+they sleep until PR-2's per-CPU scheduler adopts each AP's current context as its
+idle task. PR-2 checklist unchanged.

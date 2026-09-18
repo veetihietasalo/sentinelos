@@ -41,9 +41,15 @@ From power-on to an interactive desktop — all real, all verified in QEMU:
 - ✅ **Memory** — physical frame allocator + paging + a kernel **heap** with a `#[global_allocator]` (`Box` / `Vec` / `String` all work)
 - ✅ **Input** — a PS/2 keyboard driver, full US-QWERTY ASCII
 - ✅ **GUI** — the **Cyber Dusk** boot/lock screen → press <kbd>→</kbd> to unlock (with an animation) → a desktop
-- ✅ **Shell** — an interactive terminal: `help` · `about` · `mem` · `echo` · `uptime`
+- ✅ **Shell** — an interactive terminal: `help` · `about` · `mem` · `echo` · `uptime` · `ls` · `cat` · `cpuinfo` · …
+- ✅ **Filesystem** — an in-memory FS that persists to an IDE disk and survives reboot
+- ✅ **Networking** — e1000 NIC + ARP / IPv4 / ICMP: it pings its gateway at boot
+- ✅ **Scheduler** — cooperative + timer-preemptive kernel threads, proven bit-exact under preemption
+- ✅ **Multi-core** — every application processor brought online, each with its own descriptor tables, vector state and LAPIC, proven with an int8 GEMM on its own core
+- ✅ **AI/ML compute** — int8 GEMM on scalar / AVX2 / AVX-512 / VNNI tiers, self-tested per core at boot
+- ✅ **Verified TCB** — Miri + Kani gate every `hal` change in CI
 
-🚧 **In flight:** an in-memory filesystem + richer shell, **networking** (e1000 NIC + ARP / IPv4 / ICMP), and a windowed desktop.
+🚧 **In flight:** a per-CPU scheduler (work on the other cores), the AMX inference tier, and a richer windowed desktop.
 
 <div align="center">
 <img src="docs/images/shell.png" width="720" alt="The SentinelOS interactive shell — typing 'about' and getting real output"/>
@@ -110,10 +116,11 @@ The spine, from bare metal toward a usable, private desktop OS:
 - [x] **1 — Boot bring-up** · serial, panic, the framekernel HAL
 - [x] **2 — Core kernel** · interrupts, the PIT timer, paging + heap
 - [x] **3 — Input + GUI** · keyboard, the Cyber Dusk boot screen, an interactive shell
-- [ ] **4 — A real shell** · filesystem, command history, more built-ins *(in progress)*
-- [ ] **5 — Networking** · NIC driver + a minimal TCP/IP stack *(in progress)*
-- [ ] **6 — A windowed desktop** · compositor, launcher, multiple apps
-- [ ] **7 — Storage & userland** · persistent FS, syscalls, processes
+- [x] **4 — A real shell** · persistent filesystem, more built-ins
+- [x] **5 — Networking** · e1000 driver + ARP / IPv4 / ICMP *(TCP/UDP still to come)*
+- [x] **5b — SMP** · x2APIC, every core online *(per-CPU scheduler in progress)*
+- [ ] **6 — A windowed desktop** · compositor, launcher, multiple apps *(first slice landed)*
+- [ ] **7 — Storage & userland** · syscalls, processes
 - [ ] **8 — Native security subsystem** · port `sentinel-core` into the kernel
 - [ ] **9 — The long road** · our own browser engine, broader hardware & app support
 

@@ -28,6 +28,7 @@ pub mod ml;
 pub mod net;
 pub mod sched;
 pub mod shell;
+pub mod smp;
 pub mod wm;
 
 /// Kernel entry point — called by `boot::_start` after serial initialisation.
@@ -129,6 +130,15 @@ pub fn kmain() -> ! {
         }
         None => hal::println!("[smp] x2APIC not advertised; staying on legacy xAPIC/PIC"),
     }
+
+    // SMP phase 2: bring every application processor the bootloader parked into
+    // the kernel — per-AP GDT/TSS, the shared IDT, its own vector state and LAPIC
+    // — prove each with an int8 GEMM on its own core, then park it until the
+    // per-CPU scheduler (PR-2) gives it work. Runs under TCG too (the bootloader's
+    // xAPIC INIT-SIPI-SIPI), so `make test` asserts `online=4/4`, not only the
+    // KVM job. Must follow `interrupts::init` (APs load that IDT), `simd::enable`
+    // and `init_timer` (the wait loop counts PIT ticks).
+    smp::bring_up_aps();
 
     // Bring up the AI/ML COMPUTE path: turn the C1 cpuid detection (AMX / AVX-512)
     // into an actual quantized-inference primitive. Reports the detected hardware

@@ -14,6 +14,12 @@
 //! keyboard / mouse / NIC IRQ path unchanged; migrating those to the IOAPIC is a
 //! later, designed phase (see `docs/specs/2026-07-14-smp-x2apic-design.md`).
 //!
+//! **Application processors** (SMP phase 2, `hal::smp`) each enable their own
+//! LAPIC via [`enable_ap`] — identical, except LINT0 is *masked* so only the BSP
+//! fronts the PIC. [`cpuid_apic_id`] identifies the calling core in any LAPIC
+//! mode (x2APIC or the TCG-only xAPIC), which is how the safe kernel finds its
+//! per-CPU slot without a privileged read.
+//!
 //! The only `unsafe` here is the `MSR` access (via [`crate::cpu`]'s `read_msr` /
 //! `write_msr`), documented below and registered in `kernel/docs/hal-tcb.md`.
 
@@ -45,6 +51,8 @@ const SPURIOUS_VECTOR: u64 = 0xFF;
 const LVT_DELIVERY_EXTINT: u64 = 0b111 << 8;
 /// LVT delivery mode `NMI` (0b100 in bits 10:8).
 const LVT_DELIVERY_NMI: u64 = 0b100 << 8;
+/// LVT bit 16 — mask: the local interrupt line is ignored.
+const LVT_MASKED: u64 = 1 << 16;
 
 /// cpuid leaf 1 ECX bit 21 — the CPU advertises x2APIC.
 const CPUID_ECX_X2APIC: u32 = 1 << 21;
@@ -157,11 +165,92 @@ pub fn enable_bsp() -> Option<u32> {
     id()
 }
 
+/// Enable the **calling application processor's** Local APIC in x2APIC mode.
+///
+/// The AP counterpart of [`enable_bsp`], with one deliberate difference: **LVT
+/// LINT0 is masked**, not `ExtINT`. In virtual-wire mode exactly one LAPIC may
+/// front the 8259 PIC's INTR line; the BSP already does. A second `ExtINT` sink
+/// would make every PIC IRQ (PIT, keyboard, mouse, NIC) deliver on two cores at
+/// once — double-counted ticks, drained-twice scancodes. Until the IOAPIC phase
+/// routes device IRQs explicitly, APs receive no external interrupts at all; the
+/// LAPIC is enabled so that the core has an x2APIC ID, a spurious vector, NMI
+/// routing, and is ready to be an IPI / LAPIC-timer target later. LINT1 = NMI as
+/// on the BSP.
+///
+/// Returns this core's x2APIC ID, or `None` (doing nothing) if the CPU does not
+/// advertise x2APIC — the AP then stays in its reset-default xAPIC state, which
+/// is fine for this phase (it takes no interrupts either way). Called once per AP
+/// by `hal::smp::ap_entry`, interrupts masked.
+#[must_use]
+pub fn enable_ap() -> Option<u32> {
+    if !has_x2apic() {
+        return None;
+    }
+    // SAFETY: the same fixed, architectural LAPIC bring-up sequence as `enable_bsp`
+    // (AP1), on MSRs that exist on any x2APIC-capable CPU (checked above), touching
+    // no Rust memory — executed on *this* core's LAPIC (MSR-mapped LAPIC registers
+    // are per-core by construction). The EN=0 → EN=1 → EN|EXTD ordering avoids the
+    // illegal disabled→x2APIC jump; only bits are OR-ed into `IA32_APIC_BASE`. SVR
+    // software-enables the LVT with spurious vector 0xFF; LINT0 is *masked* so this
+    // core does not become a second ExtINT sink for the PIC (see the doc above);
+    // LINT1 = NMI. These reconfigure interrupt routing only — they cannot alias or
+    // corrupt Rust-managed memory.
+    unsafe {
+        let base = cpu::read_msr(IA32_APIC_BASE);
+        if base & APIC_BASE_EN == 0 {
+            cpu::write_msr(IA32_APIC_BASE, base | APIC_BASE_EN);
+        }
+        cpu::write_msr(IA32_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD);
+        cpu::write_msr(X2APIC_SVR, SVR_SOFTWARE_ENABLE | SPURIOUS_VECTOR);
+        cpu::write_msr(X2APIC_LVT_LINT0, LVT_MASKED);
+        cpu::write_msr(X2APIC_LVT_LINT1, LVT_DELIVERY_NMI);
+    }
+    id()
+}
+
+/// The **calling core's** APIC ID as reported by `cpuid`, valid in any LAPIC mode.
+///
+/// [`id`] reads the x2APIC ID register, which exists only once the core is in
+/// x2APIC mode — so it cannot identify a core under QEMU TCG (no x2APIC) or an AP
+/// before its LAPIC is enabled. `cpuid` reports the same identity without any
+/// privileged access or mode dependency: leaf `0xB` `EDX` is the full 32-bit
+/// x2APIC ID wherever leaf `0xB` exists (every CPU this project targets); on an
+/// older CPU whose max basic leaf is below `0xB`, leaf 1 `EBX[31:24]` gives the
+/// 8-bit initial APIC ID. Either equals the LAPIC ID the ACPI MADT (and hence the
+/// bootloader's MP response) lists for this core, so the safe kernel uses it to
+/// find its own per-CPU slot. Pure `cpuid` reads (§8, Q1) — **no** new privileged
+/// op; the field decode is split into a pure `const fn` for host tests / Kani.
+#[must_use]
+pub fn cpuid_apic_id() -> u32 {
+    if cpuid::raw(0, 0).eax >= 0xB {
+        cpuid::raw(0xB, 0).edx
+    } else {
+        initial_apic_id_from_ebx(cpuid::raw(1, 0).ebx)
+    }
+}
+
+/// The 8-bit initial APIC ID from leaf-1 `EBX` bits 31:24 (pure decode).
+#[must_use]
+const fn initial_apic_id_from_ebx(ebx: u32) -> u32 {
+    ebx >> 24
+}
+
 // ── Unit tests (host) ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::{ebx_logical_cpu_count, ecx_has_x2apic};
+    use super::{ebx_logical_cpu_count, ecx_has_x2apic, initial_apic_id_from_ebx};
+
+    #[test]
+    fn initial_apic_id_is_ebx_31_24() {
+        assert_eq!(initial_apic_id_from_ebx(0), 0);
+        assert_eq!(initial_apic_id_from_ebx(0x0100_0000), 1);
+        assert_eq!(initial_apic_id_from_ebx(0xFF00_0000), 255);
+        // Only bits 31:24 are the APIC ID — the logical-count byte (23:16), the
+        // CLFLUSH size (15:8), and the brand index (7:0) must not leak in.
+        assert_eq!(initial_apic_id_from_ebx(0x03FF_FFFF), 3);
+        assert_eq!(initial_apic_id_from_ebx(0x00FF_FFFF), 0);
+    }
 
     #[test]
     fn x2apic_bit_detected() {
@@ -193,7 +282,16 @@ mod tests {
 /// stable build (and `cargo test`) excludes this module. Run `cargo kani -p hal`.
 #[cfg(kani)]
 mod proofs {
-    use super::{ebx_logical_cpu_count, ecx_has_x2apic};
+    use super::{ebx_logical_cpu_count, ecx_has_x2apic, initial_apic_id_from_ebx};
+
+    /// `initial_apic_id_from_ebx` is **total** and always fits 8 bits, for any EBX.
+    #[kani::proof]
+    fn initial_apic_id_is_total_and_8_bit() {
+        let ebx: u32 = kani::any();
+        let id = initial_apic_id_from_ebx(ebx);
+        assert!(id <= 0xFF);
+        assert_eq!(id, (ebx >> 24) & 0xFF);
+    }
 
     /// `ecx_has_x2apic` is **total** (never panics for any 32-bit ECX) and is
     /// exactly the bit-21 test over all inputs.

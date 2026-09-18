@@ -167,6 +167,26 @@ pub fn read_cr4() -> u64 {
     value
 }
 
+/// `CR4.OSXSAVE` (bit 18): set once the OS has enabled `xgetbv`/`xsetbv` and
+/// XSAVE-managed vector state on **this** core (see [`crate::simd::enable`]).
+pub(crate) const CR4_OSXSAVE: u64 = 1 << 18;
+
+/// Whether `CR4.OSXSAVE` is set on the **current** core — the exact architectural
+/// precondition for `xsave`/`xrstor` (and `xgetbv`/`xsetbv`) not to `#UD`.
+///
+/// A live, per-core hardware read (one `mov reg, cr4`, the same primitive as
+/// [`read_cr4`]) that cannot desynchronise from the true state the way a software
+/// flag can. [`crate::context::switch`] gates its per-task vector save on it, and
+/// `isr_common` (in [`crate::idt`]) performs the identical test in assembly for
+/// its per-IRQ save — the SMP-correct form of that gate now that application
+/// processors run their own [`crate::simd::enable`] independently of the BSP.
+/// Safe: observing a control register has no side effect.
+#[inline]
+#[must_use]
+pub fn osxsave_enabled() -> bool {
+    read_cr4() & CR4_OSXSAVE != 0
+}
+
 /// Write the `CR4` control register.
 ///
 /// # Safety
