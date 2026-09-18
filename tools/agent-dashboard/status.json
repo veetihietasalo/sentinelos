@@ -15,8 +15,8 @@
       "name": "kernel-architect",
       "role": "Subsystem design & framekernel decomposition",
       "model": "opus",
-      "status": "done",
-      "task": "architect verdicts on Q1-Q3: PR-1 native-first, clock split from IOAPIC, ephemeral key",
+      "status": "working",
+      "task": "reviewing SentinelFS design spec",
       "history": [
         {
           "ts": "2026-09-18T16:27:47",
@@ -29,6 +29,12 @@
           "kind": "status",
           "status": "done",
           "task": "architect verdicts on Q1-Q3: PR-1 native-first, clock split from IOAPIC, ephemeral key"
+        },
+        {
+          "ts": "2026-09-18T17:20:29",
+          "kind": "status",
+          "status": "working",
+          "task": "reviewing SentinelFS design spec"
         }
       ]
     },
@@ -50,8 +56,8 @@
       "name": "verification-engineer",
       "role": "Miri + Kani + fuzz CI gate",
       "model": "opus",
-      "status": "done",
-      "task": "Verification-seat view on next PR: native-only PR-1 + fuzz lane",
+      "status": "working",
+      "task": "reviewing SentinelFS design from verification seat",
       "history": [
         {
           "ts": "2026-09-18T16:28:21",
@@ -64,6 +70,12 @@
           "kind": "status",
           "status": "done",
           "task": "Verification-seat view on next PR: native-only PR-1 + fuzz lane"
+        },
+        {
+          "ts": "2026-09-18T17:21:16",
+          "kind": "status",
+          "status": "working",
+          "task": "reviewing SentinelFS design from verification seat"
         }
       ]
     },
@@ -85,8 +97,8 @@
       "name": "kernel-reviewer",
       "role": "Adversarial review / human-gate",
       "model": "opus",
-      "status": "done",
-      "task": "merge-gate verdict: 3b first, wasmi blocked as written, 5 spec blockers",
+      "status": "working",
+      "task": "Reviewing SentinelFS design spec as merge gate",
       "history": [
         {
           "ts": "2026-09-18T16:27:57",
@@ -99,6 +111,12 @@
           "kind": "status",
           "status": "done",
           "task": "merge-gate verdict: 3b first, wasmi blocked as written, 5 spec blockers"
+        },
+        {
+          "ts": "2026-09-18T17:20:43",
+          "kind": "status",
+          "status": "working",
+          "task": "Reviewing SentinelFS design spec as merge gate"
         }
       ]
     },
@@ -127,8 +145,8 @@
       "name": "security-engineer",
       "role": "sentinel-core integration, capabilities, sandbox",
       "model": "opus",
-      "status": "done",
-      "task": "Security-seat verdict on next kernel PR: native-only PR-1 (C), ring-3 as trusted boundary, ephemeral key for PR-3",
+      "status": "working",
+      "task": "Security review of SentinelFS design spec",
       "history": [
         {
           "ts": "2026-09-18T16:28:41",
@@ -141,6 +159,12 @@
           "kind": "status",
           "status": "done",
           "task": "Security-seat verdict on next kernel PR: native-only PR-1 (C), ring-3 as trusted boundary, ephemeral key for PR-3"
+        },
+        {
+          "ts": "2026-09-18T17:20:56",
+          "kind": "status",
+          "status": "working",
+          "task": "Security review of SentinelFS design spec"
         }
       ]
     },
@@ -166,5 +190,5 @@
       "task": "\u2014"
     }
   ],
-  "updatedAt": "2026-09-18T16:30:03"
+  "updatedAt": "2026-09-18T17:21:16"
 }
