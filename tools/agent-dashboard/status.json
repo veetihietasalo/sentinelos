@@ -1,6 +1,6 @@
 {
   "project": "SentinelOS",
-  "updated": "2026-06-03",
+  "updated": "2026-09-18",
   "pipeline": [
     "spec",
     "architect",
@@ -16,7 +16,21 @@
       "role": "Subsystem design & framekernel decomposition",
       "model": "opus",
       "status": "done",
-      "task": "Sub-project #2 decomposed; #2a interrupts spec written"
+      "task": "architect verdicts on Q1-Q3: PR-1 native-first, clock split from IOAPIC, ephemeral key",
+      "history": [
+        {
+          "ts": "2026-09-18T16:27:47",
+          "kind": "status",
+          "status": "working",
+          "task": "deliberating next-build sequencing (Q1-Q3)"
+        },
+        {
+          "ts": "2026-09-18T16:29:26",
+          "kind": "status",
+          "status": "done",
+          "task": "architect verdicts on Q1-Q3: PR-1 native-first, clock split from IOAPIC, ephemeral key"
+        }
+      ]
     },
     {
       "name": "hal-specialist",
@@ -36,8 +50,22 @@
       "name": "verification-engineer",
       "role": "Miri + Kani + fuzz CI gate",
       "model": "opus",
-      "status": "idle",
-      "task": "—"
+      "status": "done",
+      "task": "Verification-seat view on next PR: native-only PR-1 + fuzz lane",
+      "history": [
+        {
+          "ts": "2026-09-18T16:28:21",
+          "kind": "status",
+          "status": "working",
+          "task": "Deliberating next kernel PR from verification seat"
+        },
+        {
+          "ts": "2026-09-18T16:29:46",
+          "kind": "status",
+          "status": "done",
+          "task": "Verification-seat view on next PR: native-only PR-1 + fuzz lane"
+        }
+      ]
     },
     {
       "name": "test-engineer",
@@ -58,56 +86,85 @@
       "role": "Adversarial review / human-gate",
       "model": "opus",
       "status": "done",
-      "task": "Sub-project #1: APPROVED"
+      "task": "merge-gate verdict: 3b first, wasmi blocked as written, 5 spec blockers",
+      "history": [
+        {
+          "ts": "2026-09-18T16:27:57",
+          "kind": "status",
+          "status": "working",
+          "task": "reviewing next-PR deliberation: component model vs SMP 3b"
+        },
+        {
+          "ts": "2026-09-18T16:29:57",
+          "kind": "status",
+          "status": "done",
+          "task": "merge-gate verdict: 3b first, wasmi blocked as written, 5 spec blockers"
+        }
+      ]
     },
     {
       "name": "memory-engineer",
       "role": "Frame allocator, VMM policy, kernel heap",
       "model": "opus",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     },
     {
       "name": "driver-engineer",
       "role": "Device drivers over HAL MMIO/port APIs",
       "model": "sonnet",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     },
     {
       "name": "scheduler-engineer",
       "role": "Run queue, sync primitives, SMP",
       "model": "opus",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     },
     {
       "name": "security-engineer",
       "role": "sentinel-core integration, capabilities, sandbox",
       "model": "opus",
-      "status": "idle",
-      "task": "—"
+      "status": "done",
+      "task": "Security-seat verdict on next kernel PR: native-only PR-1 (C), ring-3 as trusted boundary, ephemeral key for PR-3",
+      "history": [
+        {
+          "ts": "2026-09-18T16:28:41",
+          "kind": "status",
+          "status": "working",
+          "task": "Deliberating next kernel PR: component model vs SMP 3b (security seat)"
+        },
+        {
+          "ts": "2026-09-18T16:30:03",
+          "kind": "status",
+          "status": "done",
+          "task": "Security-seat verdict on next kernel PR: native-only PR-1 (C), ring-3 as trusted boundary, ephemeral key for PR-3"
+        }
+      ]
     },
     {
       "name": "userland-engineer",
       "role": "Syscall ABI, ELF loader, process lifecycle",
       "model": "sonnet",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     },
     {
       "name": "ui-engineer",
-      "role": "Compositor, widgets, display — security-ops aesthetic",
+      "role": "Compositor, widgets, display \u2014 security-ops aesthetic",
       "model": "sonnet",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     },
     {
       "name": "docs-writer",
       "role": "Design docs, ADRs, API refs, dev-setup",
       "model": "sonnet",
       "status": "idle",
-      "task": "—"
+      "task": "\u2014"
     }
-  ]
+  ],
+  "updatedAt": "2026-09-18T16:30:03"
 }
