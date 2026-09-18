@@ -1,6 +1,6 @@
 # SMP Bring-up via x2APIC — Design
 
-Status: **phase 1 implemented, rest proposed** · Track A (Intel/AMD CPU +
+Status: **phase 1 implemented; AP bring-up, per-CPU scheduler + IPIs, and the per-core LAPIC timer implemented (see the 2026-09-18 note at the end); IOAPIC routing proposed** · Track A (Intel/AMD CPU +
 security), step 3 · Author: scheduler / hal track
 Depends on: `hal::pic` (8259 remap + EOI), `hal::pit` (100 Hz IRQ0),
 `hal::cpu` MSR primitives (`read_msr`/`write_msr`, shipped), `hal::cpuid`
@@ -189,3 +189,27 @@ concurrency story get its real test.
   Track A. The literature improvement-map's SMP / many-core scheduling entries
   (arXiv:2601.20435) inform phases 4–5 (per-CPU state + SMP-safe concurrency), not
   the bring-up mechanics here.
+
+## Status note — 2026-09-18
+
+What landed, against the phase table above (the numbering there is the original
+plan; the work shipped in a different order):
+
+- **Phase 1** (BSP LAPIC, virtual wire): shipped; since PR-2 the register access is
+  dual-path — x2APIC MSRs where advertised, one uncached xAPIC MMIO page under
+  QEMU TCG — so the "x2APIC-only?" open question resolved as **both**.
+- **Phase 3 (AP bring-up)**: shipped via the **Limine MP protocol**, not a
+  hand-rolled trampoline; the MADT question resolved as "the bootloader's CPU
+  list". See `docs/specs/2026-07-16-smp-ap-bringup-design.md`.
+- **Phase 4 (per-CPU state)**: shipped as a dense-index array in the safe kernel,
+  not `GS`-base (rationale in the AP bring-up doc).
+- **IPIs**: shipped as the per-CPU scheduler's reschedule wake-up (vector `0xF0`).
+- **Per-core LAPIC timer** (not in the original table): shipped — calibrated against
+  the PIT on the BSP, periodic at 100 Hz on every core (vector `0xF1`), carrying
+  `sched::on_tick`; the PIT is wall clock only. Proof: `[sched] ap-preemptive: …`.
+- **Phase 2 (IOAPIC)**: still proposed. Device IRQs remain PIC-routed to the BSP
+  through LINT0 = ExtINT. Needs an ACPI MADT walk for the IOAPIC base/GSIs; it is
+  the next SMP step (3b), together with a core-independent wall clock.
+- **Phase 5 (SMP-safe kernel)**: partially shipped alongside — cross-core console
+  lock, the no-allocation-under-IRQ-lock rule, per-core preempt state; the
+  input/mouse rings and driver locks are still unaudited for real concurrency.

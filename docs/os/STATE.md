@@ -2,7 +2,7 @@
 
 One page for a fresh session (or a fresh container) to pick the kernel work back
 up without re-deriving state from git. Update it at the end of any session that
-changes direction; keep it short. Last updated **2026-09-18** (PR-2).
+changes direction; keep it short. Last updated **2026-09-18** (phase 3a).
 
 ## Landed (main)
 
@@ -23,7 +23,11 @@ changes direction; keep it short. Last updated **2026-09-18** (PR-2).
   PR-2: **per-CPU scheduler** — per-core run queues (fixed rings) + task slab,
   pinned `spawn_on(cpu, …)`, reschedule IPIs (`send_ipi`/`eoi`, vector 0xF0)
   wake an AP out of `sti; hlt`; `[sched] pinned: … distinct=yes ok` asserted
-  under TCG and KVM. Cross-core console lock landed with it.
+  under TCG and KVM. Cross-core console lock landed with it. Phase 3a:
+  **per-core LAPIC timer** — calibrated against the PIT on the BSP, 100 Hz on
+  every core (vector 0xF1) driving `sched::on_tick`; the PIT is wall clock only;
+  `[sched] ap-preemptive: cpu1 … tick-preempted=N ok` proves timer preemption
+  on an AP with bit-exact GEMM state.
 - **Verification.** Miri (hal + kernel ml/sched) and Kani (hal + kernel) are
   **gating** CI; every workflow job carries a timeout, machine-checked. Boot
   timing harness (`make boot-timing`) is informational.
@@ -32,11 +36,13 @@ changes direction; keep it short. Last updated **2026-09-18** (PR-2).
 
 ## Next (in sequencing order from the strategy doc)
 
-1. **IOAPIC + LAPIC timer** (SMP phase 3) — route device IRQs explicitly; give
-   every AP a tick so its tasks are timer-preempted like the BSP's (today AP
-   tasks switch only on IPI / `yield_now` / `exit`). The dual-path LAPIC
-   register layer in `hal::apic` (`reg_read`/`reg_write`) is the base.
-   Then: load balancing / stealing is a product decision, not a default.
+1. **IOAPIC + core-independent wall clock** (SMP phase 3b) — route device
+   IRQs explicitly (needs an ACPI MADT walk for the IOAPIC base/GSIs; the
+   RSDP comes from Limine) and stop depending on the BSP servicing IRQ0 for
+   `pit::ticks()` (a LAPIC-timer-derived or TSC clock). Until then, BSP code
+   that waits on another core must keep interrupts enabled
+   (`sched::wait_on_other_core`). Then: load balancing / stealing is a product
+   decision, not a default.
 3. **AMX tier / inference workload 2** — `docs/specs/2026-07-16-inference-workload2-design.md`.
 4. **Tiered memory** — `docs/specs/2026-07-14-tiered-memory-design.md` (design only).
 5. **CPU security step 2** — `docs/specs/2026-07-14-cpu-security-features-design.md`.
@@ -54,6 +60,9 @@ changes direction; keep it short. Last updated **2026-09-18** (PR-2).
   BSP prints during bring-up even though the console is now cross-core locked.
 - **Tasks are pinned; a core is told about work by IPI**, never by another core
   touching its `current`. No stealing until it is deliberately designed.
+- **The PIT wall clock advances only via the BSP's IRQ0.** Waiting on another
+  core with interrupts off froze it once (silent hang, found with `-d int`).
+  Every cross-core wait opens the interrupt window.
 - **Keep the preemption proof at 40 ticks** (PR #31 analysis): 200 ms of boot
   time is not worth halving a gating proof's margin.
 - **Kernel-crate Kani harnesses must be discharged locally before merge**
@@ -63,6 +72,11 @@ changes direction; keep it short. Last updated **2026-09-18** (PR-2).
 
 - Development happens on a branch; PRs are drafts until CI is green; `main`
   is always bootable.
+- **Commit identity split (standing rule).** Commits Claude authors are
+  committed as `Claude <noreply@anthropic.com>` (the repo's stop hook checks
+  this) and **always** carry a `Co-Authored-By: Veeti Väinö Valtteri Hietasalo <33787357+veetihietasalo@users.noreply.github.com>`
+  trailer so Veeti is credited as a contributor on every one, plus the Claude
+  attribution trailers last.
 - Boot proofs are hard assertions in `kernel/xtask` (`make test`), never prose.
 - `println!("{}", n)` with integer args faults on this target — use
   `hal::serial::write_str` / `write_dec`.

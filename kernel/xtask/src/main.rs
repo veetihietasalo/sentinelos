@@ -403,6 +403,24 @@ const SCHED_PINNED_PREFIX: &str = "[sched] pinned: ";
 /// The field of the pinned-proof line asserting the task ran on a core other
 /// than the BSP.
 const SCHED_PINNED_DISTINCT_OK: &str = "distinct=yes";
+/// Prefix of the SMP phase-3 **LAPIC timer** line written by
+/// `kernel::interrupts::init_lapic_timer`: `[timer] lapic: N counts/tick (div16)
+/// -> 100 Hz scheduler tick on every core; PIT stays wall clock`. Its presence
+/// (with [`TIMER_LAPIC_EVERY_CORE`]) proves the BSP calibrated its LAPIC timer
+/// against the PIT and moved the scheduler tick onto it — the count every AP then
+/// copies. The unavailable/failed variants say `stays on the PIT` instead.
+const TIMER_LAPIC_PREFIX: &str = "[timer] lapic: ";
+/// The substring of the LAPIC timer line confirming the tick is per-core.
+const TIMER_LAPIC_EVERY_CORE: &str = "scheduler tick on every core";
+/// Prefix of the SMP phase-3 **AP preemption** proof line written by
+/// `kernel::sched::prove_ap_preemptive`: `[sched] ap-preemptive: cpuN
+/// gemm-iters=<N> gemm-exact=yes spin-iters=<N> tick-preempted=<N> ok` — the
+/// PR-B payoff proof on an application processor. `tick-preempted` counts only
+/// switches made by that core's own LAPIC-timer tick (the IPIs that deliver the
+/// two tasks are excluded), so `>= 1` is evidence of the AP's tick. Field-checked
+/// like the BSP line: `gemm-exact=yes`, both iteration counts `> 0`,
+/// `tick-preempted >= 1`, trailing `ok`.
+const SCHED_AP_PREEMPTIVE_PREFIX: &str = "[sched] ap-preemptive: ";
 /// The `[ml]` `active=` values that mean a *vector* tier is live — a real SIMD
 /// int8-GEMM kernel runs (its boot self-test passed), not the scalar fallback. We
 /// accept **any** implemented vector tier because the runner fleet is heterogeneous:
@@ -980,6 +998,50 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // SMP phase 3: the LAPIC timer must carry the scheduler tick on every core …
+    let Some(timer_line) = log.lines().find(|l| l.contains(TIMER_LAPIC_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: LAPIC timer line '{}…' missing (calibration did not run, or \
+             the scheduler tick stayed on the PIT).",
+            TIMER_LAPIC_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    if !timer_line.contains(TIMER_LAPIC_EVERY_CORE) {
+        eprintln!(
+            "TEST FAILED: the scheduler tick did not move to the LAPIC timer \
+             (expected '{}'): '{}'",
+            TIMER_LAPIC_EVERY_CORE, timer_line
+        );
+        return ExitCode::FAILURE;
+    }
+    // … and an application processor's tick must preempt two non-yielding tasks
+    // with the GEMM task's vector state surviving bit-exact.
+    let Some(ap_line) = log.lines().find(|l| l.contains(SCHED_AP_PREEMPTIVE_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: AP preemption proof line '{}…' missing (did \
+             `kernel::sched::prove_ap_preemptive` run?).",
+            SCHED_AP_PREEMPTIVE_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    let ap_tick_preempted = parse_u64_after(ap_line, "tick-preempted=").unwrap_or(0);
+    let ap_gemm_iters = parse_u64_after(ap_line, "gemm-iters=").unwrap_or(0);
+    let ap_spin_iters = parse_u64_after(ap_line, "spin-iters=").unwrap_or(0);
+    if !ap_line.contains(SCHED_PREEMPTIVE_GEMM_EXACT)
+        || ap_tick_preempted < 1
+        || ap_gemm_iters == 0
+        || ap_spin_iters == 0
+        || !ap_line.trim_end().ends_with("ok")
+    {
+        eprintln!(
+            "TEST FAILED: the AP preemption proof did not pass (expected '{}', \
+             tick-preempted>=1, both iteration counts > 0, trailing 'ok'): '{}'",
+            SCHED_PREEMPTIVE_GEMM_EXACT, ap_line
+        );
+        return ExitCode::FAILURE;
+    }
+
     // A vector int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is a
     // real SIMD kernel — proving the hand-written `asm!` kernels execute and compute
     // correctly. `-cpu Haswell` (TCG) exposes avx2; `-cpu host` (KVM) exposes avx2
@@ -1144,8 +1206,8 @@ fn boot_test(kvm: bool) -> ExitCode {
         println!(
             "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' — SMP \
              phase 2 proven ('{}': all {} CPUs online, {} APs GEMM-verified on \
-             their own cores), the per-CPU scheduler proven ('{}'), a vector \
-             int8-GEMM tier verified active ('{}' with \
+             their own cores), the per-CPU scheduler proven ('{}'), the per-core \
+             LAPIC tick proven ('{}'), a vector int8-GEMM tier verified active ('{}' with \
              '{}' and '{}' in the [ml] lines), the cooperative scheduler verdict \
              ('{}'), the preemptive scheduler proof ('{}', preempted={}, \
              gemm-iters={}, spin-iters={}), plus banner + end-marker '{}'.",
@@ -1155,6 +1217,7 @@ fn boot_test(kvm: bool) -> ExitCode {
             tracked,
             aps_ok,
             pinned_line,
+            ap_line,
             active_tier,
             ML_GEMM_OK,
             ML_TFB_OK,
@@ -1169,8 +1232,8 @@ fn boot_test(kvm: bool) -> ExitCode {
         println!(
             "TEST PASSED: full banner, SMP bring-up line, SMP phase 2 proven \
              ('{}': all {} CPUs online, {} APs GEMM-verified on their own cores), \
-             the per-CPU scheduler proven ('{}'), vector tier active ('{}' with \
-             '{}' and '{}'), the cooperative \
+             the per-CPU scheduler proven ('{}'), the per-core LAPIC tick proven \
+             ('{}'), vector tier active ('{}' with '{}' and '{}'), the cooperative \
              scheduler verdict ('{}'), the preemptive scheduler proof ('{}', \
              preempted={}, gemm-iters={}, spin-iters={}), and end-marker '{}' \
              confirmed in serial output.",
@@ -1178,6 +1241,7 @@ fn boot_test(kvm: bool) -> ExitCode {
             tracked,
             aps_ok,
             pinned_line,
+            ap_line,
             active_tier,
             ML_GEMM_OK,
             ML_TFB_OK,

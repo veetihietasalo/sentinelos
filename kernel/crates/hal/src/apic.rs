@@ -25,11 +25,13 @@
 //! not (QEMU TCG) the same registers are 32-bit MMIO words at the LAPIC's
 //! physical base (`IA32_APIC_BASE[..12]`, normally `0xFEE0_0000`), which
 //! [`enable_bsp`] maps once, uncached, through the audited `mm::map_mmio`. Both
-//! paths program the same virtual-wire configuration and support the same two
+//! paths program the same virtual-wire configuration and support the same
 //! SMP operations the per-CPU scheduler needs — [`send_ipi`] (a fixed-delivery
-//! inter-processor interrupt, so a core idling in `hlt` learns it has work) and
-//! [`eoi`] — so multi-core scheduling is exercised on every TCG boot test, not
-//! only under KVM.
+//! inter-processor interrupt, so a core idling in `hlt` learns it has work),
+//! [`eoi`], and the **per-core LAPIC timer** ([`timer_start_calibration`] /
+//! [`timer_current_count`] / [`timer_start_periodic`]: the scheduler tick on
+//! every core, calibrated once against the PIT) — so multi-core scheduling is
+//! exercised on every TCG boot test, not only under KVM.
 //!
 //! The `unsafe` here is the `MSR` access (via [`crate::cpu`]'s `read_msr` /
 //! `write_msr`) and the bounded volatile MMIO access to the mapped LAPIC page,
@@ -67,6 +69,18 @@ const REG_ICR_HIGH: u32 = 0x310;
 const REG_LVT_LINT0: u32 = 0x350;
 /// LVT LINT1 (local interrupt 1 — NMI in virtual-wire mode).
 const REG_LVT_LINT1: u32 = 0x360;
+/// LVT Timer register (vector, mask, mode).
+const REG_LVT_TIMER: u32 = 0x320;
+/// Timer initial-count register (write starts the countdown).
+const REG_TIMER_INIT: u32 = 0x380;
+/// Timer current-count register (read-only).
+const REG_TIMER_CUR: u32 = 0x390;
+/// Timer divide-configuration register.
+const REG_TIMER_DIV: u32 = 0x3E0;
+/// LVT Timer bit 17 — periodic mode (reload the initial count on expiry).
+const LVT_TIMER_PERIODIC: u64 = 1 << 17;
+/// Divide-configuration encoding for divide-by-16 (bits 0,1,3 = `0b0011`).
+const TIMER_DIV_16: u64 = 0b0011;
 /// Base MSR of the x2APIC register block.
 const X2APIC_MSR_BASE: u32 = 0x800;
 /// Size of the xAPIC MMIO register page.
@@ -466,6 +480,70 @@ pub fn eoi() {
         // memory.
         unsafe { reg_write(mode, REG_EOI, 0) }
     }
+}
+
+/// Start the **calling core's** LAPIC timer in one-shot mode with the maximum
+/// initial count and the interrupt **masked** — the calibration probe.
+///
+/// The kernel then waits a known number of PIT ticks (the PIT is the wall
+/// clock) and reads [`timer_current_count`]: the difference is how many LAPIC
+/// timer counts (at divide-by-16) elapse per PIT tick, which
+/// [`timer_start_periodic`] turns into a periodic tick on every core. Masked, so
+/// no interrupt fires during calibration whatever the vector register holds.
+/// Returns `false` (doing nothing) without a LAPIC access path.
+#[must_use]
+pub fn timer_start_calibration() -> bool {
+    let Some(mode) = access_mode() else {
+        return false;
+    };
+    // SAFETY: `mode` is live; the three writes program only the timer: divide
+    // by 16, LVT timer masked + one-shot (mode bits clear), then the initial
+    // count, which starts the countdown. Timer registers configure a counter
+    // and (here, masked) an interrupt source; they cannot alias Rust memory.
+    unsafe {
+        reg_write(mode, REG_TIMER_DIV, TIMER_DIV_16);
+        reg_write(mode, REG_LVT_TIMER, LVT_MASKED);
+        reg_write(mode, REG_TIMER_INIT, u64::from(u32::MAX));
+    }
+    true
+}
+
+/// The calling core's LAPIC timer current count, or `None` without an access
+/// path. Read-only.
+#[must_use]
+pub fn timer_current_count() -> Option<u32> {
+    let mode = access_mode()?;
+    // SAFETY: `mode` is live; `REG_TIMER_CUR` is a read-only counter register.
+    Some(unsafe { reg_read(mode, REG_TIMER_CUR) } as u32)
+}
+
+/// Start the **calling core's** LAPIC timer in **periodic** mode: `vector` is
+/// delivered every `initial_count` counts (at divide-by-16), forever.
+///
+/// This is the per-core scheduler tick (SMP phase 3): each core — the BSP and
+/// every AP — runs this once with the count the BSP calibrated against the PIT,
+/// and `kernel::interrupts::handle_lapic_timer` turns each expiry into
+/// `sched::on_tick` on that core. The handler owes a LAPIC [`eoi`]. Returns
+/// `false` (doing nothing) without an access path or with a zero count.
+#[must_use]
+pub fn timer_start_periodic(vector: u8, initial_count: u32) -> bool {
+    let Some(mode) = access_mode() else {
+        return false;
+    };
+    if initial_count == 0 {
+        return false;
+    }
+    // SAFETY: `mode` is live. Divide by 16 (the calibration's divisor), LVT
+    // timer = periodic | vector (unmasked), then the initial count, which starts
+    // it. Configures this core's own timer and its interrupt vector; what the
+    // core does on expiry is decided by the IDT, where the kernel registered the
+    // handler before any core's timer is started. Cannot alias Rust memory.
+    unsafe {
+        reg_write(mode, REG_TIMER_DIV, TIMER_DIV_16);
+        reg_write(mode, REG_LVT_TIMER, LVT_TIMER_PERIODIC | u64::from(vector));
+        reg_write(mode, REG_TIMER_INIT, u64::from(initial_count));
+    }
+    true
 }
 
 /// The **calling core's** APIC ID as reported by `cpuid`, valid in any LAPIC mode.

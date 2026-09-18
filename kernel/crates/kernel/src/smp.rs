@@ -66,6 +66,8 @@ pub struct PerCpu {
     simd: AtomicBool,
     /// The identity int8 GEMM boot proof passed **on this core**.
     gemm_ok: AtomicBool,
+    /// This core's LAPIC timer is running as its scheduler tick (SMP phase 3).
+    tick: AtomicBool,
     /// The core's own `cpuid` APIC ID equals the bootloader's `lapic_id` for the
     /// slot it was handed — i.e. the AP that arrived is the one we started.
     lapic_match: AtomicBool,
@@ -79,6 +81,7 @@ impl PerCpu {
             lapic_mode: AtomicU8::new(0),
             simd: AtomicBool::new(false),
             gemm_ok: AtomicBool::new(false),
+            tick: AtomicBool::new(false),
             lapic_match: AtomicBool::new(false),
         }
     }
@@ -124,6 +127,12 @@ impl PerCpu {
     #[must_use]
     pub fn gemm_ok(&self) -> bool {
         self.gemm_ok.load(Ordering::Relaxed)
+    }
+
+    /// Whether this CPU's LAPIC timer carries its scheduler tick.
+    #[must_use]
+    pub fn has_tick(&self) -> bool {
+        self.tick.load(Ordering::Relaxed)
     }
 
     /// Whether the CPU's own `cpuid` APIC ID matched its slot's `lapic_id`.
@@ -256,7 +265,7 @@ pub(crate) fn plan(descs: &[CpuDesc], bsp_lapic_fallback: u32) -> BringUpPlan {
 /// Serial output (all from the BSP):
 ///
 /// ```text
-/// [smp] cpu1 online: apic-id=1 lapic-match=yes lapic=xapic simd=yes gemm=ok
+/// [smp] cpu1 online: apic-id=1 lapic-match=yes lapic=xapic simd=yes gemm=ok tick=lapic
 /// [smp] cpu2 FAILED to start (timeout 100 ticks): apic-id=2
 /// [smp] online=4/4 bsp-apic-id=0 aps-ok=3 aps-failed=0 skipped=0
 /// ```
@@ -281,6 +290,9 @@ pub fn bring_up_aps() {
         .gemm_ok
         .store(ml::gemm_proof_ok(), Ordering::Relaxed);
     CPUS[0].lapic_match.store(true, Ordering::Relaxed);
+    CPUS[0]
+        .tick
+        .store(crate::interrupts::lapic_tick_active(), Ordering::Relaxed);
 
     if descs.is_empty() {
         CPUS[0].lapic_id.store(bsp_cpuid_apic, Ordering::Release);
@@ -350,6 +362,8 @@ pub fn bring_up_aps() {
             hal::serial::write_str(yes_no(cpu.simd_enabled()));
             hal::serial::write_str(" gemm=");
             hal::serial::write_str(if cpu.gemm_ok() { "ok" } else { "FAIL" });
+            hal::serial::write_str(" tick=");
+            hal::serial::write_str(if cpu.has_tick() { "lapic" } else { "none" });
             hal::serial::write_str("\n");
         } else {
             aps_failed += 1;
@@ -456,6 +470,14 @@ fn ap_main(info: ApInfo) -> ! {
     if crate::sched::init_ap(info.cpu_index).is_none() {
         hal::cpu::halt_loop();
     }
+    // This core's scheduler tick (SMP phase 3): the LAPIC timer with the count
+    // the BSP calibrated. After `init_ap` so the first tick finds this core's
+    // idle as `current`; the interrupt stays pending until the idle loop's
+    // first `sti`.
+    cpu.tick.store(
+        crate::interrupts::start_lapic_timer_here(),
+        Ordering::Relaxed,
+    );
     cpu.online.store(true, Ordering::Release);
 
     // The per-CPU idle: reap what exited here, then `sti; hlt` until the next
