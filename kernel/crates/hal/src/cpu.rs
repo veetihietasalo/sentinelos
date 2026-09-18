@@ -167,6 +167,26 @@ pub fn read_cr4() -> u64 {
     value
 }
 
+/// `CR4.OSXSAVE` (bit 18): set once the OS has enabled `xgetbv`/`xsetbv` and
+/// XSAVE-managed vector state on **this** core (see [`crate::simd::enable`]).
+pub(crate) const CR4_OSXSAVE: u64 = 1 << 18;
+
+/// Whether `CR4.OSXSAVE` is set on the **current** core — the exact architectural
+/// precondition for `xsave`/`xrstor` (and `xgetbv`/`xsetbv`) not to `#UD`.
+///
+/// A live, per-core hardware read (one `mov reg, cr4`, the same primitive as
+/// [`read_cr4`]) that cannot desynchronise from the true state the way a software
+/// flag can. [`crate::context::switch`] gates its per-task vector save on it, and
+/// `isr_common` (in [`crate::idt`]) performs the identical test in assembly for
+/// its per-IRQ save — the SMP-correct form of that gate now that application
+/// processors run their own [`crate::simd::enable`] independently of the BSP.
+/// Safe: observing a control register has no side effect.
+#[inline]
+#[must_use]
+pub fn osxsave_enabled() -> bool {
+    read_cr4() & CR4_OSXSAVE != 0
+}
+
 /// Write the `CR4` control register.
 ///
 /// # Safety
@@ -398,6 +418,37 @@ pub fn halt() {
         asm!("hlt", options(nomem, nostack, preserves_flags));
     }
 }
+
+/// Enable interrupts and halt **atomically** (`sti; hlt`) — the race-free idle
+/// step.
+///
+/// `sti` takes effect only after the *next* instruction, so an interrupt that
+/// is already pending is recognised **after** `hlt` has been entered and wakes
+/// the core immediately. Two separate calls ([`enable_interrupts`] then
+/// [`halt`]) leave a window between them in which a wake-up interrupt (an IPI
+/// telling this core it has work) could be taken *before* the `hlt`, and the
+/// core would then sleep through the wake-up it was waiting for. Application
+/// processors idle on this while they have nothing to run (`kernel::sched`).
+/// Returns once an interrupt has been serviced; interrupts are left enabled.
+#[cfg(target_os = "none")]
+#[inline]
+pub fn enable_interrupts_and_halt() {
+    // SAFETY: `sti` sets RFLAGS.IF and `hlt` idles the core until the next
+    // interrupt; the pair touches no memory or GP registers (`nomem`,
+    // `nostack`). It modifies IF, so `preserves_flags` is NOT set. Neither
+    // instruction can create UB — see `enable_interrupts` and `halt`; the only
+    // difference is that they are one asm block, which is what makes the
+    // interrupt shadow of `sti` cover the `hlt`.
+    unsafe {
+        asm!("sti", "hlt", options(nomem, nostack));
+    }
+}
+
+/// Host stub for [`enable_interrupts_and_halt`]: privileged on the host and
+/// never reached by tests; a no-op like the other interrupt-flag stubs.
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn enable_interrupts_and_halt() {}
 
 /// Halt the CPU forever in a `hlt` loop and never return.
 ///

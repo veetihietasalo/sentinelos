@@ -28,6 +28,7 @@ pub mod ml;
 pub mod net;
 pub mod sched;
 pub mod shell;
+pub mod smp;
 pub mod wm;
 
 /// Kernel entry point — called by `boot::_start` after serial initialisation.
@@ -107,7 +108,7 @@ pub fn kmain() -> ! {
     // broken virtual wire would stall here and fail the boot test, rather than
     // silently stopping the clock. See docs/specs/2026-07-14-smp-x2apic-design.md.
     match hal::apic::enable_bsp() {
-        Some(apic_id) => {
+        Some(lapic) => {
             let start = hal::pit::ticks();
             hal::cpu::enable_interrupts();
             while hal::pit::ticks() < start + 3 {
@@ -119,16 +120,27 @@ pub fn kmain() -> ! {
             // `core::fmt` emits need `.got`/`.rela` the linker script discards; see
             // memory.rs / hal-tcb.md §5e). String-literal `println!` is fine, but
             // the dynamic apic id / cpu count / tick count must go through write_dec.
-            hal::serial::write_str("[smp] x2APIC enabled; BSP apic id=");
-            hal::serial::write_dec(apic_id as u64);
+            hal::serial::write_str("[smp] ");
+            hal::serial::write_str(lapic.mode.label());
+            hal::serial::write_str(" enabled; BSP apic id=");
+            hal::serial::write_dec(u64::from(lapic.id));
             hal::serial::write_str("; ");
             hal::serial::write_dec(hal::apic::logical_cpu_count() as u64);
             hal::serial::write_str(" logical CPU(s); timer live (");
             hal::serial::write_dec(hal::pit::ticks());
             hal::serial::write_str(" ticks)\n");
         }
-        None => hal::println!("[smp] x2APIC not advertised; staying on legacy xAPIC/PIC"),
+        None => hal::println!("[smp] no LAPIC access path; staying on the legacy PIC"),
     }
+
+    // SMP phase 2: bring every application processor the bootloader parked into
+    // the kernel — per-AP GDT/TSS, the shared IDT, its own vector state and LAPIC
+    // — prove each with an int8 GEMM on its own core, then park it until the
+    // per-CPU scheduler (PR-2) gives it work. Runs under TCG too (the bootloader's
+    // xAPIC INIT-SIPI-SIPI), so `make test` asserts `online=4/4`, not only the
+    // KVM job. Must follow `interrupts::init` (APs load that IDT), `simd::enable`
+    // and `init_timer` (the wait loop counts PIT ticks).
+    smp::bring_up_aps();
 
     // Bring up the AI/ML COMPUTE path: turn the C1 cpuid detection (AMX / AVX-512)
     // into an actual quantized-inference primitive. Reports the detected hardware
@@ -195,6 +207,13 @@ pub fn kmain() -> ! {
     // Runs after `prove_cooperative` has fully drained (so `ready`/`tasks`
     // start clean) and before the closing banner, same rationale as above.
     sched::prove_preemptive();
+
+    // SMP PR-2 boot proof: place a task on an application processor by dense
+    // cpu index; it records which core it actually ran on (its own `cpuid`
+    // APIC ID → dense index) and the BSP asserts that is the target and not
+    // itself. Exercises the reschedule IPI end to end — send, AP wake from
+    // `sti; hlt`, ISR-tail switch, exit back to the AP idle, reap.
+    sched::prove_pinned();
 
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");

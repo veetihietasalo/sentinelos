@@ -36,9 +36,11 @@
 //! CPU-wide bit unaffected by a context switch). No vector instructions appear
 //! in the asm below (`cargo xtask check-no-vector` enforces this); the eager
 //! `xsave`/`xrstor` bracket lives in the thin Rust body of [`switch`], gated on
-//! [`crate::idt::vector_state_armed`] so it never runs before
-//! [`crate::simd::enable`] has set `CR4.OSXSAVE` — exactly the same gate
-//! [`crate::idt::isr_common`] uses for its per-IRQ save.
+//! [`crate::cpu::osxsave_enabled`] — a live read of **this core's** `CR4.OSXSAVE`,
+//! the architectural precondition itself — so it never runs before
+//! [`crate::simd::enable`] has set that bit on the executing core; exactly the
+//! same per-core test `isr_common` (in [`crate::idt`]) performs in assembly for
+//! its per-IRQ save.
 
 use core::arch::global_asm;
 use core::ptr::{self, NonNull};
@@ -356,9 +358,9 @@ sentinel_task_entry_trampoline:
 /// state for a task's first run — never lazily, per the scheduler design
 /// doc's requirement #1), *then* swap the general-purpose registers/stack via
 /// [`sentinel_gpr_switch`]. The vector bracket is skipped entirely — matching
-/// [`crate::idt::isr_common`]'s own gate byte-for-byte — until
-/// [`crate::simd::enable`] has armed it, so it can never execute before
-/// `CR4.OSXSAVE` is set (which would `#UD`).
+/// `isr_common`'s own gate (a live `CR4.OSXSAVE` test on the executing core) —
+/// until [`crate::simd::enable`] has set that bit on this core, so it can never
+/// execute before `CR4.OSXSAVE` is set (which would `#UD`).
 pub fn switch(prev: TaskHandle, next: TaskHandle) {
     // SAFETY: `prev`/`next` are `TaskHandle`s minted (via `TaskHandle::new`)
     // from live `&mut Context` references that, by the kernel's documented
@@ -370,11 +372,12 @@ pub fn switch(prev: TaskHandle, next: TaskHandle) {
     // pointers to `&mut Context` is therefore sound and unaliased.
     let (prev_ctx, next_ctx) = unsafe { (&mut *prev.0.as_ptr(), &mut *next.0.as_ptr()) };
 
-    if crate::idt::vector_state_armed() {
-        // SAFETY: `vector_state_armed()` is true only after `simd::enable` has
-        // set `CR4.OSXSAVE` + `XCR0` and confirmed the `xsave`/`xrstor`
-        // round-trip self-test — the exact precondition `cpu::xsave`/
-        // `cpu::xrstor` require, so neither can `#UD`. `prev_ctx.xsave` /
+    if crate::cpu::osxsave_enabled() {
+        // SAFETY: `osxsave_enabled()` is a live read of this core's
+        // `CR4.OSXSAVE`, which `simd::enable` leaves set only after it has also
+        // set `XCR0` and confirmed the `xsave`/`xrstor` round-trip self-test
+        // (on failure it clears the bit again) — the exact precondition
+        // `cpu::xsave`/`cpu::xrstor` require, so neither can `#UD`. `prev_ctx.xsave` /
         // `next_ctx.xsave` were captured from a live `&mut XsaveArea`
         // (`adopt_running`/`for_new_task`): 64-byte aligned,
         // `XSAVE_AREA_SIZE` bytes, header-zeroed (`new_init`/`zeroize`) —

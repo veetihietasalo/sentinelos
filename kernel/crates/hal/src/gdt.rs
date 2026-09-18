@@ -17,9 +17,12 @@
 //!   double-fault stack.
 //!
 //! It then `lgdt`s the table, reloads `CS` via a far return, reloads the data
-//! segment registers, and `ltr`s the TSS selector. The only public entry point
-//! is the safe [`init`]; everything privileged is confined to documented
-//! `unsafe` blocks and registered in `kernel/docs/hal-tcb.md`.
+//! segment registers, and `ltr`s the TSS selector. The safe [`init`] does this
+//! for the bootstrap processor; the crate-private [`init_ap`] does the same for
+//! an application processor from its own per-AP slot of tables (a TSS goes
+//! *busy* on `ltr`, so cores cannot share one). Everything privileged is
+//! confined to documented `unsafe` blocks and registered in
+//! `kernel/docs/hal-tcb.md`.
 //!
 //! Hand-rolled by design (spec §4): we deliberately do **not** pull in the
 //! `x86_64` crate, so the entire descriptor-table TCB is auditable in-tree and
@@ -114,12 +117,41 @@ impl TaskStateSegment {
     }
 }
 
-/// The single Task State Segment for the (single-core) kernel.
+/// The bootstrap processor's Task State Segment.
 ///
 /// `static mut` because its `ist[0]` field is filled in at runtime with the
 /// address of [`DOUBLE_FAULT_STACK`]'s top, and the CPU references it by
-/// physical/linear address via the TSS descriptor after `ltr`.
+/// physical/linear address via the TSS descriptor after `ltr`. Application
+/// processors get their own (see [`init_ap`]): a TSS descriptor is marked *busy*
+/// by `ltr`, so one TSS cannot be loaded on two cores, and each core's
+/// double-fault IST stack must be distinct anyway.
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
+
+// ── Per-application-processor descriptor tables (SMP) ────────────────────────
+
+/// Number of application-processor table slots: every CPU but the BSP.
+pub(crate) const MAX_APS: usize = crate::smp::MAX_CPUS - 1;
+
+/// Size of each AP's double-fault IST stack (8 KiB).
+///
+/// Half the BSP's: the AP double-fault path is the same report-and-halt chain,
+/// and 8 KiB × [`MAX_APS`] keeps the static footprint modest.
+const AP_IST_STACK_SIZE: usize = 8 * 1024;
+
+/// 16-byte-aligned backing storage for one AP's double-fault IST stack.
+#[repr(C, align(16))]
+struct ApIstStack([u8; AP_IST_STACK_SIZE]);
+
+/// Per-AP double-fault stacks (`.bss`), indexed by AP slot. CPU-written only.
+static mut AP_DOUBLE_FAULT_STACKS: [ApIstStack; MAX_APS] =
+    [const { ApIstStack([0; AP_IST_STACK_SIZE]) }; MAX_APS];
+
+/// Per-AP Task State Segments, indexed by AP slot (`ist[0]` filled by [`init_ap`]).
+static mut AP_TSS: [TaskStateSegment; MAX_APS] = [const { TaskStateSegment::new() }; MAX_APS];
+
+/// Per-AP GDTs, indexed by AP slot. Same layout as [`GDT`]; only the TSS
+/// descriptor (entries 3/4) differs per core.
+static mut AP_GDT: [[u64; GDT_ENTRIES]; MAX_APS] = [[0; GDT_ENTRIES]; MAX_APS];
 
 /// Number of 8-byte slots in the GDT: null + code + data + 2 for the TSS.
 const GDT_ENTRIES: usize = 5;
@@ -213,35 +245,103 @@ const fn tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
 /// (the IDT's gates reference [`KERNEL_CODE_SELECTOR`], which only becomes valid
 /// once this GDT is loaded).
 pub fn init() {
-    // SAFETY: We take raw pointers to the `static mut` TSS/stack/GDT and program
-    // them, then load them into the CPU. This is sound because:
-    //   * `init` is documented to run exactly once on the single boot core
-    //     before interrupts are enabled, so there is no concurrent access to
-    //     these statics and no aliasing `&mut` exists elsewhere.
-    //   * We compute the stack top and the TSS base/limit from the statics' own
-    //     addresses/sizes, so every descriptor field is self-consistent.
+    // SAFETY: We take raw pointers to the BSP's `static mut` TSS/stack/GDT and
+    // hand them to `install`. Sound because `init` is documented to run exactly
+    // once on the boot core before interrupts are enabled, so there is no
+    // concurrent access to these statics and no aliasing `&mut` exists elsewhere;
+    // the stack top is computed from the static's own address/size (one past the
+    // end of the array — the stack grows down), so `install`'s preconditions
+    // (exclusively-owned table storage for this core, a valid IST stack top,
+    // interrupts masked) all hold.
+    unsafe {
+        let stack_bottom = core::ptr::addr_of_mut!(DOUBLE_FAULT_STACK) as *mut u8;
+        let stack_top = stack_bottom.add(IST_STACK_SIZE) as u64;
+        install(
+            core::ptr::addr_of_mut!(GDT),
+            core::ptr::addr_of_mut!(TSS),
+            stack_top,
+        );
+    }
+}
+
+/// Build and load a **private** GDT + TSS (with its own double-fault IST stack)
+/// for application processor `slot` (`0..MAX_APS`), on the calling AP.
+///
+/// The code/data descriptors are identical to the BSP's — the selectors
+/// [`KERNEL_CODE_SELECTOR`] / [`KERNEL_DATA_SELECTOR`] / [`TSS_SELECTOR`] mean the
+/// same thing on every core, which is what lets the **shared** IDT (whose gates
+/// name [`KERNEL_CODE_SELECTOR`]) be loaded unchanged on each AP. Only the TSS
+/// differs per core: `ltr` marks a TSS descriptor *busy*, so a second core cannot
+/// load the BSP's, and each core's IST stack must be its own memory.
+///
+/// Returns `false` (doing nothing) if `slot` is out of range. Must be called
+/// **once per AP**, on that AP, with interrupts masked — which is exactly how
+/// `hal::smp::ap_entry` calls it (slot = dense cpu index − 1, unique per AP).
+pub(crate) fn init_ap(slot: usize) -> bool {
+    if slot >= MAX_APS {
+        return false;
+    }
+    // SAFETY: `slot < MAX_APS` (checked), so each `.add(slot)` stays inside its
+    // static array. Each slot is used by exactly one AP (the kernel hands out
+    // dense cpu indices uniquely and starts APs serially), and that AP is the
+    // only core that ever touches its slot — so the table storage is exclusively
+    // owned by the calling core, unaliased, and never concurrently accessed. The
+    // IST stack top is one past the end of that slot's `ApIstStack` (the stack
+    // grows down). Interrupts are masked on an AP until after `ap_entry`'s
+    // privileged sequence. These are `install`'s preconditions.
+    unsafe {
+        let stacks = core::ptr::addr_of_mut!(AP_DOUBLE_FAULT_STACKS) as *mut ApIstStack;
+        let stack_bottom = stacks.add(slot) as *mut u8;
+        let stack_top = stack_bottom.add(AP_IST_STACK_SIZE) as u64;
+        let gdt = (core::ptr::addr_of_mut!(AP_GDT) as *mut [u64; GDT_ENTRIES]).add(slot);
+        let tss = (core::ptr::addr_of_mut!(AP_TSS) as *mut TaskStateSegment).add(slot);
+        install(gdt, tss, stack_top);
+    }
+    true
+}
+
+/// Program `gdt_ptr`/`tss_ptr` and switch the **calling core** onto them.
+///
+/// Steps, in order:
+/// 1. Fill the TSS's `ist[0]` with `ist_top`.
+/// 2. Compose the GDT (code, data, and the TSS descriptor built from `tss_ptr`).
+/// 3. `lgdt` the new table.
+/// 4. Reload `CS` to the kernel-code selector via a far return.
+/// 5. Reload the data segment registers to the kernel-data selector.
+/// 6. `ltr` the TSS selector so `ist[0]` is live.
+///
+/// # Safety
+///
+/// `gdt_ptr` and `tss_ptr` must point at `'static` table storage owned
+/// exclusively by the calling core (no other core or reference accesses it, ever);
+/// `ist_top` must be the 16-byte-aligned top of a valid, otherwise-unused stack;
+/// and interrupts must be masked on the calling core for the duration. Call once
+/// per core.
+unsafe fn install(gdt_ptr: *mut [u64; GDT_ENTRIES], tss_ptr: *mut TaskStateSegment, ist_top: u64) {
+    // SAFETY: We program the caller-owned tables through raw pointers, then load
+    // them into this CPU. This is sound because:
+    //   * By this function's contract the tables are exclusively owned by the
+    //     calling core and interrupts are masked, so there is no concurrent
+    //     access and no aliasing `&mut` exists elsewhere.
+    //   * We compute the TSS base/limit from the table's own address/size and take
+    //     `ist_top` from a valid stack, so every descriptor field is
+    //     self-consistent.
     //   * The descriptor bit-layouts (`code_descriptor`/`data_descriptor`/
     //     `tss_descriptor`) follow the AMD64 manual; loading well-formed
     //     descriptors cannot corrupt Rust-managed memory.
     // Each individual privileged instruction has its own SAFETY note below.
     unsafe {
-        // (1) Record the double-fault stack top in IST[0]. The stack grows down,
-        // so the top is one-past-the-end of the array. We use raw-pointer
-        // arithmetic on the static's address (no intermediate reference to the
-        // `static mut`, avoiding any aliasing question).
-        let stack_bottom = core::ptr::addr_of_mut!(DOUBLE_FAULT_STACK) as *mut u8;
-        let stack_top = stack_bottom.add(IST_STACK_SIZE) as u64;
-        let tss_ptr = core::ptr::addr_of_mut!(TSS);
-        // Write only the one IST entry we use, via the raw pointer's field.
-        (*tss_ptr).interrupt_stack_table[DOUBLE_FAULT_IST_INDEX] = stack_top;
+        // (1) Record the double-fault stack top in IST[0], via the raw pointer's
+        // field (no intermediate reference to the static, avoiding any aliasing
+        // question).
+        (*tss_ptr).interrupt_stack_table[DOUBLE_FAULT_IST_INDEX] = ist_top;
 
         // (2) Compose the GDT. Entries 1/2 are compile-time constants; the TSS
-        // descriptor (entries 3/4) is built from the runtime address of `TSS`.
+        // descriptor (entries 3/4) is built from the runtime address of the TSS.
         let tss_base = tss_ptr as u64;
         let tss_limit = (size_of::<TaskStateSegment>() - 1) as u32;
         let (tss_low, tss_high) = tss_descriptor(tss_base, tss_limit);
 
-        let gdt_ptr = core::ptr::addr_of_mut!(GDT);
         (*gdt_ptr)[0] = 0; // null
         (*gdt_ptr)[1] = code_descriptor();
         (*gdt_ptr)[2] = data_descriptor();
@@ -306,9 +406,11 @@ pub fn init() {
         //
         // SAFETY: `ltr` loads the task register from the TSS selector (`0x18`),
         // which indexes the available-64-bit-TSS descriptor we built in entries
-        // 3/4 pointing at our `TSS`. After this, a fault routed to IST[0] (the
-        // double-fault gate) switches to `DOUBLE_FAULT_STACK`. Loading a valid
-        // TSS selector cannot corrupt memory; it only arms the IST mechanism.
+        // 3/4 pointing at this core's TSS (never loaded on any other core, so it
+        // is *available*, not *busy*). After this, a fault routed to IST[0] (the
+        // double-fault gate) switches to this core's double-fault stack. Loading
+        // a valid TSS selector cannot corrupt memory; it only arms the IST
+        // mechanism.
         asm!(
             "ltr {sel:x}",
             sel = in(reg) TSS_SELECTOR,

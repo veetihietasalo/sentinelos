@@ -18,22 +18,51 @@
 //! [`on_tick`] — hooked from `kernel::interrupts::handle_timer` (the PIT/IRQ0
 //! handler) — decrements the current task's remaining time slice
 //! ([`TIME_SLICE_TICKS`] per quantum) and, on expiry, either switches away
-//! right there at the timer-IRQ tail ([`PREEMPT_COUNT`] `== 0`) or defers to
-//! the [`preempt_enable`] that next brings [`PREEMPT_COUNT`] back to `0`
-//! ([`NEED_RESCHED`]). See [`prove_preemptive`] for the payoff boot proof (a
+//! right there at the timer-IRQ tail ([`PreemptState::count`] `== 0`) or defers to
+//! the [`preempt_enable`] that next brings [`PreemptState::count`] back to `0`
+//! ([`PreemptState::need_resched`]). See [`prove_preemptive`] for the payoff boot proof (a
 //! GEMM task's live vector accumulators surviving genuine, uninvited timer
 //! preemption bit-exact) and the "Interrupt-flag discipline" section below for
 //! how this avoids the PR-A review's force-`sti` carry-item.
 //!
+//! # SMP scope (PR-2 of the AP bring-up design — per-CPU, no work stealing)
+//!
+//! Every core has its **own** run queue ([`CPU_SCHED`]`[cpu]`: `current`,
+//! `ready`, `zombie`) and its own preemption state ([`PREEMPT`]`[cpu]`), indexed
+//! by the dense cpu index `kernel::smp` assigns (BSP = 0). Tasks are **pinned**:
+//! [`spawn_on`] places a task on one core's queue and it never migrates; the BSP
+//! decides placement ([`spawn`] = the local core). A remote placement is
+//! followed by a **reschedule IPI** (`hal::apic::send_ipi`, vector
+//! `kernel::interrupts::VECTOR_RESCHED_IPI`) so the target core — idling in
+//! `sti; hlt` ([`ap_idle_loop`]) — wakes and switches to the task at the ISR
+//! tail ([`on_resched_ipi`], the same shape as [`on_tick`]). Each AP adopted its
+//! own control flow as its idle task in [`init_ap`], exactly as the BSP adopted
+//! `kmain` in [`init`]. Only the BSP has a timer today (PIT via the PIC), so
+//! tasks on an AP are switched only by IPIs, `yield_now` and `exit` until the
+//! LAPIC timer lands (phase 3). See [`prove_pinned`] for the boot proof.
+//!
 //! # Locking discipline
 //!
-//! One lock ([`SCHED`]) guards all run-queue state. [`hal::sync::SpinMutex`]
-//! does **not** itself disable interrupts (it is a plain spinlock — see its
-//! own module docs), so `SCHED` is only ever locked with interrupts *already*
-//! disabled, and is **never held across [`hal::context::switch`]** — the
-//! `(prev, next)` `TaskHandle`s are copied out and the guard is dropped before
-//! the switch runs, because the handles are heap-stable tokens, not
-//! guard-borrows. See Invariants 1–5 in the design doc.
+//! Two kinds of lock, one order. [`CPU_SCHED`]`[cpu]` guards that core's queue;
+//! [`TASKS`] guards the global task table (task lifetime + control blocks).
+//! Order is always **queue → table** (never the reverse), and neither is ever
+//! held across [`hal::context::switch`] — the `(prev, next)` `TaskHandle`s are
+//! copied out and both guards are dropped before the switch runs, because the
+//! handles are heap-stable tokens, not guard-borrows. [`hal::sync::SpinMutex`]
+//! does **not** itself disable interrupts, so both locks are only ever taken
+//! with interrupts *already* disabled on the local core. See Invariants 1–5 in
+//! the design doc, now stated per core.
+//!
+//! **No allocation under either lock — a cross-core rule.** Both locks are
+//! taken from IRQ context (the BSP's timer tick, an AP's reschedule IPI). If a
+//! holder ever allocated while holding one, this cycle would exist: core A
+//! holds `TASKS` and waits for the heap lock; core B's *interrupted task* holds
+//! the heap lock while B's IPI handler waits for `TASKS`. So the task table is
+//! a fixed slab ([`TaskTable`]) and every ready queue a fixed ring
+//! ([`ReadyRing`]); a `Box<Task>` is allocated *before* any lock is taken and
+//! freed *after* the last one is released. This also retired the earlier
+//! "pre-reserve `VecDeque` capacity" machinery — the property it maintained is
+//! now structural.
 //!
 //! # ISR-context allocation freedom (PR-A/PR-B combined-review fix)
 //!
@@ -42,8 +71,8 @@
 //! [`hal::context::switch`]) — runs in genuine interrupt-gate context and
 //! **never allocates or frees heap memory**. This matters because
 //! `hal::mm::LockedHeap`'s global-allocator lock is a plain
-//! [`hal::sync::SpinMutex`] that, like [`SCHED`], does **not** itself disable
-//! interrupts: if the *interrupted* task happened to be mid-`alloc`/`dealloc`
+//! [`hal::sync::SpinMutex`] that, like [`CPU_SCHED`]/[`TASKS`], does **not** itself
+//! disable interrupts: if the *interrupted* task happened to be mid-`alloc`/`dealloc`
 //! (e.g. inside [`spawn`]'s `Box::new` calls, which run with interrupts
 //! enabled, outside [`with_interrupts_disabled`] — see that function's docs
 //! for why this is fine), a heap operation reached from inside the timer ISR
@@ -59,17 +88,14 @@
 //!    voluntary/cooperative wrapper, always thread context) — never
 //!    [`on_tick`]'s direct call into [`reschedule_locked`]. [`reschedule_locked`]
 //!    itself performs no allocation or deallocation at all.
-//! 2. **`ready`'s backing storage never needs to grow on the IRQ path.**
-//!    [`pick_next`]'s `ready.push_back` is reachable from [`on_tick`], so
-//!    [`init`] and [`spawn`] — both ordinary, allocation-safe thread-context
-//!    calls — pre-reserve enough `ready` capacity for every task the
-//!    scheduler knows about ([`reserve_ready_capacity`]) so that push can
-//!    never trigger a reallocation, in IRQ context or otherwise.
-//!    [`reschedule_locked`] carries a `debug_assert!` of this precondition.
+//! 2. **`ready` never allocates.** [`pick_next`]'s `ready.push_back` is
+//!    reachable from [`on_tick`] and [`on_resched_ipi`]; every ready queue is a
+//!    fixed-capacity [`ReadyRing`] (capacity [`MAX_TASKS`], the size of the task
+//!    slab, so it can never fill), so that push is a plain array store.
 //!
-//! Net invariant, restated: **the ISR-context scheduler path (`on_tick` →
-//! `reschedule_locked` → `pick_next` → `hal::context::switch`) never
-//! allocates or frees.**
+//! Net invariant, restated: **the ISR-context scheduler path (`on_tick` /
+//! `on_resched_ipi` → `reschedule_locked_on` → `pick_next` →
+//! `hal::context::switch`) never allocates or frees.**
 //!
 //! # Interrupt-flag discipline (PR-B)
 //!
@@ -81,19 +107,20 @@
 //!   state ([`hal::cpu::interrupts_enabled`]), disables interrupts, runs
 //!   [`reschedule_locked`], and restores exactly the saved state afterward —
 //!   **not** an unconditional `sti`. [`with_interrupts_disabled`] is the same
-//!   pattern, used by every other `SCHED`-locking accessor
-//!   (`spawn`/`current_id`/`task_ids`/`task_name`/`task_stack_pages`/`init`),
-//!   so that **the `SCHED`-lock-holding portion** of each cannot be reentered
-//!   by a timer preemption trying to re-acquire the same lock from a nested
-//!   IRQ (a self-deadlock, since a single-core spinlock holder can never run
-//!   again to release it once interrupted). This protects only `SCHED`'s own
-//!   lock, not the whole calling function: [`spawn`], for instance, calls
-//!   `Box::new` (the *heap* allocator's own, separate lock) *before* ever
-//!   entering [`with_interrupts_disabled`], so that portion genuinely can be
-//!   interrupted by a real tick. That is sound only because of the separate
+//!   pattern, used by every other lock-taking accessor
+//!   (`spawn_on`/`current_id`/`task_ids`/`task_name`/`task_stack_pages`/`init`/
+//!   `init_ap`), so that **the lock-holding portion** of each cannot be
+//!   reentered by a timer preemption or reschedule IPI trying to re-acquire the
+//!   same lock from a nested IRQ on the same core (a self-deadlock, since a
+//!   spinlock holder can never run again to release it once interrupted). This
+//!   protects only the scheduler's own locks, not the whole calling function:
+//!   [`spawn_on`], for instance, calls `Box::new` (the *heap* allocator's own,
+//!   separate lock) *before* ever entering [`with_interrupts_disabled`], so that
+//!   portion genuinely can be interrupted by a real tick. That is sound only because of the separate
 //!   invariant in "ISR-context allocation freedom" above — `on_tick` itself
 //!   never contends for the heap lock — not because of this wrapper.
-//! - **Timer preemption** ([`on_tick`]): calls [`reschedule_locked`] *directly*
+//! - **Timer preemption** ([`on_tick`]) and **reschedule IPIs**
+//!   ([`on_resched_ipi`]): call [`reschedule_locked_on`] *directly*
 //!   — no wrapper, no `sti`/`cli` at all. This runs in interrupt-gate context,
 //!   where `IF` is *already* clear on entry; it must return with `IF` still
 //!   clear so the ISR stub's own `iretq` restores the **interrupted task's
@@ -112,8 +139,9 @@
 //! switch that started this task was cooperative or timer-driven.
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, VecDeque};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+use crate::smp::MAX_CPUS;
 
 // ── Task identity ───────────────────────────────────────────────────────────
 
@@ -151,14 +179,14 @@ fn next_task_id() -> TaskId {
 /// A task's scheduling state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TaskState {
-    /// Runnable, waiting in [`SchedState::ready`].
+    /// Runnable, waiting in its core's [`CpuSched::ready`].
     Ready,
-    /// The task currently executing — exactly one, named by
-    /// [`SchedState::current`].
+    /// The task currently executing on its core — exactly one per core, named
+    /// by that core's [`CpuSched::current`].
     Running,
-    /// Departed for good; its id is parked in [`SchedState::zombie`] awaiting
-    /// reap on a later scheduling pass (never the pass that switched away
-    /// from it — see [`reschedule`]).
+    /// Departed for good; its id is parked in its core's [`CpuSched::zombie`]
+    /// awaiting reap on a later scheduling pass on that core (never the pass
+    /// that switched away from it — see [`reschedule`]).
     Exited,
 }
 
@@ -170,22 +198,27 @@ enum TaskState {
 /// (e.g. between map operations) — moving a `Box` moves the pointer, not the
 /// pointee.
 ///
-/// **Invariant:** a `Box<Task>` is dropped only by [`reap_zombie`] — called
-/// solely from [`reschedule`], i.e. thread context, **never** from
-/// [`on_tick`]'s IRQ-context path (see the module docs' "ISR-context
-/// allocation freedom" section) — *after* the task has been removed from
+/// **Invariant:** a `Box<Task>` is dropped only by [`reap_zombie_on`] — called
+/// solely from [`reschedule`] and the AP idle loop's [`idle_reap`], i.e. thread
+/// context, **never** from the IRQ-context paths of [`on_tick`]/
+/// [`on_resched_ipi`] (see the module docs' "ISR-context allocation freedom"
+/// section) — *after* the task has been removed from its core's
 /// `current`/`ready`/`zombie` bookkeeping in a way that makes it permanently
 /// unreachable as a switch target — so every `TaskHandle` minted from it
-/// outlives its uses. Dropping it also drops the boxed [`hal::context::XsaveArea`],
+/// outlives its uses. A task lives on exactly one core's bookkeeping, so no
+/// other core can ever hold a handle to it. Dropping it also drops the boxed [`hal::context::XsaveArea`],
 /// which zeroizes on `Drop` (no vector-register residue outlives a task).
 struct Task {
-    /// This task's identifier (duplicates the `SchedState::tasks` map key —
-    /// kept on the `Task` itself for self-describing introspection, see
-    /// [`task_ids`]).
+    /// This task's identifier (the [`TaskTable`] slot is found by scanning for
+    /// it — see [`task_ids`]).
     id: TaskId,
     /// Name it was [`spawn`]ed with (boot-proof / debug output — see
     /// [`task_name`]).
     name: &'static str,
+    /// The dense index of the core this task is pinned to — the only core whose
+    /// run queue ever holds its id and whose `current` it can ever be. Set at
+    /// [`spawn_on`]/[`init`]/[`init_ap`]; never changes (no migration).
+    cpu: u32,
     /// Current scheduling state.
     state: TaskState,
     /// The kernel-thread body [`spawn`] was given. Invoked exactly once, by
@@ -219,31 +252,186 @@ struct Task {
     slice: u32,
 }
 
-/// All scheduler state, guarded by one lock ([`SCHED`]).
-struct SchedState {
-    /// The currently-running task.
+/// Upper bound on live tasks (all cores together): the size of the
+/// [`TaskTable`] slab and of every core's [`ReadyRing`]. Fixed so that neither
+/// ever allocates (see the module docs' locking discipline). Plenty for the
+/// boot proofs and the shell; a spawn past it fails with
+/// [`SpawnError::TooManyTasks`] rather than growing anything under a lock.
+pub const MAX_TASKS: usize = 64;
+
+/// Fixed-capacity FIFO of task ids — the production ready queue.
+///
+/// A ring over a `[TaskId; N]` array: O(1) `pop_front`/`push_back`, **no
+/// allocation ever**, which is what lets [`pick_next`] run from IRQ context on
+/// any core without the heap-lock cycle described in the module docs. Capacity
+/// `N` is [`MAX_TASKS`] in production, so a ring can never fill: every task id
+/// is in at most one core's `current`/`ready`/`zombie` (Invariant #4), and the
+/// slab holds at most `MAX_TASKS` tasks. The Kani harness proves the same
+/// [`pick_next`] over a small `ReadyRing<6>`.
+struct ReadyRing<const N: usize> {
+    buf: [TaskId; N],
+    head: usize,
+    len: usize,
+}
+
+impl<const N: usize> ReadyRing<N> {
+    const fn new() -> Self {
+        Self {
+            buf: [TaskId::IDLE; N],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    /// Number of queued ids.
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The `i`-th queued id from the head, if `i < len()` (inspection for the
+    /// host tests and the Kani harness; production only pops and pushes).
+    #[cfg_attr(not(any(test, kani)), allow(dead_code))]
+    fn get(&self, i: usize) -> Option<TaskId> {
+        if i < self.len {
+            Some(self.buf[(self.head + i) % N])
+        } else {
+            None
+        }
+    }
+}
+
+impl<const N: usize> ReadyQueue for ReadyRing<N> {
+    fn pop_front(&mut self) -> Option<TaskId> {
+        if self.len == 0 {
+            return None;
+        }
+        let id = self.buf[self.head];
+        self.head = (self.head + 1) % N;
+        self.len -= 1;
+        Some(id)
+    }
+
+    fn push_back(&mut self, id: TaskId) {
+        // Unreachable by construction (see the type docs): assert in debug
+        // builds so a future change that broke that reasoning fails loudly
+        // instead of silently dropping an id (which would violate Invariant #4).
+        debug_assert!(
+            self.len < N,
+            "ReadyRing overflow — more queued ids than MAX_TASKS"
+        );
+        if self.len < N {
+            self.buf[(self.head + self.len) % N] = id;
+            self.len += 1;
+        }
+    }
+}
+
+/// One core's run-queue state, guarded by its slot of [`CPU_SCHED`].
+struct CpuSched {
+    /// The task currently running on this core.
     current: TaskId,
-    /// Runnable tasks, in round-robin order. Invariant: never contains
-    /// `current`.
-    ready: VecDeque<TaskId>,
-    /// Every live task's control block, keyed by id — the single stable heap
-    /// home for each `Task` (see the struct's invariant note).
-    tasks: BTreeMap<TaskId, Box<Task>>,
-    /// An exited task awaiting reap, if any. Reaped by [`reap_zombie`] at the
-    /// top of the *next* [`reschedule`] call (never the call that made it a
-    /// zombie) — thread context only, never from [`on_tick`]'s IRQ path.
+    /// Runnable tasks pinned to this core, in round-robin order. Invariant:
+    /// never contains `current`.
+    ready: ReadyRing<MAX_TASKS>,
+    /// An exited task awaiting reap, if any. Reaped by [`reap_zombie_on`] at
+    /// the top of the *next* [`reschedule`] on this core (or by the AP idle
+    /// loop's [`idle_reap`]) — thread context only, never from an IRQ path.
     zombie: Option<TaskId>,
 }
 
-/// The one lock guarding all scheduler state. Acquired only with interrupts
-/// disabled, and never held across [`hal::context::switch`] (see
-/// [`reschedule`]).
-static SCHED: hal::sync::SpinMutex<SchedState> = hal::sync::SpinMutex::new(SchedState {
-    current: TaskId::IDLE,
-    ready: VecDeque::new(),
-    tasks: BTreeMap::new(),
-    zombie: None,
-});
+impl CpuSched {
+    const fn new() -> Self {
+        Self {
+            current: TaskId::IDLE,
+            ready: ReadyRing::new(),
+            zombie: None,
+        }
+    }
+}
+
+/// Every core's run-queue state, by dense cpu index (BSP = 0). Each slot is
+/// acquired only with interrupts disabled on the local core, only **before**
+/// [`TASKS`] when both are needed, and never held across
+/// [`hal::context::switch`] (see [`reschedule_locked_on`]).
+static CPU_SCHED: [hal::sync::SpinMutex<CpuSched>; MAX_CPUS] =
+    [const { hal::sync::SpinMutex::new(CpuSched::new()) }; MAX_CPUS];
+
+/// The fixed task slab: the single stable heap home for every live `Task`
+/// (each `Box<Task>` is heap-stable; the slot only holds the pointer). Insert
+/// and remove are pointer moves — **no allocation under the lock** (the module
+/// docs' cross-core rule). Lookup is a linear scan over [`MAX_TASKS`] slots,
+/// trivially cheap at this scale and allocation-free.
+struct TaskTable {
+    slots: [Option<Box<Task>>; MAX_TASKS],
+}
+
+impl TaskTable {
+    const fn new() -> Self {
+        Self {
+            slots: [const { None }; MAX_TASKS],
+        }
+    }
+
+    fn get(&self, id: TaskId) -> Option<&Task> {
+        self.slots
+            .iter()
+            .flatten()
+            .map(|t| &**t)
+            .find(|t| t.id == id)
+    }
+
+    fn get_mut(&mut self, id: TaskId) -> Option<&mut Task> {
+        self.slots
+            .iter_mut()
+            .flatten()
+            .map(|t| &mut **t)
+            .find(|t| t.id == id)
+    }
+
+    /// Store `task` in a free slot; gives it back if the slab is full.
+    fn insert(&mut self, task: Box<Task>) -> Result<(), Box<Task>> {
+        match self.slots.iter_mut().find(|s| s.is_none()) {
+            Some(slot) => {
+                *slot = Some(task);
+                Ok(())
+            }
+            None => Err(task),
+        }
+    }
+
+    /// Take the task `id` out of the slab (the caller drops it **after**
+    /// releasing the lock).
+    fn remove(&mut self, id: TaskId) -> Option<Box<Task>> {
+        self.slots
+            .iter_mut()
+            .find(|s| s.as_ref().is_some_and(|t| t.id == id))
+            .and_then(Option::take)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Task> {
+        self.slots.iter().flatten().map(|t| &**t)
+    }
+}
+
+/// The task table lock. Acquired only with interrupts disabled on the local
+/// core, only **after** a [`CPU_SCHED`] slot when both are needed, never held
+/// across [`hal::context::switch`], and never while allocating or freeing.
+static TASKS: hal::sync::SpinMutex<TaskTable> = hal::sync::SpinMutex::new(TaskTable::new());
+
+/// The dense index of the core this code is running on (`0` = BSP), from
+/// `kernel::smp`. Before the CPUs are enumerated only the BSP runs, so an
+/// unknown answer is the BSP.
+#[cfg(target_os = "none")]
+fn local_cpu() -> usize {
+    crate::smp::this_cpu_index().map_or(0, |i| i as usize)
+}
+
+/// Host builds (unit tests) have one logical core and no `cpuid`-derived
+/// identity to consult: always core 0.
+#[cfg(not(target_os = "none"))]
+fn local_cpu() -> usize {
+    0
+}
 
 // ── Preemption state (PR-B) ─────────────────────────────────────────────────
 
@@ -255,27 +443,55 @@ static SCHED: hal::sync::SpinMutex<SchedState> = hal::sync::SpinMutex::new(Sched
 /// here as the documented fallback default.)
 const TIME_SLICE_TICKS: u32 = 10;
 
-/// Per-current-task critical-section depth. The timer never switches away
-/// while this is nonzero ([`on_tick`]); [`preempt_disable`]/[`preempt_enable`]
-/// bracket such sections.
-static PREEMPT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// One core's preemption state (PR-B, made per-core in PR-2). Plain atomics:
+/// no lock, written only by code running on that core.
+struct PreemptState {
+    /// Per-current-task critical-section depth. The timer / a reschedule IPI
+    /// never switches this core away while nonzero;
+    /// [`preempt_disable`]/[`preempt_enable`] bracket such sections.
+    count: AtomicU32,
+    /// Set when [`on_tick`]/[`on_resched_ipi`] wanted to reschedule but `count`
+    /// was nonzero, so the switch is deferred to the [`preempt_enable`] call
+    /// that next brings the count back to `0`.
+    need_resched: AtomicBool,
+    /// Count of **involuntary** switches actually performed on this core — every
+    /// time [`on_tick`]/[`on_resched_ipi`] (directly) or a deferred
+    /// [`preempt_enable`] drain called [`reschedule_locked_on`] and it *actually
+    /// switched* (never a no-op pass). Read by [`prove_preemptive`] (core 0,
+    /// where only the timer drives it) as the "N preemptions occurred"
+    /// evidence; never touched by voluntary [`yield_now`]/[`exit`].
+    events: AtomicU64,
+}
 
-/// Set when [`on_tick`] wanted to reschedule but [`PREEMPT_COUNT`] was
-/// nonzero, so the switch is deferred to the [`preempt_enable`] call that
-/// next brings the count back to `0`.
-static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
+impl PreemptState {
+    const fn new() -> Self {
+        Self {
+            count: AtomicU32::new(0),
+            need_resched: AtomicBool::new(false),
+            events: AtomicU64::new(0),
+        }
+    }
 
-/// Count of **timer-driven** preemptions actually performed — i.e. every time
-/// [`on_tick`] (directly) or a deferred [`preempt_enable`] drain called
-/// [`reschedule_locked`] and it *actually switched* (never counts a no-op
-/// pass where nothing else was runnable). Read by [`prove_preemptive`] as the
-/// "N preemptions occurred" evidence; never touched by voluntary
-/// [`yield_now`]/[`exit`].
-static PREEMPT_EVENTS: AtomicU64 = AtomicU64::new(0);
+    /// Enter a critical section: `count += 1`.
+    fn disable(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Leave a critical section: `count -= 1`. Returns `true` iff the count
+    /// just reached `0` **and** a reschedule had been deferred meanwhile (the
+    /// flag is consumed) — i.e. the caller must now drain it.
+    fn enable_and_take_pending(&self) -> bool {
+        let prev = self.count.fetch_sub(1, Ordering::Relaxed);
+        prev == 1 && self.need_resched.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// Every core's preemption state, by dense cpu index.
+static PREEMPT: [PreemptState; MAX_CPUS] = [const { PreemptState::new() }; MAX_CPUS];
 
 /// While `true`, [`on_tick`] still charges each task's slice but never turns a
 /// slice expiry into a switch — neither immediately nor deferred via
-/// [`NEED_RESCHED`]. Set only by [`prove_cooperative`], for exactly the span
+/// [`PreemptState::need_resched`]. Set only by [`prove_cooperative`], for exactly the span
 /// of the PR-A cooperative boot proof, and cleared before it returns.
 ///
 /// WHY THIS EXISTS. The cooperative proof asserts that the two proof tasks'
@@ -283,7 +499,7 @@ static PREEMPT_EVENTS: AtomicU64 = AtomicU64::new(0);
 /// alternates (`ready` never contains `current`), but the recorded sequence
 /// is a record of *prints*, and those two only coincide when nothing but
 /// [`yield_now`] moves the CPU. A fresh task's [`task_prologue`] resets
-/// [`PREEMPT_COUNT`] to `0` and enables interrupts the instant it starts
+/// [`PreemptState::count`] to `0` and enables interrupts the instant it starts
 /// running, so on every switch-in there is a window — before the task reaches
 /// its first [`print_marker_atomic`] and the `preempt_disable` inside it — in
 /// which a pending PIT tick can preempt it before it prints. When that lands,
@@ -310,26 +526,27 @@ static COOP_PROOF_NO_PREEMPT: AtomicBool = AtomicBool::new(false);
 /// ticked — is what kept the interleave strict.
 static COOP_PROOF_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
-/// Enter a preemption-disabled critical section.
+/// Enter a preemption-disabled critical section on the calling core.
 ///
-/// Increments [`PREEMPT_COUNT`]; pairs with [`preempt_enable`]. While nonzero,
-/// [`on_tick`] defers a slice-expiry reschedule via [`NEED_RESCHED`] instead
-/// of switching immediately.
+/// Increments this core's [`PreemptState::count`]; pairs with
+/// [`preempt_enable`]. While nonzero, [`on_tick`]/[`on_resched_ipi`] defer a
+/// reschedule via `need_resched` instead of switching immediately. Tasks are
+/// pinned, so the core is the same at the matching `preempt_enable`.
 pub fn preempt_disable() {
-    PREEMPT_COUNT.fetch_add(1, Ordering::Relaxed);
+    PREEMPT[local_cpu()].disable();
 }
 
-/// Leave a preemption-disabled critical section.
+/// Leave a preemption-disabled critical section on the calling core.
 ///
-/// Decrements [`PREEMPT_COUNT`]; if it reaches `0` and a reschedule was
-/// deferred while disabled ([`NEED_RESCHED`]), drains it by rescheduling
-/// immediately (via the voluntary/cooperative [`schedule`] wrapper — this
-/// runs in normal task context, never from inside the timer ISR, so the usual
-/// interrupt-flag save/restore applies).
+/// Decrements this core's count; if it reaches `0` and a reschedule was
+/// deferred while disabled, drains it by rescheduling immediately (via the
+/// voluntary/cooperative [`schedule`] wrapper — this runs in normal task
+/// context, never from inside an ISR, so the usual interrupt-flag save/restore
+/// applies).
 pub fn preempt_enable() {
-    let prev = PREEMPT_COUNT.fetch_sub(1, Ordering::Relaxed);
-    if prev == 1 && NEED_RESCHED.swap(false, Ordering::Relaxed) && schedule() {
-        PREEMPT_EVENTS.fetch_add(1, Ordering::Relaxed);
+    let cpu = local_cpu();
+    if PREEMPT[cpu].enable_and_take_pending() && schedule() {
+        PREEMPT[cpu].events.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -339,7 +556,7 @@ pub fn preempt_enable() {
 ///
 /// Decrements the current task's remaining time slice ([`tick_slice`]); on
 /// expiry, either switches away right here at the timer-IRQ tail (if
-/// [`PREEMPT_COUNT`] `== 0`) or defers to [`NEED_RESCHED`] for the next
+/// [`PreemptState::count`] `== 0`) or defers to [`PreemptState::need_resched`] for the next
 /// [`preempt_enable`] to drain.
 ///
 /// # Interrupt-flag discipline
@@ -352,10 +569,13 @@ pub fn preempt_enable() {
 /// switch — restores that task's own saved `RFLAGS`. See the module docs'
 /// "Interrupt-flag discipline" section.
 pub fn on_tick() {
+    let cpu = local_cpu();
     let expired = {
-        let mut guard = SCHED.lock();
-        let current = guard.current;
-        match guard.tasks.get_mut(&current) {
+        // Lock order: this core's queue, then the task table.
+        let queue = CPU_SCHED[cpu].lock();
+        let current = queue.current;
+        let mut tasks = TASKS.lock();
+        match tasks.get_mut(current) {
             Some(t) => tick_slice(&mut t.slice),
             None => false,
         }
@@ -366,17 +586,45 @@ pub fn on_tick() {
 
     match tick_action(
         COOP_PROOF_NO_PREEMPT.load(Ordering::Relaxed),
-        PREEMPT_COUNT.load(Ordering::Relaxed),
+        PREEMPT[cpu].count.load(Ordering::Relaxed),
     ) {
         TickAction::Suppress => {
             COOP_PROOF_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
         }
         TickAction::Switch => {
-            if reschedule_locked(false) {
-                PREEMPT_EVENTS.fetch_add(1, Ordering::Relaxed);
+            if reschedule_locked_on(cpu, false) {
+                PREEMPT[cpu].events.fetch_add(1, Ordering::Relaxed);
             }
         }
-        TickAction::Defer => NEED_RESCHED.store(true, Ordering::Relaxed),
+        TickAction::Defer => PREEMPT[cpu].need_resched.store(true, Ordering::Relaxed),
+    }
+}
+
+/// The reschedule-IPI hook (PR-2): called from
+/// `kernel::interrupts::handle_resched_ipi` on the core that received the IPI,
+/// i.e. from **interrupt-gate context** (`IF` clear), after the LAPIC EOI.
+///
+/// Another core (the BSP, in [`spawn_on`]) has pushed a task onto **this**
+/// core's ready queue: switch to it right here at the ISR tail if preemption is
+/// enabled, else defer exactly like [`on_tick`]. No slice accounting — an IPI
+/// is a wake-up, not a tick. Same interrupt-flag discipline as [`on_tick`]:
+/// never touches `IF`; the ISR stub's `iretq` restores whichever task resumes.
+/// For a core idling in [`ap_idle_loop`] the "task" that resumes here later —
+/// when the placed task exits — is the idle itself, which returns through the
+/// stub to its `sti; hlt`.
+pub fn on_resched_ipi() {
+    let cpu = local_cpu();
+    // `tick_action(false, …)` never yields `Suppress`: the cooperative proof's
+    // suppression is a BSP-only, timer-only concern.
+    match tick_action(false, PREEMPT[cpu].count.load(Ordering::Relaxed)) {
+        TickAction::Switch => {
+            if reschedule_locked_on(cpu, false) {
+                PREEMPT[cpu].events.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        TickAction::Defer | TickAction::Suppress => {
+            PREEMPT[cpu].need_resched.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -388,7 +636,7 @@ enum TickAction {
     Suppress,
     /// Switch now: preemption is enabled and nothing is deferring it.
     Switch,
-    /// Defer via [`NEED_RESCHED`] for [`preempt_enable`] to drain — we are
+    /// Defer via [`PreemptState::need_resched`] for [`preempt_enable`] to drain — we are
     /// inside a [`preempt_disable`] critical section.
     Defer,
 }
@@ -435,28 +683,29 @@ fn tick_slice(slice: &mut u32) -> bool {
 /// Run `f` with maskable interrupts disabled, restoring the previous
 /// interrupt state afterward — the same "read `IF`, disable, run,
 /// conditionally restore" pattern `hal::serial`'s console guard
-/// (`with_console`) uses internally, applied here to guard **`SCHED`'s own
-/// lock** against a reentrant timer preemption firing mid-critical-section.
+/// (`with_console`) uses internally, applied here to guard **the scheduler's
+/// own locks** ([`CPU_SCHED`]/[`TASKS`]) against a reentrant timer preemption
+/// or reschedule IPI firing mid-critical-section on the same core.
 /// Necessary because [`hal::sync::SpinMutex`] does **not** itself disable
 /// interrupts (see its module docs) — without this, any of these accessors
-/// holding `SCHED`'s lock with interrupts enabled would be vulnerable to
-/// [`on_tick`] trying to re-acquire the same lock from a nested timer IRQ and
-/// spinning forever on the single core that can never release it (a
-/// self-deadlock).
+/// holding a scheduler lock with interrupts enabled would be vulnerable to
+/// [`on_tick`]/[`on_resched_ipi`] trying to re-acquire the same lock from a
+/// nested IRQ and spinning forever on the core that can never release it (a
+/// self-deadlock). Cross-core contention is fine: the other core's holder is
+/// still running and will release.
 ///
-/// Used by every `SCHED`-locking accessor **except** [`on_tick`]/
-/// [`reschedule_locked`]'s bare timer-preemption call, which must never touch
-/// `IF` at all — see the module docs' "Interrupt-flag discipline" section.
+/// Used by every lock-taking accessor **except** the bare IRQ-context calls
+/// into [`reschedule_locked_on`], which must never touch `IF` at all — see the
+/// module docs' "Interrupt-flag discipline" section.
 ///
-/// **Scope note (not over-claiming further than `SCHED`'s lock):** this only
-/// protects the `SCHED`-lock-holding statements actually passed as `f` — it
-/// does **not** retroactively make an entire calling function immune to
-/// preemption. [`spawn`], for example, calls `Box::new` (the *heap*
-/// allocator's own separate lock) *before* ever calling this helper, so that
-/// portion of `spawn` genuinely can be interrupted by a real tick. That is
-/// sound only because [`on_tick`]'s own path never contends for the heap
-/// lock (see the module docs' "ISR-context allocation freedom" section), not
-/// because of anything this function does.
+/// **Scope note (not over-claiming further than the scheduler's locks):** this
+/// only protects the lock-holding statements actually passed as `f` — it does
+/// **not** retroactively make an entire calling function immune to preemption.
+/// [`spawn_on`], for example, calls `Box::new` (the *heap* allocator's own
+/// separate lock) *before* ever calling this helper, so that portion genuinely
+/// can be interrupted by a real tick. That is sound only because the IRQ paths
+/// never contend for the heap lock (see the module docs' "ISR-context
+/// allocation freedom" section), not because of anything this function does.
 fn with_interrupts_disabled<R>(f: impl FnOnce() -> R) -> R {
     let was_enabled = hal::cpu::interrupts_enabled();
     hal::cpu::disable_interrupts();
@@ -471,10 +720,9 @@ fn with_interrupts_disabled<R>(f: impl FnOnce() -> R) -> R {
 
 /// The entire queue interface [`pick_next`] needs: take the head, put a task
 /// on the tail. Deliberately this small — it exists so the round-robin policy
-/// can be stated independently of the *container*, which is what lets the Kani
-/// harness verify the real [`pick_next`] over an allocation-free queue instead
-/// of over `VecDeque`'s heap model. Production uses the `VecDeque` impl below
-/// and monomorphises to identical code.
+/// can be stated independently of the *container*: production and the Kani
+/// harness both use the allocation-free [`ReadyRing`] (at different
+/// capacities), the host tests a `VecDeque` for readable expected values.
 trait ReadyQueue {
     /// Remove and return the task at the head, or `None` if empty.
     fn pop_front(&mut self) -> Option<TaskId>;
@@ -482,12 +730,15 @@ trait ReadyQueue {
     fn push_back(&mut self, id: TaskId);
 }
 
-impl ReadyQueue for VecDeque<TaskId> {
+/// Host-test convenience only: lets the policy tests below state expected
+/// queue contents as plain `VecDeque`s. Production uses [`ReadyRing`].
+#[cfg(test)]
+impl ReadyQueue for alloc::collections::VecDeque<TaskId> {
     fn pop_front(&mut self) -> Option<TaskId> {
-        VecDeque::pop_front(self)
+        alloc::collections::VecDeque::pop_front(self)
     }
     fn push_back(&mut self, id: TaskId) {
-        VecDeque::push_back(self, id)
+        alloc::collections::VecDeque::push_back(self, id)
     }
 }
 
@@ -504,15 +755,14 @@ impl ReadyQueue for VecDeque<TaskId> {
 /// requeued, it is reaped later. Returns `None` (queue left untouched) if
 /// nothing else is runnable.
 ///
-/// Generic over [`ReadyQueue`] rather than taking `&mut VecDeque<TaskId>`
-/// directly, so the Kani harness can drive **this exact function** over an
-/// allocation-free queue. Under CBMC, `VecDeque`'s heap model (`RawVec`,
-/// wrap-around index arithmetic, allocation reasoning) dominated the formula
-/// and capped the bounded proof at 2 scheduler passes — deeper bounds
-/// exhausted 15 GiB with no verdict. With [`proofs::ArrayQueue`] the same
-/// policy is proven to a far greater depth without modelling a model. In
-/// production this monomorphises to the `VecDeque` implementation below, so
-/// codegen is unchanged.
+/// Generic over [`ReadyQueue`] rather than a concrete container, so the same
+/// function serves production ([`ReadyRing<MAX_TASKS>`]), the host tests
+/// (`VecDeque`, for readable expected values) and the Kani harness
+/// (`ReadyRing<6>`). Under CBMC, `VecDeque`'s heap model (`RawVec`, wrap-around
+/// index arithmetic, allocation reasoning) once dominated the formula and
+/// capped the bounded proof at 2 scheduler passes — deeper bounds exhausted
+/// 15 GiB with no verdict; the allocation-free ring proves the same policy to a
+/// far greater depth, and since PR-2 it *is* the production container.
 fn pick_next<Q: ReadyQueue>(
     ready: &mut Q,
     zombie: &mut Option<TaskId>,
@@ -528,114 +778,78 @@ fn pick_next<Q: ReadyQueue>(
     Some(next_id)
 }
 
-/// Ensure `ready`'s backing allocation already has enough spare capacity for
-/// every task the scheduler currently knows about (`task_count`), so that
-/// [`pick_next`]'s `ready.push_back` — reachable from the IRQ-context
-/// [`on_tick`] path via [`reschedule_locked`] — can **never** need to grow
-/// the allocation (see the module docs' "ISR-context allocation freedom"
-/// section). `ready.len()` can never exceed `task_count - 1` (exactly one
-/// known task is always `current`, excluded from `ready`), so reserving up
-/// to `task_count` total capacity is a simple, safe upper bound.
+/// The scheduler's core reschedule step **for core `cpu`**: decide the next
+/// runnable task via [`pick_next`] over that core's queue, update task states,
+/// and — with both locks **dropped** first — perform the actual
+/// [`hal::context::switch`]. Returns whether a switch actually happened
+/// (`false` if nothing else was runnable on this core, in which case
+/// `current`/`ready` are left untouched).
 ///
-/// Decoupled from `Task`/`SchedState`/`hal` (like [`pick_next`]/
-/// [`tick_slice`]) so it is directly host-testable. Its sole production
-/// callers are [`init`] and [`spawn`], each immediately after inserting a new
-/// task into `SchedState::tasks` — both ordinary thread-context calls, where
-/// the `VecDeque::reserve` growth this performs (if any) is allocation-safe.
-fn reserve_ready_capacity(ready: &mut VecDeque<TaskId>, task_count: usize) {
-    let needed = task_count.saturating_sub(ready.len());
-    ready.reserve(needed);
-}
-
-/// The scheduler's core reschedule step: decide the next runnable task via
-/// [`pick_next`], update task states, and — with the run-queue lock
-/// **dropped** first — perform the actual [`hal::context::switch`]. Returns
-/// whether a switch actually happened (`false` if nothing else was runnable,
-/// in which case `current`/`ready` are left untouched).
+/// `cpu` must be the **calling** core (the switch runs on it); every caller
+/// passes [`local_cpu`].
 ///
 /// # Never allocates or frees
 ///
 /// This function performs **no heap allocation or deallocation** — see the
-/// module docs' "ISR-context allocation freedom" section. In particular it
-/// never reaps a zombie (that is [`reap_zombie`]'s job, called only from
-/// thread context by [`reschedule`], never from here), and
-/// [`pick_next`]'s `ready.push_back` cannot grow the allocation because
-/// [`init`]/[`spawn`] keep `ready`'s capacity pre-reserved
-/// ([`reserve_ready_capacity`]) — asserted below in debug builds. This is
-/// what makes it sound for [`on_tick`] to call this function directly from
-/// genuine interrupt-gate context.
+/// module docs' "ISR-context allocation freedom" and locking sections. It
+/// never reaps a zombie (that is [`reap_zombie_on`]'s job, thread context only),
+/// and [`pick_next`]'s `ready.push_back` is a store into a fixed [`ReadyRing`].
+/// This is what makes it sound for [`on_tick`] and [`on_resched_ipi`] to call
+/// this function directly from genuine interrupt-gate context.
 ///
 /// # Interrupt-flag discipline
 ///
 /// This function **never touches `IF`** — it assumes interrupts are already
 /// disabled by the caller and must stay that way for its own duration (both
 /// to satisfy [`hal::context::switch`]'s precondition and, per
-/// [`with_interrupts_disabled`]'s docs, to prevent a reentrant [`on_tick`]
-/// from deadlocking on [`SCHED`]'s lock). It has exactly two callers, each
-/// with a different reason `IF` is already off:
+/// [`with_interrupts_disabled`]'s docs, to prevent a reentrant IRQ from
+/// deadlocking on this core's locks). Its callers each have a different reason
+/// `IF` is already off:
 ///
 /// - [`reschedule`] (the voluntary/cooperative wrapper: [`yield_now`],
 ///   [`exit`], the deferred drain in [`preempt_enable`]) explicitly disables
 ///   interrupts first and restores the caller's actual prior state after.
-/// - [`on_tick`] (the timer-preemption path) calls this **directly**, with no
-///   wrapper at all — it is already running in interrupt-gate context, where
-///   `IF` was cleared by hardware on entry, and must return leaving it clear
-///   so the ISR stub's own `iretq` restores the *interrupted* task's saved
-///   `RFLAGS`. See the module docs' "Interrupt-flag discipline" section.
+/// - [`on_tick`] / [`on_resched_ipi`] call this **directly**, with no wrapper —
+///   they run in interrupt-gate context, where `IF` was cleared by hardware on
+///   entry, and must return leaving it clear so the ISR stub's own `iretq`
+///   restores the *interrupted* task's saved `RFLAGS`.
 ///
 /// # Other invariants upheld
 ///
-/// - [`SCHED`] is locked here, and the guard goes out of scope **before**
-///   `switch` runs — never held across it.
-/// - A zombie a *previous* pass recorded is left untouched here (never
-///   reaped by this function — see [`reap_zombie`]), so a task never frees
-///   its own running stack and the reap step never runs in IRQ context.
-fn reschedule_locked(exiting: bool) -> bool {
+/// - Lock order queue → table; both guards go out of scope **before** `switch`
+///   runs — never held across it.
+/// - A zombie a *previous* pass recorded is left untouched here (never reaped
+///   by this function), so a task never frees its own running stack and the
+///   reap step never runs in IRQ context.
+fn reschedule_locked_on(cpu: usize, exiting: bool) -> bool {
     let switch_pair = {
-        let mut guard = SCHED.lock();
-        // One real `&mut SchedState` (through `DerefMut`, taken exactly once)
-        // so the borrow checker can see `state.ready`/`state.zombie`/
-        // `state.tasks` as disjoint fields below — borrowing them separately
-        // via `guard.foo` each time would re-invoke `DerefMut` per access,
-        // which the borrow checker cannot prove disjoint.
-        let state: &mut SchedState = &mut guard;
-
-        // Canary for the "ISR-context path never allocates" invariant:
-        // `ready`'s capacity must already cover every known task (`init`/
-        // `spawn` keep this true via `reserve_ready_capacity`, right after
-        // every `tasks.insert`), which in turn guarantees `ready.len()` — at
-        // most `tasks.len() - 1`, since one known task is always `current`
-        // — stays strictly below `capacity()`, so the `pick_next` push below
-        // can never be forced to grow the allocation. This only checks the
-        // invariant holds; it never establishes it.
-        debug_assert!(
-            state.ready.capacity() >= state.tasks.len(),
-            "ready lacks reserved spare capacity — see `reserve_ready_capacity`; \
-             the ISR-context on_tick path must never allocate"
-        );
+        let mut queue = CPU_SCHED[cpu].lock();
+        // One real `&mut CpuSched` (through `DerefMut`, taken exactly once) so
+        // the borrow checker can see `state.ready`/`state.zombie` as disjoint
+        // fields below.
+        let state: &mut CpuSched = &mut queue;
+        let mut tasks = TASKS.lock();
 
         let prev_id = state.current;
         match pick_next(&mut state.ready, &mut state.zombie, prev_id, exiting) {
             Some(next_id) => {
-                if let Some(t) = state.tasks.get_mut(&prev_id) {
+                if let Some(t) = tasks.get_mut(prev_id) {
                     t.state = if exiting {
                         TaskState::Exited
                     } else {
                         TaskState::Ready
                     };
                 }
-                if let Some(t) = state.tasks.get_mut(&next_id) {
+                if let Some(t) = tasks.get_mut(next_id) {
                     t.state = TaskState::Running;
                 }
                 state.current = next_id;
 
-                let prev_h = state
-                    .tasks
-                    .get_mut(&prev_id)
+                let prev_h = tasks
+                    .get_mut(prev_id)
                     .map(|t| hal::context::TaskHandle::new(&mut t.ctx));
-                let next_h = state
-                    .tasks
-                    .get_mut(&next_id)
+                let next_h = tasks
+                    .get_mut(next_id)
                     .map(|t| hal::context::TaskHandle::new(&mut t.ctx));
                 match (prev_h, next_h) {
                     (Some(p), Some(n)) => Some((p, n)),
@@ -644,7 +858,7 @@ fn reschedule_locked(exiting: bool) -> bool {
             }
             None => None,
         }
-    }; // `guard` dropped here — never held across `switch`.
+    }; // both guards dropped here — never held across `switch`.
 
     let switched = switch_pair.is_some();
     if let Some((prev_h, next_h)) = switch_pair {
@@ -653,48 +867,51 @@ fn reschedule_locked(exiting: bool) -> bool {
     switched
 }
 
-/// Reap a task that exited on a **previous** scheduling pass, if any — the
-/// **only** place a `Box<Task>` (and its boxed [`hal::context::XsaveArea`])
-/// is ever dropped, which is also therefore the only place either can be
-/// deallocated. Deliberately **thread-context only**: dropping the `Box`
-/// calls into the heap allocator (`hal::mm::LockedHeap`), whose lock does
-/// not itself disable interrupts, so this must never run from inside the
-/// timer ISR (see the module docs' "ISR-context allocation freedom"
-/// section). Its sole caller is [`reschedule`], which always runs with
-/// interrupts already disabled around this call — never [`on_tick`]'s direct,
-/// IRQ-context call into [`reschedule_locked`], which never reaps.
+/// Reap a task that exited on a **previous** scheduling pass on core `cpu`, if
+/// any — the **only** place a `Box<Task>` (and its boxed
+/// [`hal::context::XsaveArea`]) is ever dropped, which is also therefore the
+/// only place either can be deallocated. Deliberately **thread-context only**:
+/// dropping the `Box` calls into the heap allocator (`hal::mm::LockedHeap`),
+/// whose lock does not itself disable interrupts, so this must never run from
+/// inside an ISR (see the module docs). Its callers are [`reschedule`] (with
+/// interrupts already disabled around this call) and the AP idle loop's
+/// [`idle_reap`] — never the IRQ-context calls into [`reschedule_locked_on`].
+///
+/// Lock discipline: the queue lock is released before the table lock is taken
+/// (no nesting needed), and **both** are released before the `Box` is dropped
+/// — the drop is the one heap operation here and must not run under a lock an
+/// IRQ path can take.
 ///
 /// Never reaps the task departing the *current* call (it is still running on
-/// its own stack until the `switch` inside [`reschedule_locked`] hands
+/// its own stack until the `switch` inside [`reschedule_locked_on`] hands
 /// control away) — only a zombie a *prior* pass already recorded.
-fn reap_zombie() {
-    let dead = {
-        let mut guard = SCHED.lock();
-        guard.zombie.take().and_then(|zid| guard.tasks.remove(&zid))
-    }; // `guard` dropped before the `Box<Task>` (and its heap dealloc) runs.
+fn reap_zombie_on(cpu: usize) {
+    let zombie = CPU_SCHED[cpu].lock().zombie.take();
+    let dead = zombie.and_then(|zid| TASKS.lock().remove(zid)); // table guard dropped here
     drop(dead);
 }
 
-/// Voluntary/cooperative reschedule wrapper: saves the caller's actual `IF`
-/// state, disables interrupts, reaps any previously-exited zombie
-/// ([`reap_zombie`]), runs [`reschedule_locked`], and restores exactly the
-/// saved state afterward (via [`with_interrupts_disabled`]) — **not** an
+/// Voluntary/cooperative reschedule wrapper for the **calling core**: saves the
+/// caller's actual `IF` state, disables interrupts, reaps any previously-exited
+/// zombie on this core ([`reap_zombie_on`]), runs [`reschedule_locked_on`], and
+/// restores exactly the saved state afterward (via [`with_interrupts_disabled`]) — **not** an
 /// unconditional `sti`, unlike PR-A's original implementation (the
 /// combined-review carry-item this PR fixes). Used by [`yield_now`],
 /// [`exit`], and the deferred drain in [`preempt_enable`] — every caller runs
 /// in normal task context, never from inside the timer ISR (see
-/// [`reschedule_locked`]'s docs for that path). Returns whether a switch
+/// [`reschedule_locked_on`]'s docs for that path). Returns whether a switch
 /// actually happened.
 ///
 /// Reaping runs first, still under [`with_interrupts_disabled`]'s protection
-/// (so it can never race a reentrant [`on_tick`]), and strictly before
-/// [`reschedule_locked`] — necessary because an exiting `reschedule_locked`
-/// call would otherwise overwrite `SchedState::zombie` with the newly-exiting
-/// task before the old one was ever reaped, leaking it.
+/// (so it can never race a reentrant [`on_tick`]/[`on_resched_ipi`]), and
+/// strictly before [`reschedule_locked_on`] — necessary because an exiting call
+/// would otherwise overwrite this core's `zombie` with the newly-exiting task
+/// before the old one was ever reaped, leaking it.
 fn reschedule(exiting: bool) -> bool {
     with_interrupts_disabled(|| {
-        reap_zombie();
-        reschedule_locked(exiting)
+        let cpu = local_cpu();
+        reap_zombie_on(cpu);
+        reschedule_locked_on(cpu, exiting)
     })
 }
 
@@ -707,17 +924,46 @@ fn schedule() -> bool {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Bring up the scheduler: adopt the currently-running control flow (`kmain`)
-/// as the permanent idle task, [`TaskId::IDLE`].
+/// Bring up the scheduler on the BSP: adopt the currently-running control flow
+/// (`kmain`) as core 0's permanent idle task, [`TaskId::IDLE`].
 ///
-/// Call once, after the kernel heap is up (construction needs `alloc`:
-/// `Box`/`BTreeMap`/`VecDeque`) and before the first [`spawn`]/[`yield_now`].
+/// Call once, after the kernel heap is up (construction needs `alloc`: `Box`)
+/// and before the first [`spawn`]/[`yield_now`]. Application processors adopt
+/// their own idle later via [`init_ap`].
 pub fn init() {
+    adopt_idle(0, TaskId::IDLE);
+}
+
+/// Bring up the scheduler on an **application processor**: adopt the calling
+/// AP's current control flow (`kernel::smp::ap_main`, on its bootloader stack)
+/// as core `cpu_index`'s idle task, with a fresh [`TaskId`].
+///
+/// Called by the AP itself, once, with interrupts masked, **before** it
+/// publishes `online` — so by the time [`spawn_on`] may target this core, its
+/// queue has a `current` (the idle) to switch away from. Returns the idle's id,
+/// or `None` for the BSP index / an out-of-range index (nothing adopted).
+pub fn init_ap(cpu_index: u32) -> Option<TaskId> {
+    let cpu = cpu_index as usize;
+    if cpu == 0 || cpu >= MAX_CPUS {
+        return None;
+    }
+    let id = next_task_id();
+    adopt_idle(cpu, id);
+    Some(id)
+}
+
+/// Adopt the calling control flow as core `cpu`'s idle task `id`
+/// ([`hal::context::Context::adopt_running`]): its stack is whatever it is
+/// already running on (the bootloader's), so there is no
+/// [`hal::mm::KernelStack`] to own. The `Box` is allocated *before* any lock is
+/// taken; under the locks only pointer moves happen.
+fn adopt_idle(cpu: usize, id: TaskId) {
     let mut xsave = Box::new(hal::context::XsaveArea::new_init());
     let ctx = hal::context::Context::adopt_running(&mut xsave);
     let idle = Box::new(Task {
-        id: TaskId::IDLE,
+        id,
         name: "idle",
+        cpu: cpu as u32,
         state: TaskState::Running,
         entry: idle_entry_unused,
         ctx,
@@ -727,15 +973,17 @@ pub fn init() {
     });
 
     with_interrupts_disabled(|| {
-        let mut guard = SCHED.lock();
-        guard.current = TaskId::IDLE;
-        guard.tasks.insert(TaskId::IDLE, idle);
-        // Keep `ready`'s capacity ahead of every known task (see
-        // `reserve_ready_capacity`'s docs) — the idle task can itself be
-        // timer-preempted and pushed onto `ready` like any other, so its
-        // insertion needs the same reservation spawn's does.
-        let task_count = guard.tasks.len();
-        reserve_ready_capacity(&mut guard.ready, task_count);
+        // Table first (alone), then the queue (alone): no nesting needed here.
+        let overflow = TASKS.lock().insert(idle).err();
+        if let Some(rejected) = overflow {
+            // Slab full before this core's idle could be registered: nothing
+            // sane to do at boot but report; the `Box` is dropped with no lock
+            // held. (Unreachable in practice — the slab is MAX_TASKS >> cores.)
+            drop(rejected);
+            hal::serial::print_line("[sched] init: task table full; idle not registered");
+            return;
+        }
+        CPU_SCHED[cpu].lock().current = id;
     });
 }
 
@@ -747,80 +995,139 @@ pub fn init() {
 /// already runs (the rest of `kmain` + [`crate::idle_loop`]), not this.
 fn idle_entry_unused() {}
 
-/// Spawn a new kernel thread running `entry`, and push it onto the ready
-/// queue.
+/// Why [`spawn_on`] could not place a task.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpawnError {
+    /// The target core is unknown or not (yet) running the scheduler.
+    CpuNotOnline(u32),
+    /// No guard-paged kernel stack could be allocated (frame allocator empty).
+    StackAllocation,
+    /// The task table already holds [`MAX_TASKS`] live tasks.
+    TooManyTasks,
+}
+
+impl SpawnError {
+    /// Short label for serial output.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            SpawnError::CpuNotOnline(_) => "target cpu not online",
+            SpawnError::StackAllocation => "could not allocate a kernel stack",
+            SpawnError::TooManyTasks => "task table full",
+        }
+    }
+}
+
+/// Whether core `cpu` can be handed a task: the BSP always (it is running this
+/// code, or the only core before enumeration); an AP once `kernel::smp` reports
+/// it online — which it does only *after* the AP has adopted its idle
+/// ([`init_ap`]), so an online core always has a `current` to switch from.
+fn cpu_is_schedulable(cpu: u32) -> bool {
+    if cpu as usize >= MAX_CPUS {
+        return false;
+    }
+    cpu == 0 || crate::smp::by_index(cpu).is_some_and(crate::smp::PerCpu::is_online)
+}
+
+/// Spawn a new kernel thread running `entry` on **this** core, and push it onto
+/// this core's ready queue — [`spawn_on`] with the local core as target.
+///
+/// Always returns a fresh [`TaskId`] (ids are never reused), even on a failure
+/// path, so callers never have to guess whether a slot was consumed. There is
+/// no `Result` in this signature (matching the design doc's public API); a
+/// failure is logged over serial and the task is simply never registered.
+pub fn spawn(name: &'static str, entry: fn()) -> TaskId {
+    let id = next_task_id();
+    if let Err(err) = spawn_with_id(id, local_cpu() as u32, name, entry) {
+        hal::serial::write_str("[sched] spawn '");
+        hal::serial::write_str(name);
+        hal::serial::write_str("' FAILED: ");
+        hal::serial::write_str(err.label());
+        hal::serial::write_str("\n");
+    }
+    id
+}
+
+/// Spawn a new kernel thread running `entry`, **pinned to core `cpu`** (dense
+/// index; `0` = BSP), and push it onto that core's ready queue.
 ///
 /// Allocates a [`hal::mm::DEFAULT_STACK_PAGES`]-page guard-paged kernel stack
 /// ([`hal::mm::alloc_kernel_stack`]) and a zero-initialised
 /// [`hal::context::XsaveArea`], fabricates the task's initial switch frame
 /// (landing in [`task_shim`], which runs `entry` and then [`exit`]s), and
-/// registers it as [`TaskState::Ready`].
-///
-/// Always returns a fresh [`TaskId`] (ids are never reused), even on the
-/// allocation-failure path below, so callers never have to guess whether a
-/// slot was consumed.
+/// registers it as [`TaskState::Ready`] on `cpu`. If `cpu` is not the calling
+/// core, a reschedule IPI wakes it (`hal::apic::send_ipi`), and its
+/// [`on_resched_ipi`] switches to the new task at the ISR tail. Placement is
+/// the caller's decision — there is no balancing and the task never migrates.
 ///
 /// # Errors
 ///
-/// There is no `Result` in this signature (matching the design doc's public
-/// API). A stack-allocation failure is logged over serial and the task is
-/// simply never registered (it appears in neither `ready` nor `tasks`) rather
-/// than panicking — this can only happen if the frame allocator is exhausted,
-/// which does not occur for the fixed, small boot proof this PR ships.
-pub fn spawn(name: &'static str, entry: fn()) -> TaskId {
+/// [`SpawnError::CpuNotOnline`] if `cpu` is unknown or not running the
+/// scheduler yet; [`SpawnError::StackAllocation`] if the frame allocator is
+/// exhausted; [`SpawnError::TooManyTasks`] past [`MAX_TASKS`] live tasks. On an
+/// error nothing is registered (the id is still consumed — never reused).
+pub fn spawn_on(cpu: u32, name: &'static str, entry: fn()) -> Result<TaskId, SpawnError> {
     let id = next_task_id();
-    match hal::mm::alloc_kernel_stack(hal::mm::DEFAULT_STACK_PAGES) {
-        Ok(stack) => {
-            // Boot-proof only (design doc item "guard-paged kernel stacks"): a
-            // read-only page-table walk confirming the guard page below this
-            // stack is genuinely unmapped. Never faults, never mutates the
-            // page tables — the non-destructive stand-in for an actual
-            // stack-overflow `#PF` test (see `hal::mm::stack_guard_is_unmapped`).
-            hal::serial::write_str("[sched] spawn '");
-            hal::serial::write_str(name);
-            hal::serial::write_str("': stack ok, guard-page unmapped=");
-            hal::serial::write_str(if hal::mm::stack_guard_is_unmapped(&stack) {
-                "true"
-            } else {
-                "false"
-            });
-            hal::serial::write_str("\n");
+    spawn_with_id(id, cpu, name, entry).map(|()| id)
+}
 
-            let mut xsave = Box::new(hal::context::XsaveArea::new_init());
-            let ctx =
-                hal::context::Context::for_new_task(&stack, task_shim, id.as_usize(), &mut xsave);
-            let task = Box::new(Task {
-                id,
-                name,
-                state: TaskState::Ready,
-                entry,
-                ctx,
-                stack: Some(stack),
-                xsave,
-                slice: TIME_SLICE_TICKS,
-            });
+fn spawn_with_id(id: TaskId, cpu: u32, name: &'static str, entry: fn()) -> Result<(), SpawnError> {
+    if !cpu_is_schedulable(cpu) {
+        return Err(SpawnError::CpuNotOnline(cpu));
+    }
+    let stack = hal::mm::alloc_kernel_stack(hal::mm::DEFAULT_STACK_PAGES)
+        .map_err(|_| SpawnError::StackAllocation)?;
 
-            with_interrupts_disabled(|| {
-                let mut guard = SCHED.lock();
-                guard.tasks.insert(id, task);
-                // Reserve `ready` capacity for this new task BEFORE pushing
-                // it on, so the push below — and every future `pick_next`
-                // push_back reachable from the IRQ-context `on_tick` path —
-                // never needs to grow the allocation (see
-                // `reserve_ready_capacity`'s docs and the module docs'
-                // "ISR-context allocation freedom" section).
-                let task_count = guard.tasks.len();
-                reserve_ready_capacity(&mut guard.ready, task_count);
-                guard.ready.push_back(id);
-            });
-        }
-        Err(_e) => {
-            hal::serial::write_str("[sched] spawn '");
-            hal::serial::write_str(name);
-            hal::serial::write_str("' FAILED: could not allocate a kernel stack\n");
+    // Boot-proof only (design doc item "guard-paged kernel stacks"): a
+    // read-only page-table walk confirming the guard page below this stack is
+    // genuinely unmapped. Never faults, never mutates the page tables — the
+    // non-destructive stand-in for an actual stack-overflow `#PF` test (see
+    // `hal::mm::stack_guard_is_unmapped`).
+    hal::serial::write_str("[sched] spawn '");
+    hal::serial::write_str(name);
+    hal::serial::write_str("': stack ok, guard-page unmapped=");
+    hal::serial::write_str(if hal::mm::stack_guard_is_unmapped(&stack) {
+        "true"
+    } else {
+        "false"
+    });
+    hal::serial::write_str("\n");
+
+    // Every allocation happens HERE, before any scheduler lock is taken.
+    let mut xsave = Box::new(hal::context::XsaveArea::new_init());
+    let ctx = hal::context::Context::for_new_task(&stack, task_shim, id.as_usize(), &mut xsave);
+    let task = Box::new(Task {
+        id,
+        name,
+        cpu,
+        state: TaskState::Ready,
+        entry,
+        ctx,
+        stack: Some(stack),
+        xsave,
+        slice: TIME_SLICE_TICKS,
+    });
+
+    let placed: Result<(), Box<Task>> = with_interrupts_disabled(|| {
+        // Table first (alone), then the target queue (alone) — pointer moves
+        // only under each lock.
+        TASKS.lock().insert(task)?;
+        CPU_SCHED[cpu as usize].lock().ready.push_back(id);
+        Ok(())
+    });
+    if let Err(rejected) = placed {
+        drop(rejected); // no lock held: the heap free is safe here
+        return Err(SpawnError::TooManyTasks);
+    }
+
+    // A remote core may be asleep in `sti; hlt`: tell it. The push above is
+    // ordered before the IPI by the queue lock's release.
+    if cpu as usize != local_cpu() {
+        if let Some(lapic) = crate::smp::lapic_id_of(cpu) {
+            let _sent = hal::apic::send_ipi(lapic, crate::interrupts::VECTOR_RESCHED_IPI);
         }
     }
-    id
+    Ok(())
 }
 
 /// Voluntarily give up the CPU so another ready task can run.
@@ -850,15 +1157,37 @@ pub fn exit() -> ! {
 /// The currently-running task's id.
 #[must_use]
 pub fn current_id() -> TaskId {
-    with_interrupts_disabled(|| SCHED.lock().current)
+    with_interrupts_disabled(|| CPU_SCHED[local_cpu()].lock().current)
 }
 
-/// Debug/introspection: every task's id currently known to the scheduler
-/// (`Ready`/`Running`, or briefly `Exited` and awaiting reap), in ascending
-/// order (`SchedState::tasks` is a `BTreeMap`).
+/// Debug/introspection: every task's id currently known to the scheduler, on
+/// any core (`Ready`/`Running`, or briefly `Exited` and awaiting reap), in
+/// ascending order.
+///
+/// The ids are copied into a fixed array under the lock and the `Vec` is built
+/// only after it is released — no allocation under [`TASKS`].
 #[must_use]
 pub fn task_ids() -> alloc::vec::Vec<TaskId> {
-    with_interrupts_disabled(|| SCHED.lock().tasks.values().map(|t| t.id).collect())
+    let mut ids = [TaskId::IDLE; MAX_TASKS];
+    let count = with_interrupts_disabled(|| {
+        let tasks = TASKS.lock();
+        let mut n = 0;
+        for t in tasks.iter() {
+            ids[n] = t.id;
+            n += 1;
+        }
+        n
+    });
+    let mut v: alloc::vec::Vec<TaskId> = ids[..count].to_vec();
+    v.sort_unstable();
+    v
+}
+
+/// Debug/introspection: the dense index of the core a task is pinned to, if it
+/// still exists.
+#[must_use]
+pub fn task_cpu(id: TaskId) -> Option<u32> {
+    with_interrupts_disabled(|| TASKS.lock().get(id).map(|t| t.cpu))
 }
 
 /// Debug/introspection: the name a task was [`spawn`]ed with, if it still
@@ -866,7 +1195,7 @@ pub fn task_ids() -> alloc::vec::Vec<TaskId> {
 /// awaiting reap).
 #[must_use]
 pub fn task_name(id: TaskId) -> Option<&'static str> {
-    with_interrupts_disabled(|| SCHED.lock().tasks.get(&id).map(|t| t.name))
+    with_interrupts_disabled(|| TASKS.lock().get(id).map(|t| t.name))
 }
 
 /// Debug/introspection: the number of 4 KiB pages in a task's kernel stack.
@@ -875,10 +1204,9 @@ pub fn task_name(id: TaskId) -> Option<&'static str> {
 #[must_use]
 pub fn task_stack_pages(id: TaskId) -> Option<usize> {
     with_interrupts_disabled(|| {
-        SCHED
+        TASKS
             .lock()
-            .tasks
-            .get(&id)
+            .get(id)
             .and_then(|t| t.stack.as_ref().map(hal::mm::KernelStack::pages))
     })
 }
@@ -898,12 +1226,9 @@ extern "C" fn task_shim(id: usize) -> ! {
     // was landed here by a voluntary switch (`reschedule` disables them
     // before the `switch` landing here) or a timer preemption (`on_tick`
     // calls `reschedule_locked` directly from interrupt-gate context, where
-    // `IF` was already clear) — either way this `SCHED` lock is acquired
+    // `IF` was already clear) — either way this `TASKS` lock is acquired
     // under Invariant #2 (locked only with interrupts disabled).
-    let entry = {
-        let guard = SCHED.lock();
-        guard.tasks.get(&TaskId::from_usize(id)).map(|t| t.entry)
-    };
+    let entry = TASKS.lock().get(TaskId::from_usize(id)).map(|t| t.entry);
 
     task_prologue();
     if let Some(f) = entry {
@@ -930,8 +1255,35 @@ extern "C" fn task_shim(id: usize) -> ! {
 /// return, regardless of whether the switch that started this task was
 /// cooperative ([`reschedule`]) or timer-driven ([`on_tick`]).
 fn task_prologue() {
-    PREEMPT_COUNT.store(0, Ordering::Relaxed);
+    PREEMPT[local_cpu()].count.store(0, Ordering::Relaxed);
     hal::cpu::enable_interrupts();
+}
+
+// ── Application-processor idle (PR-2) ───────────────────────────────────────
+
+/// Reap any zombie on the **calling** core — thread context (the heap free
+/// runs with no scheduler lock held). The AP idle loop's way of freeing tasks
+/// that exited on that core, since an idle that only `hlt`s never passes
+/// through [`reschedule`]'s reap step.
+pub fn idle_reap() {
+    with_interrupts_disabled(|| reap_zombie_on(local_cpu()));
+}
+
+/// The application-processor idle task body: reap what exited here, then
+/// `sti; hlt` until the next interrupt — a reschedule IPI, whose handler
+/// ([`on_resched_ipi`]) switches this core to the placed task at the ISR tail;
+/// when that task exits, this idle resumes inside that handler and returns
+/// through the stub's `iretq` to here, loops, reaps it, and sleeps again.
+///
+/// `hal::cpu::enable_interrupts_and_halt` is one `sti; hlt` pair so a wake-up
+/// that arrives in between cannot be lost. Entered by `kernel::smp::ap_main`
+/// after [`init_ap`]; the `sti` inside is the AP's first (after its
+/// `simd::enable`, structurally — see `hal::smp`). Never returns.
+pub fn ap_idle_loop() -> ! {
+    loop {
+        idle_reap();
+        hal::cpu::enable_interrupts_and_halt();
+    }
 }
 
 // ── PR-A boot proof: cooperative interleave ─────────────────────────────────
@@ -962,8 +1314,8 @@ const SEQ_LOG_CAP: usize = 8;
 /// The cooperative boot proof's recorded `(task letter, iteration)` entries,
 /// in the exact order [`print_marker_atomic`] observed them — the raw
 /// evidence [`validate_cooperative_sequence`] checks. A fixed-size array (no
-/// `alloc`) guarded by its own [`hal::sync::SpinMutex`] (mirrors [`SCHED`]'s
-/// own locking discipline). Entries are appended from inside
+/// `alloc`) guarded by its own [`hal::sync::SpinMutex`] (mirrors the
+/// scheduler locks' own discipline). Entries are appended from inside
 /// [`print_marker_atomic`]'s existing [`preempt_disable`]/[`preempt_enable`]
 /// bracket, so — like that bracket's print calls — a genuine timer tick can
 /// never interleave a partial append from the *other* task into the middle
@@ -1044,7 +1396,7 @@ impl CooperativeVerdict {
 /// # Why phase is not asserted (issue #21 defect 3)
 ///
 /// This scheduler is preemptive (PR-B), not cooperative-only: a fresh
-/// task's [`task_prologue`] unconditionally resets [`PREEMPT_COUNT`] to `0`
+/// task's [`task_prologue`] unconditionally resets [`PreemptState::count`] to `0`
 /// and enables interrupts the instant it starts running, so there is a real
 /// window — between a task's switch-in and its first [`preempt_disable`]
 /// (inside [`print_marker_atomic`]) — during which a timer tick can legally
@@ -1148,7 +1500,7 @@ fn validate_cooperative_sequence(entries: &[(u8, u8)]) -> CooperativeVerdict {
 /// entries land out of true program order — which [`validate_cooperative_sequence`]
 /// would then (correctly) flag as broken even though nothing was actually
 /// wrong. A tick landing inside the bracket is never lost — [`on_tick`] just
-/// defers it via [`NEED_RESCHED`] (module docs' "Interrupt-flag discipline"
+/// defers it via [`PreemptState::need_resched`] (module docs' "Interrupt-flag discipline"
 /// section) for [`preempt_enable`] to drain immediately after this function
 /// returns, so this only ever delays a real preemption by a handful of
 /// instructions, never skips one — the proof tasks' own explicit
@@ -1200,7 +1552,7 @@ fn proof_task_b() {
 /// Number of tasks currently in the ready queue — [`prove_cooperative`]'s and
 /// [`prove_preemptive`]'s drain condition.
 fn ready_len() -> usize {
-    with_interrupts_disabled(|| SCHED.lock().ready.len())
+    with_interrupts_disabled(|| CPU_SCHED[local_cpu()].lock().ready.len())
 }
 
 /// Run the PR-A cooperative-scheduling boot proof (scheduler design doc,
@@ -1228,7 +1580,7 @@ fn ready_len() -> usize {
 /// principle, fire at any instant, including in the narrow window between a
 /// freshly-spawned task's first switch-in and its first
 /// [`preempt_disable`] (inside its first [`print_marker_atomic`] call) —
-/// [`task_prologue`] unconditionally resets [`PREEMPT_COUNT`] for every
+/// [`task_prologue`] unconditionally resets [`PreemptState::count`] for every
 /// fresh task, so nothing the *spawning* context did with
 /// `preempt_disable`/`preempt_enable` reaches across that window to cover
 /// it. On real KVM hardware (this defect's origin) a burst of PIT ticks that
@@ -1446,7 +1798,7 @@ fn proof_task_spinner() {
 ///   `no`),
 /// - at least one genuine timer-driven preemption occurred (`preempted=N`,
 ///   counting only *actual* switches [`on_tick`] performed — see
-///   [`PREEMPT_EVENTS`]).
+///   [`PreemptState::events`]; on the BSP only the timer drives it).
 ///
 /// ```text
 /// [sched] preemptive: gemm-iters=<N> gemm-exact=yes spin-iters=<N> preempted=<N> ok
@@ -1458,7 +1810,8 @@ fn proof_task_spinner() {
 /// fields (`gemm-exact=yes`, `preempted >= 1`, both iteration counts `> 0`)
 /// rather than the whole line verbatim.
 pub fn prove_preemptive() {
-    let before = PREEMPT_EVENTS.load(Ordering::Relaxed);
+    let events = &PREEMPT[local_cpu()].events;
+    let before = events.load(Ordering::Relaxed);
     spawn("gemm", proof_task_gemm);
     spawn("spin", proof_task_spinner);
 
@@ -1466,7 +1819,7 @@ pub fn prove_preemptive() {
         yield_now();
     }
 
-    let after = PREEMPT_EVENTS.load(Ordering::Relaxed);
+    let after = events.load(Ordering::Relaxed);
     let preempted = after.wrapping_sub(before);
     let gemm_iters = GEMM_ITERS.load(Ordering::Relaxed);
     let gemm_exact = GEMM_EXACT.load(Ordering::Relaxed);
@@ -1485,7 +1838,97 @@ pub fn prove_preemptive() {
     hal::serial::write_str(if ok { "ok\n" } else { "FAIL\n" });
 }
 
-// ── Host + Miri unit tests: pure queue logic ────────────────────────────────
+// ── PR-2 boot proof: a task pinned to an application processor ──────────────
+
+/// Dense cpu index the pinned proof task observed itself running on
+/// (`u32::MAX` until it has run).
+static PINNED_RAN_ON: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Set (`Release`) by the pinned proof task once it has recorded its core.
+static PINNED_DONE: AtomicBool = AtomicBool::new(false);
+/// How long the BSP waits for the pinned task: 200 PIT ticks = 2 s. Generous
+/// for the same reason `kernel::smp`'s AP timeout is — a TCG vCPU thread on a
+/// contended CI host can be descheduled for far longer than the ~µs the
+/// IPI → switch → record → exit path needs.
+const PINNED_PROOF_TIMEOUT_TICKS: u64 = 200;
+
+/// The pinned proof task's body: record which core this is (the core's own
+/// `cpuid` APIC ID mapped to its dense index by `kernel::smp`), then return
+/// (→ [`task_shim`] → [`exit`] on that core). Deliberately does **not** print:
+/// the BSP reports, from the atomics, after it observes `PINNED_DONE`.
+fn proof_task_pinned() {
+    let cpu = crate::smp::this_cpu_index().unwrap_or(u32::MAX);
+    PINNED_RAN_ON.store(cpu, Ordering::Release);
+    PINNED_DONE.store(true, Ordering::Release);
+}
+
+/// Run the PR-2 **per-CPU scheduler** boot proof (AP bring-up design doc,
+/// "PR-2 checklist" item 9): the BSP places a task on the first online
+/// application processor with [`spawn_on`] — which sends that core a
+/// reschedule IPI — and the task records the core it actually ran on.
+///
+/// Evidence line (asserted by `cargo xtask test`, TCG and KVM alike):
+///
+/// ```text
+/// [sched] pinned: target=cpu1 ran-on=cpu1 bsp=cpu0 distinct=yes ok
+/// ```
+///
+/// `ok` requires all of: the task completed within the timeout, it ran on the
+/// targeted core, and that core is not the BSP. This exercises the whole
+/// cross-core path end to end — remote queue push, `send_ipi`, the AP waking
+/// from `sti; hlt`, [`on_resched_ipi`]'s ISR-tail switch from the AP idle to
+/// the task, the task's [`exit`] switching back to the idle inside the IPI
+/// handler, and the idle's [`idle_reap`]. With no online AP (a single-CPU
+/// machine) the line reports `target=none` and `skipped` — `cargo xtask test`
+/// always boots with `-smp 4`, so there it is a hard failure.
+pub fn prove_pinned() {
+    let bsp = local_cpu() as u32;
+    let target = (1..crate::smp::cpu_count() as u32).find(|&c| c != bsp && cpu_is_schedulable(c));
+    let Some(target) = target else {
+        hal::serial::write_str("[sched] pinned: target=none (no online AP) bsp=cpu");
+        hal::serial::write_dec(u64::from(bsp));
+        hal::serial::write_str(" skipped\n");
+        return;
+    };
+
+    PINNED_DONE.store(false, Ordering::Release);
+    PINNED_RAN_ON.store(u32::MAX, Ordering::Release);
+    // `spawn_on` prints its own `[sched] spawn 'pinned': …` line; the verdict
+    // line below is printed whole, afterwards, so the two never interleave.
+    if let Err(err) = spawn_on(target, "pinned", proof_task_pinned) {
+        hal::serial::write_str("[sched] pinned: target=cpu");
+        hal::serial::write_dec(u64::from(target));
+        hal::serial::write_str(" spawn FAILED: ");
+        hal::serial::write_str(err.label());
+        hal::serial::write_str("\n");
+        return;
+    }
+
+    let deadline = hal::pit::ticks().saturating_add(PINNED_PROOF_TIMEOUT_TICKS);
+    while !PINNED_DONE.load(Ordering::Acquire) && hal::pit::ticks() < deadline {
+        core::hint::spin_loop();
+    }
+    let done = PINNED_DONE.load(Ordering::Acquire);
+    let ran_on = PINNED_RAN_ON.load(Ordering::Acquire);
+    let distinct = done && ran_on != bsp;
+    let ok = done && ran_on == target && distinct;
+
+    hal::serial::write_str("[sched] pinned: target=cpu");
+    hal::serial::write_dec(u64::from(target));
+    hal::serial::write_str(" ran-on=");
+    if done {
+        hal::serial::write_str("cpu");
+        hal::serial::write_dec(u64::from(ran_on));
+    } else {
+        hal::serial::write_str("TIMEOUT");
+    }
+    hal::serial::write_str(" bsp=cpu");
+    hal::serial::write_dec(u64::from(bsp));
+    hal::serial::write_str(" distinct=");
+    hal::serial::write_str(if distinct { "yes" } else { "no" });
+    hal::serial::write_str(if ok { " ok\n" } else { " FAIL\n" });
+}
+
+// ── Host + Miri unit tests: pure queue logic ────────────────────────────────// ── Host + Miri unit tests: pure queue logic ────────────────────────────────
 //
 // `pick_next` is the entire scheduling *policy* (rotation, exit bookkeeping,
 // Invariant #4) with zero dependency on `Task`/`Context`/`hal`, so it is
@@ -1603,18 +2046,41 @@ mod tests {
 
     #[test]
     fn preempt_disable_enable_round_trip_does_not_reschedule() {
-        use super::{preempt_disable, preempt_enable, PREEMPT_COUNT};
+        use super::{preempt_disable, preempt_enable, PREEMPT};
         use core::sync::atomic::Ordering;
 
         // No task ever requests a reschedule in this test, so `preempt_enable`
-        // must not touch the (unset-up) real scheduler at all.
+        // must not touch the (unset-up) real scheduler at all. On the host
+        // `local_cpu()` is always 0.
+        let count = &PREEMPT[0].count;
         preempt_disable();
         preempt_disable();
-        assert_eq!(PREEMPT_COUNT.load(Ordering::Relaxed), 2);
+        assert_eq!(count.load(Ordering::Relaxed), 2);
         preempt_enable();
-        assert_eq!(PREEMPT_COUNT.load(Ordering::Relaxed), 1);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
         preempt_enable();
-        assert_eq!(PREEMPT_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn preempt_state_takes_pending_only_at_zero() {
+        use super::PreemptState;
+        use core::sync::atomic::Ordering;
+
+        let st = PreemptState::new();
+        st.disable();
+        st.disable();
+        st.need_resched.store(true, Ordering::Relaxed);
+        // Leaving the inner section: count 2 → 1, nothing drained yet.
+        assert!(!st.enable_and_take_pending());
+        assert!(st.need_resched.load(Ordering::Relaxed));
+        // Leaving the outer one: count 1 → 0 with a pending flag → drain, and
+        // the flag is consumed.
+        assert!(st.enable_and_take_pending());
+        assert!(!st.need_resched.load(Ordering::Relaxed));
+        // With nothing pending, reaching zero reports nothing to drain.
+        st.disable();
+        assert!(!st.enable_and_take_pending());
     }
 
     #[test]
@@ -1690,56 +2156,104 @@ mod tests {
         assert_eq!(slice, TIME_SLICE_TICKS);
     }
 
-    // ── Defect fix: `reserve_ready_capacity` (ISR-context allocation
-    // freedom — see the module docs' "ISR-context allocation freedom"
-    // section) ───────────────────────────────────────────────────────────
+    // ── PR-2: `ReadyRing` (the production, allocation-free ready queue) and
+    // `TaskTable` (the fixed task slab) ─────────────────────────────────────
 
     #[test]
-    fn reserve_ready_capacity_covers_every_known_task() {
-        use super::reserve_ready_capacity;
+    fn ready_ring_is_fifo_and_wraps_around() {
+        use super::{ReadyQueue, ReadyRing};
 
-        let mut ready: VecDeque<TaskId> = VecDeque::new();
-        // Mirrors `init`/`spawn`'s call pattern: reserve right after each
-        // `tasks.insert`, i.e. once per task, with the CURRENT `tasks.len()`
-        // (not `ready.len()`, which lags behind).
-        for task_count in 1..=8usize {
-            reserve_ready_capacity(&mut ready, task_count);
-            assert!(
-                ready.capacity() >= task_count,
-                "capacity {} must cover {} known tasks",
-                ready.capacity(),
-                task_count
-            );
+        let mut ring: ReadyRing<4> = ReadyRing::new();
+        assert_eq!(ring.len(), 0);
+        assert_eq!(ring.pop_front(), None);
+        ring.push_back(TaskId(1));
+        ring.push_back(TaskId(2));
+        ring.push_back(TaskId(3));
+        assert_eq!(ring.len(), 3);
+        assert_eq!(ring.get(0), Some(TaskId(1)));
+        assert_eq!(ring.get(2), Some(TaskId(3)));
+        assert_eq!(ring.get(3), None);
+        assert_eq!(ring.pop_front(), Some(TaskId(1)));
+        // Wrap: head has advanced; pushes land past the physical end.
+        ring.push_back(TaskId(4));
+        ring.push_back(TaskId(5));
+        assert_eq!(ring.len(), 4);
+        assert_eq!(ring.pop_front(), Some(TaskId(2)));
+        assert_eq!(ring.pop_front(), Some(TaskId(3)));
+        assert_eq!(ring.pop_front(), Some(TaskId(4)));
+        assert_eq!(ring.pop_front(), Some(TaskId(5)));
+        assert_eq!(ring.pop_front(), None);
+        assert_eq!(ring.len(), 0);
+    }
+
+    #[test]
+    fn pick_next_over_the_production_ring_rotates_and_records_exits() {
+        use super::{ReadyQueue, ReadyRing};
+
+        let mut ring: ReadyRing<8> = ReadyRing::new();
+        ring.push_back(TaskId(1));
+        ring.push_back(TaskId(2));
+        let mut zombie = None;
+        assert_eq!(
+            pick_next(&mut ring, &mut zombie, TaskId(0), false),
+            Some(TaskId(1))
+        );
+        assert_eq!(
+            (ring.get(0), ring.get(1)),
+            (Some(TaskId(2)), Some(TaskId(0)))
+        );
+        assert_eq!(
+            pick_next(&mut ring, &mut zombie, TaskId(1), true),
+            Some(TaskId(2))
+        );
+        assert_eq!(zombie, Some(TaskId(1)));
+        // The exiting task was not requeued: only the idle remains.
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.get(0), Some(TaskId(0)));
+    }
+
+    #[test]
+    fn task_table_insert_get_remove_and_full() {
+        use super::{Task, TaskState, TaskTable, MAX_TASKS, TIME_SLICE_TICKS};
+        use alloc::boxed::Box;
+
+        fn mk(id: u64, cpu: u32) -> Box<Task> {
+            let mut xsave = Box::new(hal::context::XsaveArea::new_init());
+            let ctx = hal::context::Context::adopt_running(&mut xsave);
+            Box::new(Task {
+                id: TaskId(id),
+                name: "t",
+                cpu,
+                state: TaskState::Ready,
+                entry: super::idle_entry_unused,
+                ctx,
+                stack: None,
+                xsave,
+                slice: TIME_SLICE_TICKS,
+            })
         }
-    }
 
-    #[test]
-    fn reserve_ready_capacity_never_shrinks_capacity() {
-        use super::reserve_ready_capacity;
-
-        let mut ready: VecDeque<TaskId> = VecDeque::new();
-        reserve_ready_capacity(&mut ready, 8);
-        let grown = ready.capacity();
-        assert!(grown >= 8);
-        // A later call with a SMALLER task count (e.g. after reaping shrank
-        // `tasks`) must never shrink `ready`'s allocation back down — only
-        // `init`/`spawn` (growing `tasks`) ever call this, but the function
-        // itself must stay safe regardless.
-        reserve_ready_capacity(&mut ready, 2);
-        assert!(ready.capacity() >= grown);
-    }
-
-    #[test]
-    fn reserve_ready_capacity_accounts_for_existing_ready_entries() {
-        use super::reserve_ready_capacity;
-
-        // `ready` already holds 2 entries (as if 2 of the known tasks are
-        // currently runnable) — capacity must still cover the full task
-        // count, not just the reserved-on-top-of-current-length amount.
-        let mut ready = ids(&[10, 11]);
-        reserve_ready_capacity(&mut ready, 5);
-        assert!(ready.capacity() >= 5);
-        assert!(ready.len() < ready.capacity());
+        let mut table = TaskTable::new();
+        assert!(table.get(TaskId(7)).is_none());
+        table.insert(mk(7, 2)).ok().expect("slot free");
+        table.insert(mk(9, 0)).ok().expect("slot free");
+        assert_eq!(table.get(TaskId(7)).map(|t| t.cpu), Some(2));
+        assert_eq!(table.get_mut(TaskId(9)).map(|t| t.cpu), Some(0));
+        assert_eq!(table.iter().count(), 2);
+        let removed = table.remove(TaskId(7)).expect("present");
+        assert_eq!(removed.id, TaskId(7));
+        assert!(table.get(TaskId(7)).is_none());
+        assert!(table.remove(TaskId(7)).is_none());
+        // Fill to capacity: the next insert hands the task back untouched.
+        for i in 0..(MAX_TASKS as u64 - 1) {
+            table
+                .insert(mk(100 + i, 1))
+                .ok()
+                .expect("room until MAX_TASKS");
+        }
+        assert_eq!(table.iter().count(), MAX_TASKS);
+        let rejected = table.insert(mk(999, 1)).err().expect("full");
+        assert_eq!(rejected.id, TaskId(999));
     }
 
     // ── Defect fix (issue #21, defect 3): `validate_cooperative_sequence`
@@ -1963,92 +2477,17 @@ mod tests {
     }
 }
 
-/// Kani proofs (PR-B) — bounded, in-tree harnesses over the same pure,
-/// HAL-free logic the host tests above exercise (`pick_next`'s Invariant #4,
-/// `preempt_disable`/`preempt_enable`'s `PREEMPT_COUNT` bookkeeping). Compiled
+/// Kani proofs (PR-B, per-core since PR-2) — bounded, in-tree harnesses over
+/// the same pure, HAL-free logic the host tests above exercise (`pick_next`'s
+/// Invariant #4 over the production `ReadyRing`, `PreemptState`'s
+/// critical-section bookkeeping). Compiled
 /// only under `cargo kani` (`#[cfg(kani)]`), excluded from the stable build
 /// and `cargo test` — mirrors `kernel::ml`'s existing Kani proofs (see
 /// `ml.rs`). Run with `cargo kani -p kernel`.
 #[cfg(kani)]
 mod proofs {
-    use super::{
-        pick_next, preempt_disable, preempt_enable, tick_action, ReadyQueue, TaskId, TickAction,
-        PREEMPT_COUNT,
-    };
+    use super::{pick_next, tick_action, PreemptState, ReadyQueue, ReadyRing, TaskId, TickAction};
     use core::sync::atomic::Ordering;
-
-    /// An allocation-free [`ReadyQueue`] for the proofs: a fixed array plus a
-    /// length, shifted on pop.
-    ///
-    /// This exists to get `VecDeque` out of the formula. CBMC's cost for the
-    /// Invariant #4 proof was dominated not by the scheduling policy but by
-    /// `VecDeque`'s heap model — `RawVec`, allocation reasoning, and
-    /// wrap-around head/tail arithmetic — which capped the bound at 2 symbolic
-    /// scheduler passes; 3 exhausted 15 GiB with no verdict (measured
-    /// 2026-07-25). Everything here is a plain array write CBMC handles
-    /// cheaply.
-    ///
-    /// Crucially this is NOT a re-modelling of the scheduler: [`pick_next`] —
-    /// the real production function, unmodified — is what the harness drives.
-    /// Only the container it pops from is swapped, and the container's contract
-    /// (`pop_front` takes the head, `push_back` appends to the tail) is the
-    /// whole of what [`ReadyQueue`] promises and what `VecDeque` provides.
-    #[derive(Clone, Copy)]
-    struct ArrayQueue<const N: usize> {
-        buf: [TaskId; N],
-        len: usize,
-    }
-
-    impl<const N: usize> ArrayQueue<N> {
-        fn new() -> Self {
-            Self {
-                buf: [TaskId::from_usize(0); N],
-                len: 0,
-            }
-        }
-
-        fn len(&self) -> usize {
-            self.len
-        }
-
-        /// Element at `i`, or `None` past the end. Used only by assertions.
-        fn get(&self, i: usize) -> Option<TaskId> {
-            if i < self.len {
-                Some(self.buf[i])
-            } else {
-                None
-            }
-        }
-    }
-
-    impl<const N: usize> ReadyQueue for ArrayQueue<N> {
-        fn pop_front(&mut self) -> Option<TaskId> {
-            if self.len == 0 {
-                return None;
-            }
-            let head = self.buf[0];
-            // Constant-trip shift: `0..N-1` is a compile-time bound, so CBMC
-            // unrolls a fixed number of copies with no loop guard to refute —
-            // the same reason the assertion scans below use a constant range.
-            for i in 0..N - 1 {
-                if i + 1 < self.len {
-                    self.buf[i] = self.buf[i + 1];
-                }
-            }
-            self.len -= 1;
-            Some(head)
-        }
-
-        fn push_back(&mut self, id: TaskId) {
-            // The harness's universe is `N` ids and `pick_next` never grows the
-            // queue net (one pop per push), so overflow is unreachable; assert
-            // rather than silently drop, so a future harness change that broke
-            // that reasoning would fail the proof instead of weakening it.
-            assert!(self.len < N);
-            self.buf[self.len] = id;
-            self.len += 1;
-        }
-    }
 
     /// Kani proof — Invariant #4 over a bounded, symbolic sequence of
     /// scheduler passes: `ready` never contains the new `current`, and the
@@ -2067,13 +2506,16 @@ mod proofs {
     /// verified in ~4 s, depth 3 exhausted 15 GiB in CBMC's propositional
     /// reduction with no verdict (measured 2026-07-25). The cost was the
     /// *container*, not the policy — `RawVec`, allocation reasoning and
-    /// wrap-around index arithmetic dominated the formula. Swapping in the
-    /// allocation-free [`ArrayQueue`], via the [`ReadyQueue`] trait
-    /// [`pick_next`] is now generic over, removes that entirely.
+    /// wrap-around index arithmetic dominated the formula. Swapping in an
+    /// allocation-free array queue, via the [`ReadyQueue`] trait [`pick_next`]
+    /// is generic over, removed that entirely — and since PR-2 that queue,
+    /// [`ReadyRing`], **is** the production container (here at capacity 6, in
+    /// production at `MAX_TASKS`), so the harness now drives the real policy
+    /// over the real container.
     ///
     /// This did NOT weaken the proof. The function under verification is still
-    /// the real, unmodified [`pick_next`]; only the container it pops from
-    /// changed, and that container's contract is the whole of what
+    /// the real, unmodified [`pick_next`]; the container is the production
+    /// type at a small capacity, and its contract is the whole of what
     /// [`ReadyQueue`] promises.
     ///
     /// The bound is chosen to SATURATE the reachable state space, not merely
@@ -2097,7 +2539,7 @@ mod proofs {
     fn invariant4_no_lost_or_duplicated_ids_bounded() {
         const STEPS: usize = 8;
         // A small, fixed universe: id 0 starts `current`; 1..=3 start `ready`.
-        let mut ready: ArrayQueue<6> = ArrayQueue::new();
+        let mut ready: ReadyRing<6> = ReadyRing::new();
         ready.push_back(TaskId::from_usize(1));
         ready.push_back(TaskId::from_usize(2));
         ready.push_back(TaskId::from_usize(3));
@@ -2163,7 +2605,7 @@ mod proofs {
 
     /// Kani proof — a bounded nesting of [`preempt_disable`]/[`preempt_enable`]
     /// pairs (the only pattern every real caller in this crate uses) never
-    /// underflows [`PREEMPT_COUNT`]: after `k` nested `preempt_disable` calls
+    /// underflows [`PreemptState::count`]: after `k` nested `preempt_disable` calls
     /// (any `k` up to the bound) the counter reads exactly `k`, and unwinding
     /// them one `preempt_enable` at a time never dips below `0` — an
     /// `AtomicU32::fetch_sub` underflow silently *wraps* to `u32::MAX` rather
@@ -2201,18 +2643,52 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(9)]
     fn preempt_count_nesting_never_underflows() {
-        PREEMPT_COUNT.store(0, Ordering::Relaxed);
+        // One core's state, driven exactly as `preempt_disable`/
+        // `preempt_enable` drive `PREEMPT[local_cpu()]`. With no deferred
+        // reschedule pending, no enable ever reports a drain.
+        let st = PreemptState::new();
         let depth: u32 = kani::any();
         kani::assume(depth <= 8);
 
         for i in 0..depth {
-            preempt_disable();
-            assert_eq!(PREEMPT_COUNT.load(Ordering::Relaxed), i + 1);
+            st.disable();
+            assert_eq!(st.count.load(Ordering::Relaxed), i + 1);
         }
         for i in (0..depth).rev() {
-            preempt_enable();
-            assert_eq!(PREEMPT_COUNT.load(Ordering::Relaxed), i);
+            assert!(!st.enable_and_take_pending());
+            assert_eq!(st.count.load(Ordering::Relaxed), i);
         }
-        assert_eq!(PREEMPT_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(st.count.load(Ordering::Relaxed), 0);
+    }
+
+    /// `enable_and_take_pending` reports a drain exactly once — on the enable
+    /// that brings the count to `0` while a reschedule is pending — and
+    /// consumes the flag, for any nesting depth and any moment the flag is set.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn preempt_pending_is_drained_exactly_once_at_zero() {
+        let st = PreemptState::new();
+        let depth: u32 = kani::any();
+        kani::assume((1..=8).contains(&depth));
+        let set_at: u32 = kani::any();
+        kani::assume(set_at < depth);
+
+        for _ in 0..depth {
+            st.disable();
+        }
+        let mut drains = 0u32;
+        for i in (0..depth).rev() {
+            if i == set_at {
+                st.need_resched.store(true, Ordering::Relaxed);
+            }
+            if st.enable_and_take_pending() {
+                drains += 1;
+                // Only the final enable (count reaching 0) may drain.
+                assert_eq!(i, 0);
+            }
+        }
+        assert_eq!(drains, 1);
+        assert!(!st.need_resched.load(Ordering::Relaxed));
+        assert_eq!(st.count.load(Ordering::Relaxed), 0);
     }
 }

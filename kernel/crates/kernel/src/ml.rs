@@ -257,6 +257,41 @@ pub fn gemm_i8(a: &[i8], b: &[i8], c: &mut [i32], m: usize, k: usize, n: usize) 
 /// Σ(0..80) = 3160`. Self-evident — no hand-computed constant to get wrong.
 const PROOF_CHECKSUM: i64 = 3160;
 
+/// Run the identity-GEMM boot proof through the live dispatch **on the calling
+/// core**: `(output == B, Σ output)`.
+///
+/// Shared by [`prove`] (the BSP's logged proof) and by `kernel::smp`'s per-CPU
+/// check, where every application processor runs it on its own core right after
+/// enabling its own vector state — proving that core's `YMM`/`ZMM` path is live
+/// and bit-exact, not just the BSP's. Stack-only, allocation-free.
+fn proof_gemm() -> (bool, i64) {
+    const M: usize = 4;
+    const K: usize = 4;
+    const N: usize = 20;
+    let mut a = [0i8; M * K];
+    for d in 0..M {
+        a[d * K + d] = 1; // 4×4 identity
+    }
+    let mut b = [0i8; K * N];
+    for (idx, slot) in b.iter_mut().enumerate() {
+        *slot = idx as i8; // 0..79
+    }
+    let mut c = [0i32; M * N];
+    gemm_i8(&a, &b, &mut c, M, K, N);
+
+    let correct = c.iter().zip(&b).all(|(&ci, &bi)| ci == bi as i32);
+    let checksum: i64 = c.iter().map(|&x| x as i64).sum();
+    (correct, checksum)
+}
+
+/// The identity-GEMM boot proof as a pure verdict: `true` iff the live dispatch
+/// reproduced `B` exactly with checksum [`PROOF_CHECKSUM`] on the calling core.
+#[must_use]
+pub fn gemm_proof_ok() -> bool {
+    let (correct, checksum) = proof_gemm();
+    correct && checksum == PROOF_CHECKSUM
+}
+
 /// Run a real int8 GEMM through the live dispatch and log the result, proving the
 /// inference path works end-to-end in the booted kernel.
 ///
@@ -276,22 +311,7 @@ pub fn prove() {
     let detected = detected_capability(&info);
     let active = active_tier();
 
-    const M: usize = 4;
-    const K: usize = 4;
-    const N: usize = 20;
-    let mut a = [0i8; M * K];
-    for d in 0..M {
-        a[d * K + d] = 1; // 4×4 identity
-    }
-    let mut b = [0i8; K * N];
-    for (idx, slot) in b.iter_mut().enumerate() {
-        *slot = idx as i8; // 0..79
-    }
-    let mut c = [0i32; M * N];
-    gemm_i8(&a, &b, &mut c, M, K, N);
-
-    let correct = c.iter().zip(&b).all(|(&ci, &bi)| ci == bi as i32);
-    let checksum: i64 = c.iter().map(|&x| x as i64).sum();
+    let (correct, checksum) = proof_gemm();
 
     hal::serial::write_str("[ml] inference: detected=");
     hal::serial::write_str(detected.label());

@@ -52,6 +52,19 @@
 //! - [`mm`] — memory management: the physical frame allocator, virtual page
 //!   mapping over Limine's paging, and the kernel heap behind a
 //!   `#[global_allocator]` ([`mm::init`], [`mm::LockedHeap`]).
+//! - [`apic`] — the Local APIC in virtual-wire mode, reached over x2APIC MSRs
+//!   or (QEMU TCG) an uncached xAPIC MMIO mapping: [`apic::enable_bsp`] for the
+//!   boot core, [`apic::enable_ap`] for each application processor (LINT0
+//!   masked — only the BSP fronts the PIC), [`apic::send_ipi`] / [`apic::eoi`]
+//!   for the per-CPU scheduler's cross-core wake-ups, and
+//!   [`apic::cpuid_apic_id`] to identify the calling core in any LAPIC mode.
+//! - [`smp`] — application-processor bring-up over the Limine MP protocol:
+//!   [`smp::cpus`] enumerates the firmware's CPUs, [`smp::set_ap_main`] +
+//!   [`smp::start_cpu`] release a parked AP into the sealed `ap_entry` sequence
+//!   (per-AP GDT/TSS, shared IDT, own vector state, own LAPIC) and then into the
+//!   kernel's `ApMain` with an [`smp::ApInfo`]. No trampoline, no low-memory
+//!   reservation, no MADT parser — the bootloader we already trust for the BSP's
+//!   mode switch and page tables does the same for the APs.
 //! - [`ata`] — a legacy ATA (IDE) PIO disk driver on the primary channel
 //!   (`0x1F0..=0x1F7` + control `0x3F6`) with [`ata::identify`],
 //!   [`ata::read_sectors`], [`ata::write_sectors`] (512-byte sectors, LBA28,
@@ -96,6 +109,16 @@
 //!   [`context::switch`] — the cooperative kernel-thread context switch
 //!   `kernel::sched` builds its scheduler on.
 //! - [`sync::SpinMutex`] — the spinlock backing `kernel::sched`'s run-queue state.
+//! - [`smp::cpus`] / [`smp::bsp_lapic_id`] / [`smp::set_ap_main`] /
+//!   [`smp::start_cpu`] / [`smp::ApInfo`] / [`smp::CpuDesc`] / [`smp::MAX_CPUS`] —
+//!   SMP AP bring-up for `kernel::smp`.
+//! - [`apic::cpuid_apic_id`] — the calling core's APIC ID (any LAPIC mode), for
+//!   `kernel::smp`'s per-CPU lookup.
+//! - [`cpu::osxsave_enabled`] — live per-core `CR4.OSXSAVE` read.
+//! - [`cpu::enable_interrupts_and_halt`] — race-free `sti; hlt` idle step.
+//! - [`apic::send_ipi`] / [`apic::eoi`] / [`apic::LapicInfo`] / [`apic::LapicMode`]
+//!   — the per-CPU scheduler's IPI wake-up path.
+//! - [`sync::SpinMutex::try_lock`] — bounded-wait locking (the console guard).
 
 #![no_std]
 // `unsafe` is permitted in this crate (and only this crate), but it must always
@@ -124,4 +147,5 @@ pub mod pic;
 pub mod pit;
 pub mod serial;
 pub mod simd;
+pub mod smp;
 pub mod sync;

@@ -127,11 +127,11 @@ pub fn write_header(
 #[must_use]
 pub fn checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+    let (words, remainder) = data.as_chunks::<2>();
+    for &[hi, lo] in words {
+        sum += u16::from_be_bytes([hi, lo]) as u32;
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum += (u16::from_be_bytes([*last, 0])) as u32;
     }
     // Fold the carries into the low 16 bits.

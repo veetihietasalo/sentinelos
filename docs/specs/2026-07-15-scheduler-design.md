@@ -311,11 +311,31 @@ not just the boot self-test.
    `idle_loop`) — confirmed, or a dedicated `hlt` idle thread?
 3. **`slice` length** (ticks per quantum) at 100 Hz — start at 1 tick (10 ms)?
 
-## SMP-forward (note, not a design)
+## SMP-forward — **implemented (2026-09-18, per-CPU, no work stealing)**
 
-Everything global here becomes **per-core** before AP bring-up: `SCHED`/`ready`/
-`current` → per-CPU run queues; `PREEMPT_COUNT`/`NEED_RESCHED` → per-core. This
-compounds the **already-documented** `VECTOR_SAVE_ARMED` per-core hazard (vector-state
-doc + idt.rs). The "not held across `switch`" lock discipline and stable-`TaskHandle`
-ownership make the per-CPU split mechanical, not a redesign. Load balancing / IPI
-reschedule are out of scope.
+Landed as PR-2 of `docs/specs/2026-07-16-smp-ap-bringup-design.md`. What the
+original note predicted, and what changed in the doing:
+
+- `SCHED`/`ready`/`current`/`zombie` → **per-core** `CPU_SCHED[cpu]`
+  (`SpinMutex<CpuSched>`), indexed by the dense cpu index `kernel::smp` assigns;
+  `PREEMPT_COUNT`/`NEED_RESCHED`/`PREEMPT_EVENTS` → per-core `PREEMPT[cpu]`.
+  The task table became a separate lock, `TASKS`, taken **after** a queue lock.
+- The "not held across `switch`" discipline and stable-`TaskHandle` ownership did
+  make the split mechanical. What was *not* predicted: **no lock taken from IRQ
+  context may be held across an allocation**, or an AP's IPI handler waiting on
+  `TASKS` deadlocks against a BSP that holds `TASKS` and waits on the heap lock
+  held by the AP's interrupted task. So `tasks: BTreeMap` became a fixed slab
+  (`TaskTable`, `MAX_TASKS = 64`) and `ready: VecDeque` a fixed ring
+  (`ReadyRing`) — which also retired the `reserve_ready_capacity` machinery.
+- Tasks are **pinned**: `spawn_on(cpu, …)` places, nothing migrates; `spawn`
+  = local core. A remote placement sends a **reschedule IPI**
+  (`hal::apic::send_ipi`, vector `0xF0`); the target's `on_resched_ipi` switches
+  at the ISR tail exactly like `on_tick`. So "IPI reschedule" moved from out of
+  scope to the mechanism — a core idling in `sti; hlt` has no other way to learn
+  it has work (no LAPIC timer yet).
+- Each AP adopts its parked control flow as its idle (`init_ap`), mirroring
+  `init`'s adoption of `kmain`; the AP idle loop is `idle_reap(); sti; hlt`.
+- Boot proof: `prove_pinned` → `[sched] pinned: target=cpuN ran-on=cpuN bsp=cpu0
+  distinct=yes ok`, asserted by `cargo xtask test` under TCG and KVM.
+- Still out of scope: load balancing / work stealing, timer preemption on APs
+  (phase 3: LAPIC timer + IOAPIC), TLB shootdown.
