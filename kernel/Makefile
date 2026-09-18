@@ -25,7 +25,7 @@
 HOST := $(shell rustc -vV | sed -n 's/^host: //p')
 XTASK := cargo run --manifest-path xtask/Cargo.toml --target $(HOST) --target-dir target/xtask --
 
-.PHONY: build run test test-kvm check-no-vector screenshot
+.PHONY: build run test test-kvm check-no-vector screenshot boot-timing
 build:
 	$(XTASK) build
 run:
@@ -38,3 +38,6 @@ check-no-vector:
 	$(XTASK) check-no-vector
 screenshot:
 	$(XTASK) screenshot
+
+boot-timing:
+	$(XTASK) boot-timing $(RUNS)
