@@ -21,6 +21,8 @@ extern crate alloc;
 
 pub mod app;
 pub mod fs;
+pub mod hash;
+pub mod host;
 pub mod input;
 pub mod interrupts;
 pub mod memory;
@@ -228,6 +230,16 @@ pub fn kmain() -> ! {
     // which yields — only that core's LAPIC-timer tick can switch them — with
     // the GEMM's live vector accumulators surviving each preemption bit-exact.
     sched::prove_ap_preemptive();
+
+    // Component model PR-1 boot proof (component-model design doc §14): the
+    // host hashes the embedded `hello` component's bytes (framed, §6), refuses
+    // a manifest whose id is off by one bit before any runtime sees it, then
+    // instantiates the honest manifest on the native runtime and drives one
+    // request through the instance's inbox ring and the envelope codec — the
+    // kernel stamping `from` on both the request and the reply. Last proof
+    // before the banner: it sits on the heap and the console only, touches no
+    // hardware and no clock (zero time-dependent semantics, spec §19).
+    host::prove_hello();
 
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");
