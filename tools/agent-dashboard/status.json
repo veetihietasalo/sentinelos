@@ -15,8 +15,8 @@
       "name": "kernel-architect",
       "role": "Subsystem design & framekernel decomposition",
       "model": "opus",
-      "status": "working",
-      "task": "reviewing SentinelFS design spec",
+      "status": "done",
+      "task": "SentinelFS spec review (architect seat): layering ok, staging + \u00a77 hash coverage objections",
       "history": [
         {
           "ts": "2026-09-18T16:27:47",
@@ -35,6 +35,12 @@
           "kind": "status",
           "status": "working",
           "task": "reviewing SentinelFS design spec"
+        },
+        {
+          "ts": "2026-09-18T17:22:44",
+          "kind": "status",
+          "status": "done",
+          "task": "SentinelFS spec review (architect seat): layering ok, staging + \u00a77 hash coverage objections"
         }
       ]
     },
@@ -56,8 +62,8 @@
       "name": "verification-engineer",
       "role": "Miri + Kani + fuzz CI gate",
       "model": "opus",
-      "status": "working",
-      "task": "reviewing SentinelFS design from verification seat",
+      "status": "done",
+      "task": "independent verification-seat review of SentinelFS design (crash-test design, Kani bounding, fuzz/Miri scope)",
       "history": [
         {
           "ts": "2026-09-18T16:28:21",
@@ -76,6 +82,12 @@
           "kind": "status",
           "status": "working",
           "task": "reviewing SentinelFS design from verification seat"
+        },
+        {
+          "ts": "2026-09-18T17:23:50",
+          "kind": "status",
+          "status": "done",
+          "task": "independent verification-seat review of SentinelFS design (crash-test design, Kani bounding, fuzz/Miri scope)"
         }
       ]
     },
@@ -97,8 +109,8 @@
       "name": "kernel-reviewer",
       "role": "Adversarial review / human-gate",
       "model": "opus",
-      "status": "working",
-      "task": "Reviewing SentinelFS design spec as merge gate",
+      "status": "done",
+      "task": "SentinelFS design review: 6 blocking items (hal row miscount, extent hash granularity, mid-mutation commit, lock hold time)",
       "history": [
         {
           "ts": "2026-09-18T16:27:57",
@@ -117,6 +129,12 @@
           "kind": "status",
           "status": "working",
           "task": "Reviewing SentinelFS design spec as merge gate"
+        },
+        {
+          "ts": "2026-09-18T17:23:36",
+          "kind": "status",
+          "status": "done",
+          "task": "SentinelFS design review: 6 blocking items (hal row miscount, extent hash granularity, mid-mutation commit, lock hold time)"
         }
       ]
     },
@@ -190,5 +208,5 @@
       "task": "\u2014"
     }
   ],
-  "updatedAt": "2026-09-18T17:21:16"
+  "updatedAt": "2026-09-18T17:23:50"
 }
