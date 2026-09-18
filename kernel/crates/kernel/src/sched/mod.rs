@@ -37,9 +37,10 @@
 //! `sti; hlt` ([`ap_idle_loop`]) — wakes and switches to the task at the ISR
 //! tail ([`on_resched_ipi`], the same shape as [`on_tick`]). Each AP adopted its
 //! own control flow as its idle task in [`init_ap`], exactly as the BSP adopted
-//! `kmain` in [`init`]. Only the BSP has a timer today (PIT via the PIC), so
-//! tasks on an AP are switched only by IPIs, `yield_now` and `exit` until the
-//! LAPIC timer lands (phase 3). See [`prove_pinned`] for the boot proof.
+//! `kmain` in [`init`]. Since SMP phase 3 every core has its own LAPIC-timer
+//! tick (`kernel::interrupts::handle_lapic_timer` → [`on_tick`] on that core),
+//! so tasks on an AP are timer-preempted exactly like the BSP's. See
+//! [`prove_pinned`] and [`prove_ap_preemptive`] for the boot proofs.
 //!
 //! # Locking discipline
 //!
@@ -461,6 +462,11 @@ struct PreemptState {
     /// where only the timer drives it) as the "N preemptions occurred"
     /// evidence; never touched by voluntary [`yield_now`]/[`exit`].
     events: AtomicU64,
+    /// The subset of `events` performed **directly by [`on_tick`]** — genuine
+    /// timer-driven preemptions, excluding IPI-driven switches and deferred
+    /// drains. Read by [`prove_ap_preemptive`], where the two proof tasks also
+    /// arrive by IPI and those switches must not count as timer evidence.
+    tick_events: AtomicU64,
 }
 
 impl PreemptState {
@@ -469,6 +475,7 @@ impl PreemptState {
             count: AtomicU32::new(0),
             need_resched: AtomicBool::new(false),
             events: AtomicU64::new(0),
+            tick_events: AtomicU64::new(0),
         }
     }
 
@@ -594,6 +601,7 @@ pub fn on_tick() {
         TickAction::Switch => {
             if reschedule_locked_on(cpu, false) {
                 PREEMPT[cpu].events.fetch_add(1, Ordering::Relaxed);
+                PREEMPT[cpu].tick_events.fetch_add(1, Ordering::Relaxed);
             }
         }
         TickAction::Defer => PREEMPT[cpu].need_resched.store(true, Ordering::Relaxed),
@@ -1273,7 +1281,8 @@ pub fn idle_reap() {
 /// `sti; hlt` until the next interrupt — a reschedule IPI, whose handler
 /// ([`on_resched_ipi`]) switches this core to the placed task at the ISR tail;
 /// when that task exits, this idle resumes inside that handler and returns
-/// through the stub's `iretq` to here, loops, reaps it, and sleeps again.
+/// through the stub's `iretq` to here, loops, reaps it, and sleeps again. The
+/// core's LAPIC-timer tick also wakes it every quantum (a cheap reap + re-halt).
 ///
 /// `hal::cpu::enable_interrupts_and_halt` is one `sti; hlt` pair so a wake-up
 /// that arrives in between cannot be lost. Entered by `kernel::smp::ap_main`
@@ -1705,6 +1714,14 @@ static GEMM_EXACT: AtomicBool = AtomicBool::new(true);
 /// [`proof_task_spinner`]'s total completed iterations — "the second task
 /// also made progress" evidence.
 static SPIN_ITERS: AtomicU64 = AtomicU64::new(0);
+/// How many of the two preemption-proof tasks have finished their run — what
+/// [`prove_preemptive_on`] waits for when the tasks run on **another** core
+/// (the local-core variant drains its own ready queue instead).
+static PROOF_TASKS_DONE: AtomicU32 = AtomicU32::new(0);
+/// Upper bound on the BSP's wait for a remote core's two proof tasks: each
+/// runs [`PREEMPT_PROOF_RUN_TICKS`] of wall clock and they share the core, so
+/// ~2× that plus a generous margin for a descheduled TCG vCPU thread.
+const PREEMPT_PROOF_REMOTE_TIMEOUT_TICKS: u64 = 3 * PREEMPT_PROOF_RUN_TICKS + 200;
 
 /// Boot-proof task: run a fixed int8 GEMM in a tight loop for
 /// [`PREEMPT_PROOF_RUN_TICKS`] wall-clock ticks, **never** calling
@@ -1759,6 +1776,7 @@ fn proof_task_gemm() {
     }
     GEMM_ITERS.store(iters, Ordering::Relaxed);
     GEMM_EXACT.store(exact, Ordering::Relaxed);
+    PROOF_TASKS_DONE.fetch_add(1, Ordering::Release);
 }
 
 /// Boot-proof task: loop a cheap, side-effect-free counter for
@@ -1776,6 +1794,7 @@ fn proof_task_spinner() {
         iters += 1;
     }
     SPIN_ITERS.store(iters, Ordering::Relaxed);
+    PROOF_TASKS_DONE.fetch_add(1, Ordering::Release);
 }
 
 /// Run the PR-B **preemptive**-scheduling boot proof (scheduler design doc,
@@ -1810,32 +1829,140 @@ fn proof_task_spinner() {
 /// fields (`gemm-exact=yes`, `preempted >= 1`, both iteration counts `> 0`)
 /// rather than the whole line verbatim.
 pub fn prove_preemptive() {
-    let events = &PREEMPT[local_cpu()].events;
-    let before = events.load(Ordering::Relaxed);
-    spawn("gemm", proof_task_gemm);
-    spawn("spin", proof_task_spinner);
+    prove_preemptive_on(local_cpu() as u32, "preemptive");
+}
 
-    while ready_len() > 0 {
-        yield_now();
+/// The PR-B preemption proof, run on an **application processor** (SMP phase
+/// 3): both tasks are pinned to the first online AP, whose own LAPIC-timer tick
+/// is the only thing that can switch them. The BSP waits for both to finish
+/// and reports:
+///
+/// ```text
+/// [sched] ap-preemptive: cpu1 gemm-iters=<N> gemm-exact=yes spin-iters=<N> tick-preempted=<N> ok
+/// ```
+///
+/// `tick-preempted` counts **timer-driven** switches only (`PreemptState::
+/// tick_events`) — the two IPI-driven switches that deliver the tasks to the
+/// core are deliberately excluded, so `>= 1` is evidence of the AP's tick, not
+/// of the IPIs. `cargo xtask test` asserts the fields like the BSP line's. With
+/// no online AP the line reports `cpu=none skipped` (always a hard failure under
+/// the tests' `-smp 4`).
+pub fn prove_ap_preemptive() {
+    let bsp = local_cpu() as u32;
+    let target = (1..crate::smp::cpu_count() as u32).find(|&c| c != bsp && cpu_is_schedulable(c));
+    match target {
+        Some(cpu) => prove_preemptive_on(cpu, "ap-preemptive"),
+        None => hal::serial::print_line("[sched] ap-preemptive: cpu=none (no online AP) skipped"),
+    }
+}
+
+/// Run the preemption proof with both tasks pinned to `cpu`, reporting under
+/// `label`. On the calling core the idle drains its own ready queue by
+/// yielding (PR-B's original shape); on another core the BSP spins (bounded)
+/// on [`PROOF_TASKS_DONE`], since it cannot yield on that core's behalf. The
+/// evidence fields are the same in both cases, plus `tick-preempted` for a
+/// remote core (see [`prove_ap_preemptive`]).
+fn prove_preemptive_on(cpu: u32, label: &str) {
+    let local = cpu as usize == local_cpu();
+    GEMM_ITERS.store(0, Ordering::Relaxed);
+    GEMM_EXACT.store(true, Ordering::Relaxed);
+    SPIN_ITERS.store(0, Ordering::Relaxed);
+    PROOF_TASKS_DONE.store(0, Ordering::Release);
+    let events = &PREEMPT[cpu as usize].events;
+    let tick_events = &PREEMPT[cpu as usize].tick_events;
+    let before = events.load(Ordering::Relaxed);
+    let tick_before = tick_events.load(Ordering::Relaxed);
+
+    let spawned = spawn_on(cpu, "gemm", proof_task_gemm).is_ok()
+        && spawn_on(cpu, "spin", proof_task_spinner).is_ok();
+    if !spawned {
+        hal::serial::write_str("[sched] ");
+        hal::serial::write_str(label);
+        hal::serial::write_str(": spawn FAILED on cpu");
+        hal::serial::write_dec(u64::from(cpu));
+        hal::serial::write_str("\n");
+        return;
     }
 
-    let after = events.load(Ordering::Relaxed);
-    let preempted = after.wrapping_sub(before);
+    let timed_out = if local {
+        while ready_len() > 0 {
+            yield_now();
+        }
+        false
+    } else {
+        // The tasks clock themselves on the PIT, which only the BSP advances —
+        // so the BSP must take interrupts while it waits (see `wait_on_other_core`).
+        !wait_on_other_core(
+            || PROOF_TASKS_DONE.load(Ordering::Acquire) >= 2,
+            PREEMPT_PROOF_REMOTE_TIMEOUT_TICKS,
+        )
+    };
+
+    let preempted = events.load(Ordering::Relaxed).wrapping_sub(before);
+    let tick_preempted = tick_events
+        .load(Ordering::Relaxed)
+        .wrapping_sub(tick_before);
     let gemm_iters = GEMM_ITERS.load(Ordering::Relaxed);
     let gemm_exact = GEMM_EXACT.load(Ordering::Relaxed);
     let spin_iters = SPIN_ITERS.load(Ordering::Relaxed);
-    let ok = gemm_iters > 0 && spin_iters > 0 && gemm_exact && preempted >= 1;
+    let preemption_evidence = if local { preempted } else { tick_preempted };
+    let ok =
+        !timed_out && gemm_iters > 0 && spin_iters > 0 && gemm_exact && preemption_evidence >= 1;
 
-    hal::serial::write_str("[sched] preemptive: gemm-iters=");
+    hal::serial::write_str("[sched] ");
+    hal::serial::write_str(label);
+    hal::serial::write_str(": ");
+    if !local {
+        hal::serial::write_str("cpu");
+        hal::serial::write_dec(u64::from(cpu));
+        hal::serial::write_str(" ");
+    }
+    hal::serial::write_str("gemm-iters=");
     hal::serial::write_dec(gemm_iters);
     hal::serial::write_str(" gemm-exact=");
     hal::serial::write_str(if gemm_exact { "yes" } else { "no" });
     hal::serial::write_str(" spin-iters=");
     hal::serial::write_dec(spin_iters);
-    hal::serial::write_str(" preempted=");
-    hal::serial::write_dec(preempted);
+    if local {
+        hal::serial::write_str(" preempted=");
+        hal::serial::write_dec(preempted);
+    } else {
+        hal::serial::write_str(" tick-preempted=");
+        hal::serial::write_dec(tick_preempted);
+        if timed_out {
+            hal::serial::write_str(" TIMEOUT");
+        }
+    }
     hal::serial::write_str(" ");
     hal::serial::write_str(if ok { "ok\n" } else { "FAIL\n" });
+}
+
+// ── Waiting on another core ─────────────────────────────────────────────────
+
+/// Spin — with interrupts **enabled** on this core — until `done()` holds or
+/// `timeout_ticks` PIT ticks elapse; restores the prior interrupt state and
+/// returns `done()`.
+///
+/// Why the interrupt window matters: `kmain` runs its boot proofs with
+/// interrupts disabled between steps, and the PIT wall clock (`hal::pit::ticks`)
+/// advances **only** when the BSP services IRQ0. A BSP that spins with `IF = 0`
+/// waiting for work on another core therefore freezes the very clock that work
+/// is timing itself against (the preemption-proof tasks run for a fixed number
+/// of ticks), and its own timeout never fires either — a mutual wait, observed
+/// as a silent hang the first time two timer-driven tasks ran on an AP. Same
+/// shape as `kernel::smp::wait_online`. Idle-on-the-BSP with interrupts open is
+/// harmless: a tick on an empty queue is a no-op.
+fn wait_on_other_core(done: impl Fn() -> bool, timeout_ticks: u64) -> bool {
+    let were_enabled = hal::cpu::interrupts_enabled();
+    hal::cpu::enable_interrupts();
+    let deadline = hal::pit::ticks().saturating_add(timeout_ticks);
+    while !done() && hal::pit::ticks() < deadline {
+        core::hint::spin_loop();
+    }
+    if !were_enabled {
+        hal::cpu::disable_interrupts();
+    }
+    done()
 }
 
 // ── PR-2 boot proof: a task pinned to an application processor ──────────────
@@ -1903,11 +2030,10 @@ pub fn prove_pinned() {
         return;
     }
 
-    let deadline = hal::pit::ticks().saturating_add(PINNED_PROOF_TIMEOUT_TICKS);
-    while !PINNED_DONE.load(Ordering::Acquire) && hal::pit::ticks() < deadline {
-        core::hint::spin_loop();
-    }
-    let done = PINNED_DONE.load(Ordering::Acquire);
+    let done = wait_on_other_core(
+        || PINNED_DONE.load(Ordering::Acquire),
+        PINNED_PROOF_TIMEOUT_TICKS,
+    );
     let ran_on = PINNED_RAN_ON.load(Ordering::Acquire);
     let distinct = done && ran_on != bsp;
     let ok = done && ran_on == target && distinct;

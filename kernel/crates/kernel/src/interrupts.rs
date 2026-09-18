@@ -24,6 +24,8 @@
 //! Vectors without a registered handler fall through to `hal`'s `default_handler`,
 //! which already reports and halts — no action needed here.
 
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
 use hal::interrupts::{Handler, InterruptFrame};
 
 // ── Vector numbers ────────────────────────────────────────────────────────────
@@ -55,6 +57,35 @@ const VECTOR_SPURIOUS: u8 = 0xFF;
 /// task up. Well above the PIC's 32–47 block and the NIC's PIC-derived vector,
 /// below the LAPIC spurious vector 255.
 pub const VECTOR_RESCHED_IPI: u8 = 0xF0;
+/// Vector 241 (`0xF1`): the **LAPIC timer** — the per-core scheduler tick (SMP
+/// phase 3). Every core's own LAPIC timer fires this at [`SCHED_TICK_HZ`]
+/// (calibrated against the PIT by [`init_lapic_timer`]), and the handler runs
+/// `sched::on_tick` on *that* core, so tasks on application processors are
+/// timer-preempted exactly like the BSP's. LAPIC-delivered, so it owes a LAPIC
+/// EOI.
+pub const VECTOR_LAPIC_TIMER: u8 = 0xF1;
+
+/// Scheduler tick rate every core's LAPIC timer is programmed to: the same
+/// 100 Hz as the PIT, so `sched`'s `TIME_SLICE_TICKS` quantum keeps its meaning
+/// and the boot proofs' tick budgets are unchanged.
+pub const SCHED_TICK_HZ: u64 = hal::pit::TICK_HZ;
+
+/// PIT ticks the LAPIC-timer calibration observes (10 ticks = 100 ms at 100 Hz):
+/// long enough that PIT/LAPIC edge alignment (±1 tick) is a ≤10 % error, short
+/// enough to be a negligible part of boot.
+const LAPIC_CALIBRATION_TICKS: u64 = 10;
+
+/// Whether the PIT handler still drives `sched::on_tick` on the BSP. `true`
+/// until [`init_lapic_timer`] moves the scheduler tick to the LAPIC timer; then
+/// the PIT is wall clock only (`hal::pit::ticks`). Stays `true` where no LAPIC
+/// access path exists — the single-core fallback keeps working unchanged.
+static SCHED_TICK_FROM_PIT: AtomicBool = AtomicBool::new(true);
+
+/// LAPIC timer initial count for one scheduler tick at divide-by-16, as
+/// calibrated on the BSP; `0` until [`init_lapic_timer`] has run. Every AP
+/// programs the same value ([`start_lapic_timer_here`]) — cores are homogeneous
+/// and the LAPIC timer clock is the same on each.
+static LAPIC_TIMER_COUNT: AtomicU32 = AtomicU32::new(0);
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -191,6 +222,24 @@ fn handle_page_fault(frame: &InterruptFrame) {
 /// `iretq` is what restores the resumed task's `IF`.
 fn handle_timer(_frame: &InterruptFrame) {
     hal::pit::on_tick();
+    // Once the LAPIC timer carries the scheduler tick (SMP phase 3), the PIT is
+    // wall clock only; before that (or without a LAPIC access path) it still
+    // drives preemption on the BSP as it always did.
+    if SCHED_TICK_FROM_PIT.load(Ordering::Relaxed) {
+        crate::sched::on_tick();
+    }
+}
+
+/// Vector 241 — this core's LAPIC timer (SMP phase 3, the per-core scheduler
+/// tick).
+///
+/// LAPIC-delivered, so it **owes the LAPIC an EOI** (acknowledge first, as
+/// [`handle_resched_ipi`] does), then [`crate::sched::on_tick`] on the core
+/// that received it — which may switch this core away right here at the ISR
+/// tail, exactly as the PIT path did on the BSP before phase 3. Does not touch
+/// the PIT tick counter: `hal::pit::ticks` stays the single wall clock.
+fn handle_lapic_timer(_frame: &InterruptFrame) {
+    hal::apic::eoi();
     crate::sched::on_tick();
 }
 
@@ -327,6 +376,9 @@ pub fn init_timer() {
     // Register the reschedule-IPI handler now too: `kmain` releases the
     // application processors after this, and the first IPI must find a handler.
     hal::interrupts::set_handler(VECTOR_RESCHED_IPI, handle_resched_ipi as Handler);
+    // And the per-core LAPIC-timer tick: registered before any core's timer is
+    // started (`init_lapic_timer` on the BSP, `start_lapic_timer_here` on APs).
+    hal::interrupts::set_handler(VECTOR_LAPIC_TIMER, handle_lapic_timer as Handler);
 
     // Remap the 8259A pair to vectors 32–47 (every line masked), then program
     // PIT channel 0 to ~100 Hz, then open IRQ0 (timer) and IRQ1 (keyboard).
@@ -337,6 +389,98 @@ pub fn init_timer() {
     // Bring up the PS/2 mouse: enable the i8042 aux device, start streaming, and
     // unmask IRQ12 + the IRQ2 cascade (so the slave PIC's lines reach the CPU).
     hal::mouse::init();
+}
+
+/// LAPIC timer counts per scheduler tick from a calibration that observed
+/// `elapsed` counts over `window_ticks` PIT ticks — pure integer math so it is
+/// host-testable and Kani-provable. `None` if the window was empty or the LAPIC
+/// timer did not visibly advance (a count of `0` would never fire).
+#[must_use]
+fn counts_per_period(elapsed: u32, window_ticks: u64) -> Option<u32> {
+    if window_ticks == 0 {
+        return None;
+    }
+    let per = u64::from(elapsed) / window_ticks;
+    // `per <= elapsed <= u32::MAX`, so the cast is lossless.
+    u32::try_from(per).ok().filter(|&p| p > 0)
+}
+
+/// Calibrate this core's LAPIC timer against the PIT and move the scheduler
+/// tick onto it (SMP phase 3). **BSP only, once**, after `init_timer` (the PIT
+/// must be ticking) and `hal::apic::enable_bsp` (a LAPIC access path must
+/// exist), before the application processors are released (they copy the
+/// calibrated count in `kernel::smp::ap_main`).
+///
+/// Opens the interrupt window for [`LAPIC_CALIBRATION_TICKS`] PIT ticks with
+/// the LAPIC timer counting down masked, reads how far it got, derives the
+/// count for one [`SCHED_TICK_HZ`] period, then flips [`SCHED_TICK_FROM_PIT`]
+/// **before** starting the periodic timer so the BSP never has two tick sources
+/// live at once. Restores interrupts to disabled (the state `kmain` holds here).
+///
+/// Prints one of:
+///
+/// ```text
+/// [timer] lapic: 62500 counts/tick (div16) -> 100 Hz scheduler tick on every core; PIT stays wall clock
+/// [timer] lapic timer unavailable; scheduler tick stays on the PIT (BSP only)
+/// ```
+///
+/// Returns whether the LAPIC timer now carries the tick.
+pub fn init_lapic_timer() -> bool {
+    if !hal::apic::timer_start_calibration() {
+        hal::serial::print_line(
+            "[timer] lapic timer unavailable; scheduler tick stays on the PIT (BSP only)",
+        );
+        return false;
+    }
+    let start_ticks = hal::pit::ticks();
+    hal::cpu::enable_interrupts();
+    while hal::pit::ticks().wrapping_sub(start_ticks) < LAPIC_CALIBRATION_TICKS {
+        hal::cpu::halt();
+    }
+    hal::cpu::disable_interrupts();
+    let elapsed = u32::MAX.wrapping_sub(hal::apic::timer_current_count().unwrap_or(u32::MAX));
+
+    let Some(count) = counts_per_period(elapsed, LAPIC_CALIBRATION_TICKS) else {
+        hal::serial::print_line(
+            "[timer] lapic timer did not advance during calibration; scheduler tick stays on the PIT (BSP only)",
+        );
+        return false;
+    };
+    LAPIC_TIMER_COUNT.store(count, Ordering::Release);
+    // Order matters: retire the PIT as tick source first, then start the LAPIC
+    // timer — never both at once.
+    SCHED_TICK_FROM_PIT.store(false, Ordering::Relaxed);
+    if !hal::apic::timer_start_periodic(VECTOR_LAPIC_TIMER, count) {
+        SCHED_TICK_FROM_PIT.store(true, Ordering::Relaxed);
+        hal::serial::print_line(
+            "[timer] lapic timer failed to start; scheduler tick stays on the PIT (BSP only)",
+        );
+        return false;
+    }
+    hal::serial::write_str("[timer] lapic: ");
+    hal::serial::write_dec(u64::from(count));
+    hal::serial::write_str(" counts/tick (div16) -> ");
+    hal::serial::write_dec(SCHED_TICK_HZ);
+    hal::serial::write_str(" Hz scheduler tick on every core; PIT stays wall clock\n");
+    true
+}
+
+/// Start the **calling application processor's** LAPIC timer with the count
+/// the BSP calibrated ([`init_lapic_timer`]). Returns `false` (no timer) if the
+/// BSP never calibrated one — that core then has no tick and its tasks switch
+/// only on IPI / `yield_now` / `exit`. Called by `kernel::smp::ap_main` after
+/// `sched::init_ap` (so the first tick finds this core's idle as `current`) and
+/// before the core publishes `online`.
+pub fn start_lapic_timer_here() -> bool {
+    let count = LAPIC_TIMER_COUNT.load(Ordering::Acquire);
+    count != 0 && hal::apic::timer_start_periodic(VECTOR_LAPIC_TIMER, count)
+}
+
+/// Whether the scheduler tick is carried by the LAPIC timer on every core
+/// (`true`) or still by the PIT on the BSP alone (`false`).
+#[must_use]
+pub fn lapic_tick_active() -> bool {
+    !SCHED_TICK_FROM_PIT.load(Ordering::Relaxed)
 }
 
 /// Register the NIC receive-interrupt handler and unmask its PIC line.
@@ -363,7 +507,18 @@ pub fn init_nic_irq() {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_pf_error;
+    use super::{counts_per_period, decode_pf_error};
+
+    #[test]
+    fn counts_per_period_divides_and_rejects_degenerate_inputs() {
+        assert_eq!(counts_per_period(625_000, 10), Some(62_500));
+        assert_eq!(counts_per_period(625_009, 10), Some(62_500)); // floor
+        assert_eq!(counts_per_period(10, 10), Some(1));
+        assert_eq!(counts_per_period(9, 10), None); // would program a 0 count
+        assert_eq!(counts_per_period(0, 10), None);
+        assert_eq!(counts_per_period(1_000, 0), None); // empty window
+        assert_eq!(counts_per_period(u32::MAX, 1), Some(u32::MAX));
+    }
 
     #[test]
     fn pf_non_present_read_supervisor() {
@@ -402,5 +557,41 @@ mod tests {
             decode_pf_error(0b0_1000),
             "reserved-bit set in page table entry"
         );
+    }
+}
+
+/// Kani proof harnesses — compiled only under `cargo kani` (`cfg(kani)`).
+#[cfg(kani)]
+mod proofs {
+    use super::counts_per_period;
+
+    /// `counts_per_period` over the **production window** (`LAPIC_CALIBRATION_TICKS`)
+    /// is total for every possible 32-bit `elapsed` and never yields a zero count:
+    /// a `Some(n)` always satisfies `1 <= n <= elapsed` and `n == elapsed / window`,
+    /// and `None` means the timer advanced fewer than `window` counts.
+    ///
+    /// The window is deliberately **concrete**: a symbolic 64-bit divisor makes
+    /// CBMC bit-blast a full 64-bit divider (measured: >140 s with no verdict), and
+    /// the kernel only ever calls this with the constant. Division by a constant
+    /// is cheap, and the degenerate-window case has its own harness below.
+    #[kani::proof]
+    fn counts_per_period_is_total_and_never_zero() {
+        let elapsed: u32 = kani::any();
+        let window = super::LAPIC_CALIBRATION_TICKS;
+        match counts_per_period(elapsed, window) {
+            Some(n) => {
+                assert!(n >= 1);
+                assert!(n <= elapsed);
+                assert_eq!(u64::from(n), u64::from(elapsed) / window);
+            }
+            None => assert!(u64::from(elapsed) < window),
+        }
+    }
+
+    /// An empty window is rejected for every `elapsed` without ever dividing.
+    #[kani::proof]
+    fn counts_per_period_rejects_an_empty_window() {
+        let elapsed: u32 = kani::any();
+        assert!(counts_per_period(elapsed, 0).is_none());
     }
 }

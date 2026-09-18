@@ -133,6 +133,14 @@ pub fn kmain() -> ! {
         None => hal::println!("[smp] no LAPIC access path; staying on the legacy PIC"),
     }
 
+    // SMP phase 3: calibrate the LAPIC timer against the PIT and move the
+    // scheduler tick onto it — on this core now, on every AP as it comes up
+    // (they copy the calibrated count). The PIT stays the wall clock. Must
+    // precede `bring_up_aps`, and follow `init_timer` (PIT ticking) and
+    // `apic::enable_bsp` (a LAPIC access path). Without one, the PIT keeps
+    // driving preemption on the BSP alone, exactly as before.
+    interrupts::init_lapic_timer();
+
     // SMP phase 2: bring every application processor the bootloader parked into
     // the kernel — per-AP GDT/TSS, the shared IDT, its own vector state and LAPIC
     // — prove each with an int8 GEMM on its own core, then park it until the
@@ -214,6 +222,12 @@ pub fn kmain() -> ! {
     // itself. Exercises the reschedule IPI end to end — send, AP wake from
     // `sti; hlt`, ISR-tail switch, exit back to the AP idle, reap.
     sched::prove_pinned();
+
+    // SMP phase 3 boot proof: the PR-B payoff proof, on an application
+    // processor. A GEMM task and a spin task pinned to the same AP, neither of
+    // which yields — only that core's LAPIC-timer tick can switch them — with
+    // the GEMM's live vector accumulators surviving each preemption bit-exact.
+    sched::prove_ap_preemptive();
 
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");

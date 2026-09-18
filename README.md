@@ -45,11 +45,11 @@ From power-on to an interactive desktop — all real, all verified in QEMU:
 - ✅ **Filesystem** — an in-memory FS that persists to an IDE disk and survives reboot
 - ✅ **Networking** — e1000 NIC + ARP / IPv4 / ICMP: it pings its gateway at boot
 - ✅ **Scheduler** — cooperative + timer-preemptive kernel threads, proven bit-exact under preemption
-- ✅ **Multi-core** — every application processor online with its own descriptor tables, vector state and LAPIC; a per-CPU scheduler places tasks on any core and wakes it by IPI
+- ✅ **Multi-core** — every application processor online with its own descriptor tables, vector state, LAPIC and timer tick; a per-CPU scheduler places tasks on any core, wakes it by IPI, and preempts them there
 - ✅ **AI/ML compute** — int8 GEMM on scalar / AVX2 / AVX-512 / VNNI tiers, self-tested per core at boot
 - ✅ **Verified TCB** — Miri + Kani gate every `hal` change in CI
 
-🚧 **In flight:** a per-core timer (IOAPIC + LAPIC timer) so tasks on every core are preempted, the AMX inference tier, and a richer windowed desktop.
+🚧 **In flight:** IOAPIC interrupt routing, the AMX inference tier, and a richer windowed desktop.
 
 <div align="center">
 <img src="docs/images/shell.png" width="720" alt="The SentinelOS interactive shell — typing 'about' and getting real output"/>
@@ -118,7 +118,7 @@ The spine, from bare metal toward a usable, private desktop OS:
 - [x] **3 — Input + GUI** · keyboard, the Cyber Dusk boot screen, an interactive shell
 - [x] **4 — A real shell** · persistent filesystem, more built-ins
 - [x] **5 — Networking** · e1000 driver + ARP / IPv4 / ICMP *(TCP/UDP still to come)*
-- [x] **5b — SMP** · every core online, per-CPU scheduler with IPI wake-ups *(per-core timer next)*
+- [x] **5b — SMP** · every core online, per-CPU scheduler, IPI wake-ups, per-core timer preemption *(IOAPIC next)*
 - [ ] **6 — A windowed desktop** · compositor, launcher, multiple apps *(first slice landed)*
 - [ ] **7 — Storage & userland** · syscalls, processes
 - [ ] **8 — Native security subsystem** · port `sentinel-core` into the kernel
