@@ -2,7 +2,7 @@
 
 One page for a fresh session (or a fresh container) to pick the kernel work back
 up without re-deriving state from git. Update it at the end of any session that
-changes direction; keep it short. Last updated **2026-09-18** (phase 3a).
+changes direction; keep it short. Last updated **2026-09-18** (component-model spec).
 
 ## Landed (main)
 
@@ -36,6 +36,14 @@ changes direction; keep it short. Last updated **2026-09-18** (phase 3a).
 
 ## Next (in sequencing order from the strategy doc)
 
+0. **Component model — decide, then build.** `docs/specs/2026-09-18-component-model-design.md`
+   replaces roadmap steps "userland + syscalls" and "port sentinel-core" with one design:
+   content-addressed wasm components, kernel-attested messages, capabilities (deny by
+   default), delegates for secrets, mergeable state objects only for the integrity log and
+   identity directory, `sentinel-core` running unchanged as a component. Five staged PRs with
+   boot proofs; the contentious item is `wasmi` as an external TCB component (§12). Needs
+   Veeti's call on the wasm-vs-native fork and on key sealing (§18) before PR-1.
+
 1. **IOAPIC + core-independent wall clock** (SMP phase 3b) — route device
    IRQs explicitly (needs an ACPI MADT walk for the IOAPIC base/GSIs; the
    RSDP comes from Limine) and stop depending on the BSP servicing IRQ0 for
@@ -48,6 +56,11 @@ changes direction; keep it short. Last updated **2026-09-18** (phase 3a).
 5. **CPU security step 2** — `docs/specs/2026-07-14-cpu-security-features-design.md`.
 
 ## Decisions worth remembering
+
+- **Think like Freenet, scoped** (2026-09-18): take the small core, attested callers,
+  deny-by-default, secret-holding delegates, and content-addressed identity wholesale;
+  take the commutative-monoid state discipline **only** for state that crosses devices or
+  partitions. Kernel-arbitrated state (sched, mm, drivers, fs metadata) is not a monoid.
 
 - **Trust Limine's AP path over a hand-rolled trampoline** (2026-09-18). Same
   trust we already place in its BSP path; saved six unverifiable TCB rows and
