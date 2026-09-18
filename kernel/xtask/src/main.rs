@@ -428,6 +428,13 @@ const SCHED_AP_PREEMPTIVE_PREFIX: &str = "[sched] ap-preemptive: ";
 /// runtime, and got `hello, sentinelos` back through the inbox ring and the
 /// envelope codec with the kernel stamping `from` both ways.
 const COMP_HELLO_PREFIX: &str = "[comp] hello: ";
+/// SMP phase 3b-i: the core-independent monotonic clock. With the BSP's
+/// interrupts disabled the PIT must stand still while `kernel::clock::mono_ticks`
+/// advances (carried by the APs' LAPIC ticks), and with them enabled it must run
+/// at the PIT's rate.
+const CLOCK_MONO_PREFIX: &str = "[clock] mono: ";
+/// Every field the `[clock] mono:` line must carry, plus a trailing `ok`.
+const CLOCK_MONO_REQUIRED: &[&str] = &["pit-frozen=yes", "bsp-stalled-advance=yes", "rate-ok=yes"];
 /// Every field the `[comp] hello:` line must carry, plus a trailing `ok`.
 const COMP_HELLO_REQUIRED: &[&str] = &[
     "verified=yes",
@@ -1056,6 +1063,30 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // SMP phase 3b-i: the monotonic clock must keep running while the BSP is
+    // stalled with interrupts off (only another core can have advanced it), at
+    // least two cores must be feeding it, and it must track the PIT's rate.
+    let Some(clock_line) = log.lines().find(|l| l.contains(CLOCK_MONO_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: monotonic clock proof line '{}…' missing (did \
+             `kernel::clock::prove_mono` run?).",
+            CLOCK_MONO_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    let clock_ticking = parse_u64_after(clock_line, "ticking=").unwrap_or(0);
+    if CLOCK_MONO_REQUIRED.iter().any(|f| !clock_line.contains(f))
+        || clock_ticking < 2
+        || !clock_line.trim_end().ends_with(" ok")
+    {
+        eprintln!(
+            "TEST FAILED: the monotonic clock proof did not pass (expected {:?}, \
+             ticking>=2 and a trailing 'ok'): '{}'",
+            CLOCK_MONO_REQUIRED, clock_line
+        );
+        return ExitCode::FAILURE;
+    }
+
     // Component model PR-1: the hello component must verify, the wrong id must
     // be refused, and the reply must come back through the codec.
     let Some(comp_line) = log.lines().find(|l| l.contains(COMP_HELLO_PREFIX)) else {
@@ -1270,8 +1301,9 @@ fn boot_test(kvm: bool) -> ExitCode {
              the per-CPU scheduler proven ('{}'), the per-core LAPIC tick proven \
              ('{}'), vector tier active ('{}' with '{}' and '{}'), the cooperative \
              scheduler verdict ('{}'), the preemptive scheduler proof ('{}', \
-             preempted={}, gemm-iters={}, spin-iters={}), the component host proven \
-             ('{}'), and end-marker '{}' confirmed in serial output.",
+             preempted={}, gemm-iters={}, spin-iters={}), the monotonic clock proven \
+             ('{}'), the component host proven ('{}'), and end-marker '{}' confirmed \
+             in serial output.",
             smp_line,
             tracked,
             aps_ok,
@@ -1285,6 +1317,7 @@ fn boot_test(kvm: bool) -> ExitCode {
             preempted,
             gemm_iters,
             spin_iters,
+            clock_line,
             comp_line,
             END_MARKER
         );
