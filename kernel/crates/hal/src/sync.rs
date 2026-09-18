@@ -3,10 +3,14 @@
 //! `mm`'s global statics (the frame allocator and the kernel heap) and
 //! `kernel::sched`'s run-queue state (`hal::sync::SpinMutex<SchedState>`, see the
 //! scheduler design doc) both need interior mutability behind a `Sync` type so
-//! they can live in a `static` and be shared. At bring-up (and through the PR-A
-//! cooperative scheduler) the kernel is single-core, so this lock never actually
-//! spins; it exists to make the *types* `Sync` and to be correct if/when SMP
-//! arrives.
+//! they can live in a `static` and be shared. Since SMP phase 2 brought the
+//! application processors into the kernel this lock genuinely contends across
+//! cores (the heap allocator, the task table, and the console guard are all
+//! shared) — the `Acquire`/`Release` pairing below is what makes that sound.
+//! It never disables interrupts: a holder on one core that is interrupted by a
+//! handler wanting the same lock self-deadlocks, so every kernel lock is taken
+//! with interrupts already masked on the *local* core (see `kernel::sched`'s
+//! interrupt-flag discipline and the console guard in `crate::serial`).
 //!
 //! It is a tiny, self-contained implementation (no external `spin` crate) using
 //! [`AtomicBool`] compare-exchange. The only `unsafe` is forming the `&mut` to
@@ -60,6 +64,20 @@ impl<T> SpinMutex<T> {
             }
         }
         SpinGuard { mutex: self }
+    }
+
+    /// Try to acquire the lock without spinning: `Some(guard)` if it was free,
+    /// `None` if another holder has it right now.
+    ///
+    /// Lets a caller bound its own wait (the console guard spins a bounded
+    /// number of times and then proceeds anyway, so a fault report can never
+    /// deadlock behind a wedged holder). Uses the same `Acquire` on success as
+    /// [`lock`](Self::lock).
+    pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| SpinGuard { mutex: self })
     }
 }
 

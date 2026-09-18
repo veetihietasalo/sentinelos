@@ -419,6 +419,37 @@ pub fn halt() {
     }
 }
 
+/// Enable interrupts and halt **atomically** (`sti; hlt`) — the race-free idle
+/// step.
+///
+/// `sti` takes effect only after the *next* instruction, so an interrupt that
+/// is already pending is recognised **after** `hlt` has been entered and wakes
+/// the core immediately. Two separate calls ([`enable_interrupts`] then
+/// [`halt`]) leave a window between them in which a wake-up interrupt (an IPI
+/// telling this core it has work) could be taken *before* the `hlt`, and the
+/// core would then sleep through the wake-up it was waiting for. Application
+/// processors idle on this while they have nothing to run (`kernel::sched`).
+/// Returns once an interrupt has been serviced; interrupts are left enabled.
+#[cfg(target_os = "none")]
+#[inline]
+pub fn enable_interrupts_and_halt() {
+    // SAFETY: `sti` sets RFLAGS.IF and `hlt` idles the core until the next
+    // interrupt; the pair touches no memory or GP registers (`nomem`,
+    // `nostack`). It modifies IF, so `preserves_flags` is NOT set. Neither
+    // instruction can create UB — see `enable_interrupts` and `halt`; the only
+    // difference is that they are one asm block, which is what makes the
+    // interrupt shadow of `sti` cover the `hlt`.
+    unsafe {
+        asm!("sti", "hlt", options(nomem, nostack));
+    }
+}
+
+/// Host stub for [`enable_interrupts_and_halt`]: privileged on the host and
+/// never reached by tests; a no-op like the other interrupt-flag stubs.
+#[cfg(not(target_os = "none"))]
+#[inline]
+pub fn enable_interrupts_and_halt() {}
+
 /// Halt the CPU forever in a `hlt` loop and never return.
 ///
 /// This is the canonical "we are done / nothing left to do" terminator for the

@@ -18,6 +18,7 @@
 //! | 32     | IRQ0 PIT timer     | Bump the tick counter + EOI, then [`crate::sched::on_tick`] (PR-B: may switch away right here), then **return** (whichever task is now current resumes). |
 //! | 33     | IRQ1 PS/2 keyboard | Drain the scancode byte into the ring + EOI, then **return** (resumes). |
 //! | 44     | IRQ12 PS/2 mouse   | Drain a packet byte, reassemble the 3-byte packet into the ring + dual EOI, then **return** (resumes). |
+//! | 240    | Reschedule IPI     | LAPIC EOI, then [`crate::sched::on_resched_ipi`] (may switch this core to a newly placed task right here), then **return**. |
 //! | 255    | LAPIC spurious     | No-op **return** (a spurious interrupt owes no EOI); prevents a boot-halt once the LAPIC is software-enabled. |
 //!
 //! Vectors without a registered handler fall through to `hal`'s `default_handler`,
@@ -48,6 +49,12 @@ const VECTOR_MOUSE: u8 = hal::mouse::VECTOR_MOUSE;
 /// raised interrupt is de-asserted before the CPU acknowledges it; the correct
 /// response is to **return without an EOI** (see [`handle_spurious`]).
 const VECTOR_SPURIOUS: u8 = 0xFF;
+/// Vector 240 (`0xF0`): the **reschedule IPI**. `kernel::sched::spawn_on` places a
+/// task on another core's run queue and sends this vector to that core's LAPIC
+/// (`hal::apic::send_ipi`) so a core idling in `sti; hlt` wakes and picks the
+/// task up. Well above the PIC's 32–47 block and the NIC's PIC-derived vector,
+/// below the LAPIC spurious vector 255.
+pub const VECTOR_RESCHED_IPI: u8 = 0xF0;
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -238,6 +245,19 @@ fn handle_spurious(_frame: &InterruptFrame) {
     // Intentionally empty: no EOI, just resume.
 }
 
+/// Vector 240 — the reschedule IPI (SMP PR-2).
+///
+/// A LAPIC-delivered interrupt, so it **owes the LAPIC an EOI** (unlike the
+/// PIC-routed IRQs above, which EOI the PIC): acknowledge first, then hand to
+/// [`crate::sched::on_resched_ipi`], which may switch this core to the newly
+/// placed task right here at the ISR tail — exactly the `on_tick` pattern.
+/// When that task later exits, this core's idle task resumes *inside this
+/// handler* and returns through the ISR stub's `iretq` to its `sti; hlt` loop.
+fn handle_resched_ipi(_frame: &InterruptFrame) {
+    hal::apic::eoi();
+    crate::sched::on_resched_ipi();
+}
+
 // ── Public initialisation ─────────────────────────────────────────────────────
 
 /// Register CPU exception handlers and arm the GDT + TSS + IDT.
@@ -304,6 +324,9 @@ pub fn init_timer() {
     // live before `kmain` software-enables the Local APIC (x2APIC): a spurious
     // LAPIC interrupt must return without an EOI rather than halt the core.
     hal::interrupts::set_handler(VECTOR_SPURIOUS, handle_spurious as Handler);
+    // Register the reschedule-IPI handler now too: `kmain` releases the
+    // application processors after this, and the first IPI must find a handler.
+    hal::interrupts::set_handler(VECTOR_RESCHED_IPI, handle_resched_ipi as Handler);
 
     // Remap the 8259A pair to vectors 32–47 (every line masked), then program
     // PIT channel 0 to ~100 Hz, then open IRQ0 (timer) and IRQ1 (keyboard).

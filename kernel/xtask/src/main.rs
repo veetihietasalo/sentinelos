@@ -391,6 +391,18 @@ const SMP_ONLINE_PREFIX: &str = "[smp] online=";
 /// Substring of a per-AP failure line (`[smp] cpuN FAILED to start (timeout …)`
 /// or `[smp] cpuN NOT started (…)`) — any occurrence fails the boot test.
 const SMP_AP_FAILED_MARKERS: [&str; 2] = ["FAILED to start", "NOT started"];
+/// Prefix of the SMP PR-2 **per-CPU scheduler** boot-proof line written by
+/// `kernel::sched::prove_pinned`: `[sched] pinned: target=cpuN ran-on=cpuN
+/// bsp=cpu0 distinct=yes ok`. The BSP placed a task on an application processor
+/// (`spawn_on`), sent it a reschedule IPI, and the task recorded — from its own
+/// `cpuid` APIC ID — which core it actually ran on. The boot test requires the
+/// line to carry [`SCHED_PINNED_DISTINCT_OK`] and end in `ok`: the task ran on
+/// the targeted core, and that core is not the BSP. Runs under TCG (xAPIC MMIO
+/// IPIs) and KVM (x2APIC IPIs) alike.
+const SCHED_PINNED_PREFIX: &str = "[sched] pinned: ";
+/// The field of the pinned-proof line asserting the task ran on a core other
+/// than the BSP.
+const SCHED_PINNED_DISTINCT_OK: &str = "distinct=yes";
 /// The `[ml]` `active=` values that mean a *vector* tier is live — a real SIMD
 /// int8-GEMM kernel runs (its boot self-test passed), not the scalar fallback. We
 /// accept **any** implemented vector tier because the runner fleet is heterogeneous:
@@ -948,6 +960,26 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // SMP PR-2: the per-CPU scheduler must have run a task on an application
+    // processor via a reschedule IPI, and that task must report the targeted
+    // core — not the BSP — as the one it ran on.
+    let Some(pinned_line) = log.lines().find(|l| l.contains(SCHED_PINNED_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: per-CPU scheduler proof line '{}…' missing (did \
+             `kernel::sched::prove_pinned` run?).",
+            SCHED_PINNED_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    if !pinned_line.contains(SCHED_PINNED_DISTINCT_OK) || !pinned_line.trim_end().ends_with("ok") {
+        eprintln!(
+            "TEST FAILED: the pinned task did not run on the targeted application \
+             processor (expected '{}' and a trailing 'ok'): '{}'",
+            SCHED_PINNED_DISTINCT_OK, pinned_line
+        );
+        return ExitCode::FAILURE;
+    }
+
     // A vector int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is a
     // real SIMD kernel — proving the hand-written `asm!` kernels execute and compute
     // correctly. `-cpu Haswell` (TCG) exposes avx2; `-cpu host` (KVM) exposes avx2
@@ -1112,7 +1144,8 @@ fn boot_test(kvm: bool) -> ExitCode {
         println!(
             "KVM TEST PASSED: x2APIC ENABLE path proven — '{}' with '{}' — SMP \
              phase 2 proven ('{}': all {} CPUs online, {} APs GEMM-verified on \
-             their own cores), a vector int8-GEMM tier verified active ('{}' with \
+             their own cores), the per-CPU scheduler proven ('{}'), a vector \
+             int8-GEMM tier verified active ('{}' with \
              '{}' and '{}' in the [ml] lines), the cooperative scheduler verdict \
              ('{}'), the preemptive scheduler proof ('{}', preempted={}, \
              gemm-iters={}, spin-iters={}), plus banner + end-marker '{}'.",
@@ -1121,6 +1154,7 @@ fn boot_test(kvm: bool) -> ExitCode {
             smp_line,
             tracked,
             aps_ok,
+            pinned_line,
             active_tier,
             ML_GEMM_OK,
             ML_TFB_OK,
@@ -1135,13 +1169,15 @@ fn boot_test(kvm: bool) -> ExitCode {
         println!(
             "TEST PASSED: full banner, SMP bring-up line, SMP phase 2 proven \
              ('{}': all {} CPUs online, {} APs GEMM-verified on their own cores), \
-             vector tier active ('{}' with '{}' and '{}'), the cooperative \
+             the per-CPU scheduler proven ('{}'), vector tier active ('{}' with \
+             '{}' and '{}'), the cooperative \
              scheduler verdict ('{}'), the preemptive scheduler proof ('{}', \
              preempted={}, gemm-iters={}, spin-iters={}), and end-marker '{}' \
              confirmed in serial output.",
             smp_line,
             tracked,
             aps_ok,
+            pinned_line,
             active_tier,
             ML_GEMM_OK,
             ML_TFB_OK,

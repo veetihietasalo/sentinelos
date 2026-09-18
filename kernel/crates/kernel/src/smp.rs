@@ -33,8 +33,9 @@
 
 use alloc::vec::Vec;
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
+use hal::apic::{LapicInfo, LapicMode};
 pub use hal::smp::MAX_CPUS;
 use hal::smp::{ApInfo, CpuDesc, StartError};
 
@@ -57,9 +58,9 @@ pub struct PerCpu {
     /// Set (`Release`) by the CPU itself once it is running kernel code; every
     /// other AP-written field below is published by this store.
     online: AtomicBool,
-    /// The core's LAPIC is in x2APIC mode (BSP: `apic::enable_bsp`; AP:
-    /// `apic::enable_ap`). `false` under QEMU TCG.
-    x2apic: AtomicBool,
+    /// How the core's LAPIC is reached: `0` = none, `1` = xAPIC (MMIO, QEMU
+    /// TCG), `2` = x2APIC (MSRs). Set from `apic::enable_bsp` / `enable_ap`.
+    lapic_mode: AtomicU8,
     /// `hal::simd::enable` succeeded on this core (vector state on, save contract
     /// verified). `false` ⇒ this core runs scalar tiers only.
     simd: AtomicBool,
@@ -75,7 +76,7 @@ impl PerCpu {
         Self {
             lapic_id: AtomicU32::new(0),
             online: AtomicBool::new(false),
-            x2apic: AtomicBool::new(false),
+            lapic_mode: AtomicU8::new(0),
             simd: AtomicBool::new(false),
             gemm_ok: AtomicBool::new(false),
             lapic_match: AtomicBool::new(false),
@@ -94,10 +95,23 @@ impl PerCpu {
         self.online.load(Ordering::Acquire)
     }
 
-    /// Whether this CPU's LAPIC is in x2APIC mode.
+    /// How this CPU's LAPIC is reached, or `None` if it has no access path.
     #[must_use]
-    pub fn x2apic(&self) -> bool {
-        self.x2apic.load(Ordering::Relaxed)
+    pub fn lapic_mode(&self) -> Option<LapicMode> {
+        match self.lapic_mode.load(Ordering::Relaxed) {
+            1 => Some(LapicMode::XApic),
+            2 => Some(LapicMode::X2Apic),
+            _ => None,
+        }
+    }
+
+    fn set_lapic_mode(&self, mode: Option<LapicMode>) {
+        let code = match mode {
+            None => 0,
+            Some(LapicMode::XApic) => 1,
+            Some(LapicMode::X2Apic) => 2,
+        };
+        self.lapic_mode.store(code, Ordering::Relaxed);
     }
 
     /// Whether vector state is enabled (and verified) on this CPU.
@@ -148,6 +162,13 @@ pub fn cpus() -> &'static [PerCpu] {
 #[must_use]
 pub fn by_index(index: u32) -> Option<&'static PerCpu> {
     cpus().get(index as usize)
+}
+
+/// The local APIC ID of the CPU at dense index `cpu`, if tracked — the IPI
+/// destination `kernel::sched::spawn_on` uses to wake that core.
+#[must_use]
+pub fn lapic_id_of(cpu: u32) -> Option<u32> {
+    by_index(cpu).map(PerCpu::lapic_id)
 }
 
 /// The dense index of the **calling** core, by matching its `cpuid` APIC ID
@@ -235,7 +256,7 @@ pub(crate) fn plan(descs: &[CpuDesc], bsp_lapic_fallback: u32) -> BringUpPlan {
 /// Serial output (all from the BSP):
 ///
 /// ```text
-/// [smp] cpu1 online: apic-id=1 lapic-match=yes x2apic=no simd=yes gemm=ok
+/// [smp] cpu1 online: apic-id=1 lapic-match=yes lapic=xapic simd=yes gemm=ok
 /// [smp] cpu2 FAILED to start (timeout 100 ticks): apic-id=2
 /// [smp] online=4/4 bsp-apic-id=0 aps-ok=3 aps-failed=0 skipped=0
 /// ```
@@ -248,9 +269,11 @@ pub fn bring_up_aps() {
 
     // The BSP's own record: it is trivially online; mirror its LAPIC mode and
     // vector state, and run the same GEMM proof it will demand of every AP.
-    CPUS[0]
-        .x2apic
-        .store(hal::apic::id().is_some(), Ordering::Relaxed);
+    CPUS[0].set_lapic_mode(if hal::apic::id().is_some() {
+        Some(LapicMode::X2Apic)
+    } else {
+        None
+    });
     CPUS[0]
         .simd
         .store(hal::cpu::osxsave_enabled(), Ordering::Relaxed);
@@ -317,8 +340,12 @@ pub fn bring_up_aps() {
             hal::serial::write_dec(u64::from(cpu.lapic_id()));
             hal::serial::write_str(" lapic-match=");
             hal::serial::write_str(yes_no(cpu.lapic_matches()));
-            hal::serial::write_str(" x2apic=");
-            hal::serial::write_str(yes_no(cpu.x2apic()));
+            hal::serial::write_str(" lapic=");
+            hal::serial::write_str(match cpu.lapic_mode() {
+                Some(LapicMode::X2Apic) => "x2apic",
+                Some(LapicMode::XApic) => "xapic",
+                None => "none",
+            });
             hal::serial::write_str(" simd=");
             hal::serial::write_str(yes_no(cpu.simd_enabled()));
             hal::serial::write_str(" gemm=");
@@ -391,16 +418,18 @@ fn start_error_label(err: StartError) -> &'static str {
 ///
 /// Records the HAL's report, proves the int8 GEMM **on this core** (through the
 /// vector tiers only if this core's vector state is on — otherwise only if the
-/// active tier is already scalar), publishes `online` (which releases every field
-/// written above to the BSP), enables interrupts, and parks in `hlt`. The AP
-/// receives no interrupts yet (LINT0 masked, no IOAPIC, no LAPIC timer), so it
-/// sleeps until PR-2's per-CPU scheduler gives it work.
+/// active tier is already scalar), adopts itself as this core's scheduler idle
+/// task (`sched::init_ap`), publishes `online` (which releases every field
+/// written above to the BSP), and enters the per-CPU idle loop
+/// (`sched::ap_idle_loop`: reap, `sti; hlt`). The AP receives only reschedule
+/// IPIs (LINT0 masked, no IOAPIC, no LAPIC timer yet), so it sleeps until the
+/// BSP places a task on it.
 ///
-/// **Invariant:** this is the AP's first `sti`, and this function is reachable
-/// only through `hal::smp::ap_entry`, which ran `simd::enable` (setting
-/// `CR4.OSXSAVE`) before calling here — so the per-IRQ vector save can never
-/// execute on a core without vector state (and `isr_common` checks the live bit
-/// regardless).
+/// **Invariant:** the AP's first `sti` is inside `ap_idle_loop`, and this
+/// function is reachable only through `hal::smp::ap_entry`, which ran
+/// `simd::enable` (setting `CR4.OSXSAVE`) before calling here — so the per-IRQ
+/// vector save can never execute on a core without vector state (and
+/// `isr_common` checks the live bit regardless).
 fn ap_main(info: ApInfo) -> ! {
     let Some(cpu) = by_index(info.cpu_index) else {
         // Unknown slot: the BSP never handed out this index. Nothing to report
@@ -412,20 +441,27 @@ fn ap_main(info: ApInfo) -> ! {
         cpu.lapic_id() == info.lapic_id && own_apic == info.lapic_id,
         Ordering::Relaxed,
     );
-    cpu.x2apic
-        .store(info.x2apic_id.is_some(), Ordering::Relaxed);
+    cpu.set_lapic_mode(info.lapic.map(|l: LapicInfo| l.mode));
     cpu.simd.store(info.simd_enabled, Ordering::Relaxed);
     let can_run_active_tier = info.simd_enabled || matches!(ml::active_tier(), ml::Tier::Scalar);
     cpu.gemm_ok.store(
         can_run_active_tier && ml::gemm_proof_ok(),
         Ordering::Relaxed,
     );
+
+    // Adopt this control flow as the core's idle task BEFORE publishing
+    // `online`: `online` is what tells `sched::spawn_on` this core can take
+    // work, and work arrives as a reschedule IPI that expects a run queue with
+    // an idle to switch away from.
+    if crate::sched::init_ap(info.cpu_index).is_none() {
+        hal::cpu::halt_loop();
+    }
     cpu.online.store(true, Ordering::Release);
 
-    hal::cpu::enable_interrupts();
-    loop {
-        hal::cpu::halt();
-    }
+    // The per-CPU idle: reap what exited here, then `sti; hlt` until the next
+    // IPI (there is no timer on an AP yet — phase 3). The first `sti` on this
+    // core happens inside that loop.
+    crate::sched::ap_idle_loop()
 }
 
 // ── host tests ────────────────────────────────────────────────────────────────

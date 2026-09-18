@@ -8,14 +8,22 @@
 //!
 //! # Concurrency model
 //!
-//! At bring-up the kernel is single-core and runs with interrupts effectively
-//! disabled on the boot path, so contention is minimal. To keep the global
-//! writer sound without pulling in an external `spin`/atomics crate, every write
-//! through the global console is performed with maskable interrupts disabled for
-//! the duration of the write and the prior interrupt state restored afterwards
-//! (see `with_console`). This prevents an interrupt handler from re-entering
-//! the UART mid-byte and interleaving output. It is **not** a multi-core lock;
-//! SMP synchronisation is a sub-project #2 concern.
+//! Every write through the global console runs inside `with_console`, which
+//! (1) masks maskable interrupts on the calling core for the duration of the
+//! write and restores the prior state afterwards — so an interrupt handler on
+//! the same core can never re-enter the UART mid-byte — and (2), since SMP
+//! phase 2 put every core in the kernel, holds a cross-core spinlock
+//! ([`crate::sync::SpinMutex`], `CONSOLE_LOCK`) around the write, so two cores
+//! cannot interleave bytes. The lock is taken **after** interrupts are masked
+//! (a holder can never be interrupted by a handler wanting the same lock on its
+//! own core — the self-deadlock every kernel lock here avoids the same way).
+//!
+//! The wait is **bounded**: a caller spins at most `CONSOLE_LOCK_SPIN_LIMIT`
+//! iterations and then writes anyway. The console is the fault-report channel
+//! of last resort — a `#DF`/`#GP` handler that found the lock held by a core
+//! that will never release it (wedged, halted mid-print) must still get its
+//! report out; a garbled line beats a silent machine. The limit is far above
+//! any real print's duration, so under normal operation it never trips.
 
 // Only the bare-metal `inb`/`outb`/`interrupts_enabled` bodies use inline asm; the
 // host stubs (`not(target_os = "none")`) do not, so this import is bare-metal-only
@@ -229,6 +237,16 @@ impl Write for Serial {
 /// provides by masking interrupts for the duration of each write.
 static CONSOLE: Serial = Serial::com1();
 
+/// Cross-core mutual exclusion for the console (see the module docs'
+/// concurrency model). Guards nothing but the *right to write*: `Serial` is a
+/// zero-sized port handle, so the lock carries `()`.
+static CONSOLE_LOCK: crate::sync::SpinMutex<()> = crate::sync::SpinMutex::new(());
+
+/// Bounded wait for [`CONSOLE_LOCK`] before a caller proceeds without it. A
+/// full boot-proof line is a few hundred UART bytes at ~µs each; this is
+/// orders of magnitude above that, so only a wedged holder ever trips it.
+const CONSOLE_LOCK_SPIN_LIMIT: u32 = 4_000_000;
+
 /// Initialise the global COM1 console.
 ///
 /// Call this **once**, early on the boot path, before the first
@@ -277,17 +295,32 @@ pub(crate) fn interrupts_enabled() -> bool {
     false
 }
 
-/// Run `f` with maskable interrupts disabled, restoring the previous interrupt
-/// state afterwards.
+/// Run `f` with maskable interrupts disabled on this core **and** the
+/// cross-core [`CONSOLE_LOCK`] held (bounded wait), restoring the previous
+/// interrupt state afterwards.
 ///
-/// This is the global console's "no interleaving" guard: it ensures a print
-/// cannot be re-entered by an interrupt handler that also prints. The previous
+/// This is the global console's "no interleaving" guard: interrupts are masked
+/// first so a handler on this core cannot re-enter the UART (or contend for
+/// the lock this core holds); then the lock keeps other cores out. The previous
 /// `IF` state is saved before masking and re-enabled only if it had been set,
-/// so callers that already ran with interrupts disabled stay disabled.
+/// so callers that already ran with interrupts disabled stay disabled. If the
+/// lock is not obtained within [`CONSOLE_LOCK_SPIN_LIMIT`] spins, the write
+/// proceeds unlocked (see the module docs for why a fault report must never
+/// deadlock here).
 fn with_console<R>(f: impl FnOnce(Serial) -> R) -> R {
     let were_enabled = interrupts_enabled();
     crate::cpu::disable_interrupts();
+    let mut guard = None;
+    let mut spins: u32 = 0;
+    while guard.is_none() && spins < CONSOLE_LOCK_SPIN_LIMIT {
+        guard = CONSOLE_LOCK.try_lock();
+        if guard.is_none() {
+            core::hint::spin_loop();
+            spins += 1;
+        }
+    }
     let result = f(CONSOLE);
+    drop(guard);
     if were_enabled {
         crate::cpu::enable_interrupts();
     }

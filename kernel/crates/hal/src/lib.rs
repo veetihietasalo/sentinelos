@@ -52,10 +52,12 @@
 //! - [`mm`] — memory management: the physical frame allocator, virtual page
 //!   mapping over Limine's paging, and the kernel heap behind a
 //!   `#[global_allocator]` ([`mm::init`], [`mm::LockedHeap`]).
-//! - [`apic`] — the Local APIC in x2APIC / virtual-wire mode: [`apic::enable_bsp`]
-//!   for the boot core, [`apic::enable_ap`] for each application processor
-//!   (LINT0 masked — only the BSP fronts the PIC), and [`apic::cpuid_apic_id`]
-//!   to identify the calling core in any LAPIC mode.
+//! - [`apic`] — the Local APIC in virtual-wire mode, reached over x2APIC MSRs
+//!   or (QEMU TCG) an uncached xAPIC MMIO mapping: [`apic::enable_bsp`] for the
+//!   boot core, [`apic::enable_ap`] for each application processor (LINT0
+//!   masked — only the BSP fronts the PIC), [`apic::send_ipi`] / [`apic::eoi`]
+//!   for the per-CPU scheduler's cross-core wake-ups, and
+//!   [`apic::cpuid_apic_id`] to identify the calling core in any LAPIC mode.
 //! - [`smp`] — application-processor bring-up over the Limine MP protocol:
 //!   [`smp::cpus`] enumerates the firmware's CPUs, [`smp::set_ap_main`] +
 //!   [`smp::start_cpu`] release a parked AP into the sealed `ap_entry` sequence
@@ -113,6 +115,10 @@
 //! - [`apic::cpuid_apic_id`] — the calling core's APIC ID (any LAPIC mode), for
 //!   `kernel::smp`'s per-CPU lookup.
 //! - [`cpu::osxsave_enabled`] — live per-core `CR4.OSXSAVE` read.
+//! - [`cpu::enable_interrupts_and_halt`] — race-free `sti; hlt` idle step.
+//! - [`apic::send_ipi`] / [`apic::eoi`] / [`apic::LapicInfo`] / [`apic::LapicMode`]
+//!   — the per-CPU scheduler's IPI wake-up path.
+//! - [`sync::SpinMutex::try_lock`] — bounded-wait locking (the console guard).
 
 #![no_std]
 // `unsafe` is permitted in this crate (and only this crate), but it must always

@@ -86,9 +86,10 @@ pub struct ApInfo {
     /// Whether [`crate::simd::enable`] succeeded on this core (vector state on and
     /// its save contract verified). `false` ⇒ this core must stay on scalar tiers.
     pub simd_enabled: bool,
-    /// This core's x2APIC ID if [`crate::apic::enable_ap`] switched it into x2APIC
-    /// mode; `None` where x2APIC is not advertised (QEMU TCG).
-    pub x2apic_id: Option<u32>,
+    /// How [`crate::apic::enable_ap`] reached this core's LAPIC (x2APIC MSRs, or
+    /// the shared xAPIC MMIO page under QEMU TCG) and the ID it read back;
+    /// `None` only if no LAPIC access path exists at all.
+    pub lapic: Option<crate::apic::LapicInfo>,
 }
 
 /// The kernel-side AP main: never returns (the AP parks or schedules forever).
@@ -228,9 +229,10 @@ unsafe extern "C" fn ap_entry(cpu: &Cpu) -> ! {
     // check + tier self-tests. Must precede any interrupt on this core (the
     // kernel `sti`s only after we return control to it) and any GEMM on it.
     let simd_enabled = crate::simd::enable();
-    // (4) This core's LAPIC into x2APIC mode (LINT0 masked — only the BSP fronts
-    // the PIC); a no-op `None` where x2APIC is not advertised.
-    let x2apic_id = crate::apic::enable_ap();
+    // (4) This core's LAPIC: software-enabled (so reschedule IPIs reach it) with
+    // LINT0 masked — only the BSP fronts the PIC. x2APIC where advertised, else
+    // through the MMIO page the BSP mapped in `enable_bsp`.
+    let lapic = crate::apic::enable_ap();
 
     // (5) Hand off to the safe kernel. `start_cpu` refused to release us while
     // `AP_MAIN` was null, so it is set; park defensively if not.
@@ -248,6 +250,6 @@ unsafe extern "C" fn ap_entry(cpu: &Cpu) -> ! {
         cpu_index,
         lapic_id,
         simd_enabled,
-        x2apic_id,
+        lapic,
     })
 }
