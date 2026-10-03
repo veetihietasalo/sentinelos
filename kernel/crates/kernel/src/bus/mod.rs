@@ -541,17 +541,6 @@ impl<R: ComponentRuntime> Host<R> {
         };
         let expires = match d.ttl {
             None => parent.expires,
-            // Dead on arrival: refuse it rather than install it and notify.
-            Some(0) => {
-                return Err(self.refuse(
-                    now,
-                    actor.0,
-                    actor.1,
-                    cap,
-                    Action::Delegate,
-                    DenyReason::Malformed,
-                ));
-            }
             Some(t) => Some(now.saturating_add(t)),
         };
         // The child is over the parent's target; anything else would fail `⊑`.
@@ -577,6 +566,19 @@ impl<R: ComponentRuntime> Host<R> {
                 Some(reason) => self.refuse(now, actor.0, actor.1, cap, Action::Delegate, reason),
                 None => BusError::Busy,
             });
+        }
+        // Dead on arrival (`ttl = 0`): refuse it rather than install it and
+        // notify — after the authority checks, so a delegator refused for
+        // authority is logged with that reason, and before any state change.
+        if d.ttl == Some(0) {
+            return Err(self.refuse(
+                now,
+                actor.0,
+                actor.1,
+                cap,
+                Action::Delegate,
+                DenyReason::Malformed,
+            ));
         }
         if self.inbox_full(r) {
             return Err(BusError::Busy);

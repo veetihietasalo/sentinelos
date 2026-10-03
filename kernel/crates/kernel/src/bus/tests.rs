@@ -5,11 +5,13 @@
 use super::*;
 use crate::cap::deny::{Action, DenyRecord};
 use crate::cap::table::{GEN_MAX, MAX_CAPS};
-use crate::cap::{Attenuation, CapIndex, Capability, DenyReason, Op, OpSet, Target};
+use crate::cap::{
+    Attenuation, CapIndex, CapNeed, CapRequest, Capability, DenyReason, Op, OpSet, Target,
+};
 use crate::host::codec::{Envelope, Kind, Sender};
 use crate::host::native::{NativeRuntime, BOOT_POLICY, REGISTRY};
 use crate::host::probe::{self, Args, ALICE_ID, BOB_ID, CAROL_ID};
-use crate::host::{Host, InstanceId, InstantiateError, MAX_INBOX, MAX_INSTANCES};
+use crate::host::{Host, InstanceId, InstantiateError, Manifest, MAX_INBOX, MAX_INSTANCES};
 use hal::sync::SpinMutex;
 
 type Cell = SpinMutex<Host<NativeRuntime>>;
@@ -473,6 +475,31 @@ fn a_delegation_dead_on_arrival_is_refused() {
     );
     assert_eq!(h.caps().live_count(cs), 0, "nothing installed");
     assert_eq!(h.inbox_len(w.carol), Some(0), "nobody notified");
+    // Authority is judged first: a delegator without `Delegate` asking for a
+    // dead-on-arrival child is logged as not delegable, not as malformed.
+    h.delegate_from(
+        w.alice,
+        w.a_bob,
+        w.a_carol,
+        &delegation(&[Op::Send], 8, None),
+        7,
+    )
+    .unwrap();
+    let Kind::Grant { granted: c_bob } = pop(h, w.carol).unwrap().kind else {
+        panic!()
+    };
+    assert_eq!(
+        h.delegate_from(
+            w.carol,
+            c_bob,
+            c_bob,
+            &delegation(&[Op::Send], 8, Some(0)),
+            7
+        ),
+        Err(BusError::Denied)
+    );
+    assert_eq!(last_deny(h).reason, DenyReason::NotDelegable);
+    assert_eq!(h.inbox_len(w.bob), Some(0), "nobody notified");
 }
 
 #[test]
@@ -663,6 +690,59 @@ fn grants_that_do_not_fit_are_refused_before_anything_changes() {
             (Action::Grant, DenyReason::MissingRequired)
         );
     }
+    // Nothing was claimed, not even an id: the next instance gets the id
+    // the refused one would have had (bob is 1, carol 2).
+    assert_eq!(
+        instantiate(&cell, &probe::BOB_MANIFEST),
+        Ok(InstanceId(3)),
+        "the refused start consumed no InstanceId"
+    );
+}
+
+#[test]
+fn required_grants_get_the_room_before_optional_ones() {
+    // alice's two requests, the optional one listed first.
+    static OPTIONAL_FIRST: [CapRequest; 2] = [
+        CapRequest {
+            target: CAROL_ID,
+            ops: OpSet::of(&[Op::Send]),
+            attenuation: Attenuation::UNRESTRICTED_MESSAGE,
+            need: CapNeed::Optional,
+        },
+        CapRequest {
+            target: BOB_ID,
+            ops: OpSet::of(&[Op::Send, Op::Request, Op::Delegate]),
+            attenuation: Attenuation::UNRESTRICTED_MESSAGE,
+            need: CapNeed::Required,
+        },
+    ];
+    let reordered = Manifest {
+        caps: &OPTIONAL_FIRST,
+        ..probe::ALICE_MANIFEST
+    };
+    let cell = fresh();
+    let bob = instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    let _carol = instantiate(&cell, &probe::CAROL_MANIFEST).unwrap();
+    // One usable slot: it goes to the required request, not the first one.
+    retire_all_but(&mut cell.lock(), 2, 1);
+    let alice = instantiate(&cell, &reordered).unwrap();
+    let h = cell.lock();
+    assert_eq!(h.cap_count(alice), 1);
+    assert_eq!(
+        h.granted(alice, 0),
+        None,
+        "the optional request got no room"
+    );
+    let to_bob = h
+        .granted(alice, 1)
+        .expect("the required request was granted");
+    assert_eq!(
+        h.caps().get(slot(&h, alice), to_bob).unwrap().cap.target,
+        Target::Instance(bob)
+    );
+    let r = last_deny(&h);
+    assert_eq!(r.holder, who(alice, ALICE_ID));
+    assert_eq!((r.action, r.reason), (Action::Grant, DenyReason::TableFull));
 }
 
 #[test]

@@ -58,8 +58,8 @@ shared state — we adopt them **only** for state that genuinely crosses devices
 ## 3. Vocabulary
 
 - **Component** — a sandboxed unit of code plus its instantiation parameters, identified by a
-  [`ComponentId`](#6-identity) = hash(code ‖ params). Three kinds: **state object**,
-  **delegate**, **UI**.
+  [`ComponentId`](#6-identity) = hash(code ‖ params) (v2 adds the declarations, A12 — PR-2b).
+  Three kinds: **state object**, **delegate**, **UI**.
 - **Service** — a capability the safe kernel exports natively (compute/GEMM, compositor surface,
   storage, network socket, clock, randomness, integrity vectors). Services are the *only* path
   to hardware.
@@ -87,10 +87,10 @@ shared state — we adopt them **only** for state that genuinely crosses devices
 3. **Secrets never cross a boundary.** Keys and tokens live in delegates; requests get
    signatures, plaintexts, or decisions back — never the material. The secrets store is
    readable only by the owning delegate instance. (Proof: PR-3.)
-4. **Components are what they hash to.** `ComponentId = H(code ‖ params)`. The host verifies
-   the hash of the bytes it is about to run against the id it was asked for. Two instances
-   with the same id run the same code with the same parameters; state is per instance.
-   (Proof: PR-1.)
+4. **Components are what they hash to.** `ComponentId = H(code ‖ params)` (v2 adds the
+   declarations, A12 — PR-2b). The host verifies the hash of the bytes it is about to run
+   against the id it was asked for. Two instances with the same id run the same code with the
+   same parameters; state is per instance. (Proof: PR-1.)
 5. **State objects validate themselves.** No one, including the kernel, mutates a state
    object's bytes except through its own `update`, which rejects invalid transitions.
    Mergeable objects additionally satisfy `merge(a, b) == merge(b, a)`,
@@ -210,10 +210,12 @@ pub struct Sender { pub instance: InstanceId, pub component: ComponentId }
 - **Request/reply** carries a `reply_tag`; the reply travels back over a one-shot reply
   capability the host mints for that request and revokes on use or timeout. Timeouts are the
   requester's concern; the host never fabricates a reply. **Silence is denial.** *(As shipped
-  in PR-2: freed on use. Once expired it is refused, and its slot is reclaimed — with every
-  other expired capability in the responder's table — exactly when that table reaches either
-  capacity limit, no free slot or 4 reply rights pending, on the next request or authorised
-  delegation to it, and when a late answer presents it; threat model T-REP-1, T-DOS-2.)*
+  in PR-2: freed on use, or when the responder releases it, declining to answer. Once expired it
+  is refused, and its slot is reclaimed together with every other expired capability in the
+  responder's table when the next request to the responder finds either capacity limit
+  reached — no free slot, or 4 reply rights pending — or when an authorised delegation to the
+  responder finds its table **full**; on its own when the responder releases it or a late answer
+  presents it; threat model T-REP-1, T-DOS-2.)*
 - **Delivery** is by the scheduler: a component instance is a pinned task (`spawn_on`); an
   inbox push wakes it exactly like the reschedule IPI wakes a core today. Cross-core delivery
   reuses that path unchanged. *(Superseded at PR-2 by run-to-completion dispatch; measurement
@@ -297,8 +299,9 @@ static CAP_TABLES: [SpinMutex<CapTable>; MAX_INSTANCES];   // fixed slab, kernel
   equal*, never amplified. The host enforces `ops' ⊆ ops` and `attenuation' ⊑ attenuation`.
 - **Revoke**: a grantor may revoke what it delegated; expiry is a tick. Revocation cascades
   through the delegation tree the host records.
-- Components see `CapIndex`, an opaque `u32` valid only in their own table. Forgery is
-  structurally impossible: the table lives in the kernel and indices are checked on use.
+- Components see `CapIndex`, an opaque `u32` (u64 from PR-2b, A13) valid only in their own
+  table. Forgery is structurally impossible: the table lives in the kernel and indices are
+  checked on use.
 - Kani targets: "no capability exists in a table that was not produced by `grant` or by an
   attenuating `delegate`" over a bounded sequence of operations — the analogue of the
   scheduler's Invariant #4 proof.
@@ -761,6 +764,7 @@ fabricated reply). Dispositions:
 | R15 | The boot proof's `rate_limited` field relies on carol's bucket not refilling during the burst (a timing margin, ample on TCG today) | follow-up |
 | R16 | `envelope_codec_round_trips_bounded` takes 81.6 s locally (49.7 s in CI), with or without `Grant` | accepted with this note; verification-engineer may cut its payload bound from 4 to 3 |
 | R17 | T-MAN-1: bind manifest capability declarations into `ComponentId` | **decided: A12** (v2 framing, records name services; PR-2b) |
+| R18 | Re-review note: the component source guard checks all of `host/native.rs`, which also holds the runtime | follow-up: if PR-3's runtime ever needs `Host` in `host/native.rs`, move the `hello` component into `components/` rather than loosening the guard |
 
 ## 20. References
 

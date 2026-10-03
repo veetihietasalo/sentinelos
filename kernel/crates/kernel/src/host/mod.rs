@@ -480,8 +480,10 @@ impl<R: ComponentRuntime> Host<R> {
     /// 1. a free instance slot is found (not yet claimed);
     /// 2. every capability request is resolved against the live instances,
     ///    the policy **and the room in that slot's table** — retired slots
-    ///    never come back (threat T-CAP-2) — in manifest order; a `Required`
-    ///    one that cannot be granted refuses here (logged, amendment A8);
+    ///    never come back (threat T-DOS-5) — the `Required` ones first, so an
+    ///    `Optional` one can never take the room a `Required` one needs; a
+    ///    `Required` one that cannot be granted refuses here (logged,
+    ///    amendment A8);
     /// 3. the slot and the runtime are claimed;
     /// 4. the grants are installed (`request ∧ policy`) in the instance's own
     ///    table and their indices recorded in manifest order; refused
@@ -507,31 +509,40 @@ impl<R: ComponentRuntime> Host<R> {
             instance: InstanceId::KERNEL,
             component: m.id,
         };
+        // Every planned grant takes one usable slot. The room is handed out
+        // to the `Required` requests first, then the `Optional` ones; the
+        // grants still install in manifest order (`granted(i)` is by it), and
+        // all of them fit, whatever that order, since none was planned
+        // without a slot.
         let mut room = self.caps.usable_slots(slot);
         let mut plan: [Result<(Capability, Capability), DenyReason>; MAX_MANIFEST_CAPS] =
             [Err(DenyReason::NotHeld); MAX_MANIFEST_CAPS];
-        for (i, req) in m.caps.iter().enumerate() {
-            let mut planned = self.plan_grant(&m.id, req, now);
-            if planned.is_ok() {
-                // Grants install in manifest order, one usable slot each.
-                if room == 0 {
-                    planned = Err(DenyReason::TableFull);
-                } else {
-                    room -= 1;
+        for need in [CapNeed::Required, CapNeed::Optional] {
+            for (i, req) in m.caps.iter().enumerate() {
+                if req.need != need {
+                    continue;
                 }
+                let mut planned = self.plan_grant(&m.id, req, now);
+                if planned.is_ok() {
+                    if room == 0 {
+                        planned = Err(DenyReason::TableFull);
+                    } else {
+                        room -= 1;
+                    }
+                }
+                if planned.is_err() && need == CapNeed::Required {
+                    self.deny.record(
+                        now,
+                        UNBOUND_BUCKET,
+                        unborn,
+                        CapIndex::KERNEL,
+                        Action::Grant,
+                        DenyReason::MissingRequired,
+                    );
+                    return Err(InstantiateError::MissingRequiredCap);
+                }
+                plan[i] = planned;
             }
-            if planned.is_err() && req.need == CapNeed::Required {
-                self.deny.record(
-                    now,
-                    UNBOUND_BUCKET,
-                    unborn,
-                    CapIndex::KERNEL,
-                    Action::Grant,
-                    DenyReason::MissingRequired,
-                );
-                return Err(InstantiateError::MissingRequiredCap);
-            }
-            plan[i] = planned;
         }
 
         let handle = self.runtime.instantiate(m.code, m.params)?;
