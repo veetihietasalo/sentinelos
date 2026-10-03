@@ -1046,7 +1046,13 @@ fn cpu_is_schedulable(cpu: u32) -> bool {
 /// failure is logged over serial and the task is simply never registered.
 pub fn spawn(name: &'static str, entry: fn()) -> TaskId {
     let id = next_task_id();
-    if let Err(err) = spawn_with_id(id, local_cpu() as u32, name, entry) {
+    if let Err(err) = spawn_with_id(
+        id,
+        local_cpu() as u32,
+        name,
+        entry,
+        hal::mm::DEFAULT_STACK_PAGES,
+    ) {
         hal::serial::write_str("[sched] spawn '");
         hal::serial::write_str(name);
         hal::serial::write_str("' FAILED: ");
@@ -1075,16 +1081,47 @@ pub fn spawn(name: &'static str, entry: fn()) -> TaskId {
 /// exhausted; [`SpawnError::TooManyTasks`] past [`MAX_TASKS`] live tasks. On an
 /// error nothing is registered (the id is still consumed — never reused).
 pub fn spawn_on(cpu: u32, name: &'static str, entry: fn()) -> Result<TaskId, SpawnError> {
-    let id = next_task_id();
-    spawn_with_id(id, cpu, name, entry).map(|()| id)
+    spawn_on_with_stack(cpu, name, entry, hal::mm::DEFAULT_STACK_PAGES)
 }
 
-fn spawn_with_id(id: TaskId, cpu: u32, name: &'static str, entry: fn()) -> Result<(), SpawnError> {
+/// Most pages [`spawn_on_with_stack`] will give one task (256 KiB).
+pub const MAX_STACK_PAGES: usize = 64;
+
+/// [`spawn_on`] with a kernel stack of `stack_pages` 4 KiB pages instead of
+/// [`hal::mm::DEFAULT_STACK_PAGES`] — for a long-lived service task whose
+/// call depth is known to need more (the `sfs-commit` task hashes and parses
+/// 4 KiB blocks; in a debug build its frames do not fit 16 KiB). Same guard
+/// page, same placement and wake-up.
+///
+/// # Errors
+///
+/// As [`spawn_on`]; [`SpawnError::StackAllocation`] also for `stack_pages`
+/// outside `1..=MAX_STACK_PAGES`.
+pub fn spawn_on_with_stack(
+    cpu: u32,
+    name: &'static str,
+    entry: fn(),
+    stack_pages: usize,
+) -> Result<TaskId, SpawnError> {
+    let id = next_task_id();
+    spawn_with_id(id, cpu, name, entry, stack_pages).map(|()| id)
+}
+
+fn spawn_with_id(
+    id: TaskId,
+    cpu: u32,
+    name: &'static str,
+    entry: fn(),
+    stack_pages: usize,
+) -> Result<(), SpawnError> {
     if !cpu_is_schedulable(cpu) {
         return Err(SpawnError::CpuNotOnline(cpu));
     }
-    let stack = hal::mm::alloc_kernel_stack(hal::mm::DEFAULT_STACK_PAGES)
-        .map_err(|_| SpawnError::StackAllocation)?;
+    if stack_pages == 0 || stack_pages > MAX_STACK_PAGES {
+        return Err(SpawnError::StackAllocation);
+    }
+    let stack =
+        hal::mm::alloc_kernel_stack(stack_pages).map_err(|_| SpawnError::StackAllocation)?;
 
     // Boot-proof only (design doc item "guard-paged kernel stacks"): a
     // read-only page-table walk confirming the guard page below this stack is

@@ -442,6 +442,90 @@ const COMP_HELLO_REQUIRED: &[&str] = &[
     "runtime=native",
     "reply=ok",
 ];
+/// SentinelFS FS-1a (`docs/specs/2026-09-18-sentinelfs-design.md` §11): the
+/// `sfs-commit` task mounted the SentinelFS window of the IDE disk (formatting
+/// it first only on a blank image), every block it read verified, and the line
+/// has exactly the shape
+/// `[sfs] mount: gen=N slot=S sb=<8 hex> verified=yes groups=1 free=N/N reserve=64 ok`
+/// ([`parse_sfs_mount`]). The writer puts generation `g` in slot `g % 2`, so
+/// `slot == gen % 2` holds on every boot of a healthy image.
+const SFS_MOUNT_PREFIX: &str = "[sfs] mount: ";
+/// The empty commit that follows the mount: generation `N + 1` into the other
+/// slot, so the slot alternates on every boot
+/// (`[sfs] commit: gen=N+1 slot=1-S sb=<8 hex> blocks=B flushes=2 ok`).
+const SFS_COMMIT_PREFIX: &str = "[sfs] commit: ";
+
+/// A parsed `[sfs] mount:` / `[sfs] commit:` line's numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SfsLine {
+    gen: u64,
+    slot: u64,
+    free: u64,
+    total: u64,
+}
+
+/// A decimal field: digits only, no sign, no empty string.
+fn sfs_dec(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Eight lowercase hex digits (the short superblock hash).
+fn sfs_hex8(s: &str) -> bool {
+    s.len() == 8
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Parse exactly
+/// `[sfs] mount: gen=N slot=S sb=<8 hex> verified=yes groups=1 free=N/N reserve=64 ok`
+/// — every field, in order, nothing else. `None` for any other shape.
+fn parse_sfs_mount(line: &str) -> Option<SfsLine> {
+    let mut it = line.trim_end().strip_prefix(SFS_MOUNT_PREFIX)?.split(' ');
+    let gen = sfs_dec(it.next()?.strip_prefix("gen=")?)?;
+    let slot = sfs_dec(it.next()?.strip_prefix("slot=")?)?;
+    if !sfs_hex8(it.next()?.strip_prefix("sb=")?) {
+        return None;
+    }
+    if it.next()? != "verified=yes" || it.next()? != "groups=1" {
+        return None;
+    }
+    let (free, total) = it.next()?.strip_prefix("free=")?.split_once('/')?;
+    let (free, total) = (sfs_dec(free)?, sfs_dec(total)?);
+    if it.next()? != "reserve=64" || it.next()? != "ok" || it.next().is_some() {
+        return None;
+    }
+    Some(SfsLine {
+        gen,
+        slot,
+        free,
+        total,
+    })
+}
+
+/// Parse exactly `[sfs] commit: gen=N slot=S sb=<8 hex> blocks=B flushes=F ok`.
+fn parse_sfs_commit(line: &str) -> Option<SfsLine> {
+    let mut it = line.trim_end().strip_prefix(SFS_COMMIT_PREFIX)?.split(' ');
+    let gen = sfs_dec(it.next()?.strip_prefix("gen=")?)?;
+    let slot = sfs_dec(it.next()?.strip_prefix("slot=")?)?;
+    if !sfs_hex8(it.next()?.strip_prefix("sb=")?) {
+        return None;
+    }
+    sfs_dec(it.next()?.strip_prefix("blocks=")?)?;
+    sfs_dec(it.next()?.strip_prefix("flushes=")?)?;
+    if it.next()? != "ok" || it.next().is_some() {
+        return None;
+    }
+    Some(SfsLine {
+        gen,
+        slot,
+        free: 0,
+        total: 0,
+    })
+}
+
 /// The `[ml]` `active=` values that mean a *vector* tier is live — a real SIMD
 /// int8-GEMM kernel runs (its boot self-test passed), not the scalar fallback. We
 /// accept **any** implemented vector tier because the runner fleet is heterogeneous:
@@ -1108,6 +1192,47 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // SentinelFS FS-1a: the mount line has exactly the specified shape, the
+    // slot matches the generation's parity, and the boot's empty commit moved
+    // to the next generation in the other slot.
+    let Some(sfs_mount_line) = log.lines().find(|l| l.starts_with(SFS_MOUNT_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: SentinelFS mount line '{}…' missing (did `kernel::sfs::prove_mount` run?).",
+            SFS_MOUNT_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    let sfs_mount = match parse_sfs_mount(sfs_mount_line) {
+        Some(m) if m.gen >= 1 && m.slot == m.gen % 2 && m.total > 0 && m.free <= m.total => m,
+        _ => {
+            eprintln!(
+                "TEST FAILED: the SentinelFS mount line is not `[sfs] mount: gen=N slot=S \
+                 sb=<8 hex> verified=yes groups=1 free=N/N reserve=64 ok` with slot = gen % 2 \
+                 and free <= total: '{}'",
+                sfs_mount_line
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let sfs_commit_line = log
+        .lines()
+        .find(|l| l.starts_with(SFS_COMMIT_PREFIX))
+        .unwrap_or("");
+    match parse_sfs_commit(sfs_commit_line) {
+        Some(c) if c.gen == sfs_mount.gen + 1 && c.slot == 1 - sfs_mount.slot => {}
+        _ => {
+            eprintln!(
+                "TEST FAILED: expected `[sfs] commit: gen={} slot={} … ok` after the mount \
+                 (the next generation, in the other slot): '{}'",
+                sfs_mount.gen + 1,
+                1 - sfs_mount.slot,
+                sfs_commit_line
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    println!("SentinelFS FS-1a proven: '{sfs_mount_line}' then '{sfs_commit_line}'");
+
     // A vector int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is a
     // real SIMD kernel — proving the hand-written `asm!` kernels execute and compute
     // correctly. `-cpu Haswell` (TCG) exposes avx2; `-cpu host` (KVM) exposes avx2
@@ -1765,6 +1890,57 @@ ffffffff80105000 <isr_common>:\n\
         let deferred = "[sched] cooperative: deferred-tick-preemptions observed=0";
         assert!(!raw.contains(SCHED_COOPERATIVE_PREFIX));
         assert!(!deferred.contains(SCHED_COOPERATIVE_PREFIX));
+    }
+
+    #[test]
+    fn sfs_mount_line_parses_only_the_exact_shape() {
+        use super::{parse_sfs_mount, SfsLine};
+
+        let good =
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=64 ok";
+        assert_eq!(
+            parse_sfs_mount(good),
+            Some(SfsLine {
+                gen: 12,
+                slot: 0,
+                free: 3836,
+                total: 3840
+            })
+        );
+        assert!(parse_sfs_mount(&format!("{good}\r")).is_some());
+        for bad in [
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=64 FAIL",
+            "[sfs] mount: gen=12 slot=0 sb=0A1B2C3D verified=yes groups=1 free=3836/3840 reserve=64 ok",
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3 verified=yes groups=1 free=3836/3840 reserve=64 ok",
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=no groups=1 free=3836/3840 reserve=64 ok",
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=2 free=3836/3840 reserve=64 ok",
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836 reserve=64 ok",
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=32 ok",
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=64 ok extra",
+            "[sfs] mount: gen=-1 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=64 ok",
+            "[sfs] mount: slot=0 gen=12 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=64 ok",
+            "[sfs] mount: corrupt (superblocks; never formatted over) FAIL",
+            "[sfs] mount: no-disk (no-device) skipped",
+            " [sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=64 ok",
+        ] {
+            assert_eq!(parse_sfs_mount(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn sfs_commit_line_parses_only_the_exact_shape() {
+        use super::parse_sfs_commit;
+
+        let c = parse_sfs_commit("[sfs] commit: gen=13 slot=1 sb=ffff0000 blocks=1 flushes=2 ok")
+            .unwrap();
+        assert_eq!((c.gen, c.slot), (13, 1));
+        assert_eq!(parse_sfs_commit("[sfs] commit: io FAIL"), None);
+        assert_eq!(parse_sfs_commit("[sfs] commit: TIMEOUT FAIL"), None);
+        assert_eq!(
+            parse_sfs_commit("[sfs] commit: gen=13 slot=1 sb=ffff0000 blocks=1 flushes=2 FAIL"),
+            None
+        );
+        assert_eq!(parse_sfs_commit(""), None);
     }
 }
 

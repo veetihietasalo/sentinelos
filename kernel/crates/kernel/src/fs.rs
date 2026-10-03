@@ -570,6 +570,8 @@ fn split_parent(components: &[String]) -> Result<(&[String], &str), FsError> {
 /// ```
 mod disk {
     use super::Node;
+    #[cfg(not(test))]
+    use crate::blk::ata::with_channel;
     use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -605,7 +607,9 @@ mod disk {
     /// `cfg(test)` so host unit tests never perform port I/O.
     #[cfg(not(test))]
     pub(super) fn probe() -> Option<Geometry> {
-        match ata::identify() {
+        // Every `hal::ata` command runs with the IDE channel held: the
+        // `sfs-commit` task shares the disk (`kernel::blk::ata::with_channel`).
+        match with_channel(ata::identify) {
             Ok(info) => Some(Geometry {
                 sectors: info.sectors,
             }),
@@ -646,7 +650,7 @@ mod disk {
 
         // Read the superblock (sector 0).
         let mut sb = vec![0u8; SECTOR_SIZE];
-        ata::read_sectors(0, 1, &mut sb).ok()?;
+        with_channel(|| ata::read_sectors(0, 1, &mut sb)).ok()?;
         if &sb[0..8] != MAGIC {
             return None;
         }
@@ -673,11 +677,13 @@ mod disk {
         while done < sectors {
             let chunk = (sectors - done).min(256);
             let off = done * SECTOR_SIZE;
-            ata::read_sectors(
-                (1 + done) as u32,
-                chunk as u16,
-                &mut buf[off..off + chunk * SECTOR_SIZE],
-            )
+            with_channel(|| {
+                ata::read_sectors(
+                    (1 + done) as u32,
+                    chunk as u16,
+                    &mut buf[off..off + chunk * SECTOR_SIZE],
+                )
+            })
             .ok()?;
             done += chunk;
         }
@@ -734,11 +740,13 @@ mod disk {
         while done < total_sectors {
             let chunk = (total_sectors - done).min(256);
             let off = done * SECTOR_SIZE;
-            ata::write_sectors(
-                done as u32,
-                chunk as u16,
-                &image[off..off + chunk * SECTOR_SIZE],
-            )
+            with_channel(|| {
+                ata::write_sectors(
+                    done as u32,
+                    chunk as u16,
+                    &image[off..off + chunk * SECTOR_SIZE],
+                )
+            })
             .map_err(|_| ())?;
             done += chunk;
         }

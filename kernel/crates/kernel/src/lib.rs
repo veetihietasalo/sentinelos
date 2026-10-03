@@ -20,6 +20,7 @@
 extern crate alloc;
 
 pub mod app;
+pub mod blk;
 pub mod clock;
 pub mod fs;
 pub mod hash;
@@ -30,6 +31,7 @@ pub mod memory;
 pub mod ml;
 pub mod net;
 pub mod sched;
+pub mod sfs;
 pub mod shell;
 pub mod smp;
 pub mod wm;
@@ -249,6 +251,17 @@ pub fn kmain() -> ! {
     // before the banner: it sits on the heap and the console only, touches no
     // hardware and no clock (zero time-dependent semantics, spec §19).
     host::prove_hello();
+
+    // SentinelFS FS-1a boot proof (docs/specs/2026-09-18-sentinelfs-design.md
+    // §11): start the `sfs-commit` task — pinned to this core, the only code
+    // that touches the device — which mounts the SentinelFS window of the IDE
+    // disk past the old `kernel::fs` image (formatting it only if it is blank,
+    // never over a disk that carries the magic), then commits once so the
+    // superblock slot alternates on every boot. Runs after every proof that
+    // drains this core's ready queue: from here on the task stays runnable on
+    // the BSP (it polls for commit requests), so nothing below may wait for
+    // that queue to empty.
+    sfs::prove_mount();
 
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");
