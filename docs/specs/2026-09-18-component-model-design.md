@@ -1,10 +1,15 @@
 # Component Model — attested messaging, delegates, and content-addressed components
 
-Status: **PR-1 + PR-1b implemented (2026-09-18)** — `kernel::hash`, `kernel::host` (native
-runtime, envelope codec, inbox ring), `kernel::clock` (core-independent monotonic clock), boot
-lines asserted; review round 1 complete, sequencing and the
-three open decisions settled in §19; amendments A5–A10 land with the PRs named there · Tracks A (kernel core)
-+ D (security subsystem) · Author: kernel-architect
+Status: **PR-1 + PR-1b implemented (2026-09-18); PR-2 implemented (2026-10-03)** —
+`kernel::hash`, `kernel::host` (native runtime, envelope codec, inbox ring, manifests with
+required/optional capabilities), `kernel::clock` (core-independent monotonic clock),
+`kernel::cap` (per-instance capability tables, the `⊑` lattice, the rate-limited denial log) and
+`kernel::bus` (the kernel-wide host; attested send/request/reply/delegate/revoke); boot lines
+asserted; review round 1 complete, sequencing and the three open decisions settled in §19; A8
+and A10 applied with PR-2 (the threat model now lives in `docs/security/threat-model.md`), A5,
+A6, A7's remainder and A9 land with the PRs named there · Tracks A (kernel core) + D (security
+subsystem) · Author: kernel-architect; PR-2 implementation: security-engineer — **pending
+kernel-reviewer sign-off on the PR-2 security boundary decisions recorded in §7, §8 and §18.4**
 Depends on: SMP phases 1–3a (shipped: per-CPU scheduler, IPIs, per-core tick), `kernel::fs`
 (persistence), `kernel::sched` (`spawn_on`, pinned tasks), `sentinel-core` (the portable
 security crate + `SecurityProvider`), the Security Center design
@@ -181,10 +186,54 @@ pub struct Sender { pub instance: InstanceId, pub component: ComponentId }
   requester's concern; the host never fabricates a reply. **Silence is denial.**
 - **Delivery** is by the scheduler: a component instance is a pinned task (`spawn_on`); an
   inbox push wakes it exactly like the reschedule IPI wakes a core today. Cross-core delivery
-  reuses that path unchanged.
+  reuses that path unchanged. *(Superseded at PR-2 by run-to-completion dispatch; measurement
+  and decision in §18.4.)*
 - Cross-core safety follows `kernel::sched`'s rule: bus locks are taken with interrupts
   masked, never across a switch, never around an allocation — the payload arena is
   pre-sized at instantiation.
+
+**As shipped in PR-2** (`kernel::bus`, 2026-10-03):
+
+- **Component code acts only as itself.** It runs in exactly two places, `bus::dispatch` (one
+  envelope from the inbox → the instance's message handler) and `bus::call` (a kernel call into
+  an export), each with no host lock held and handed a `bus::Ctx` minted for *that* instance.
+  `Ctx` cannot be built outside `kernel::bus` and no operation on it takes a sender or a target:
+  `bus::send(cap, payload)` above is `Ctx::send(cap, payload)`, and likewise `request`, `reply`,
+  `delegate`, `revoke`, `release`. The host stamps `from` from the running instance's record.
+  On the native runtime this stops a *confused* component, not a malicious one (§16 → threat
+  model T-NAT-1).
+- **Reply tags.** Both ends see kernel-chosen tags. The responder's `Request { reply_tag }` *is*
+  the `CapIndex` of the one-shot reply capability minted in **its** table (target
+  `(requester, tag)`, ops `{Reply}`, expiring at the requester's timeout, clamped to
+  `1..=1000` ticks, at most 4 pending per table); it answers with `Ctx::reply(CapIndex(reply_tag),
+  …)`, which spends the capability. The requester's `Reply { reply_tag }` is the tag
+  `Ctx::request` returned. A late or second answer is refused; nothing is fabricated.
+- **Delegation notices.** A delegated capability is announced to its recipient by a
+  kernel-written `Kind::Grant { granted }` envelope (wire kind 3; `from` = the delegator, `cap`
+  = the delegator's `via` capability). The recipient learns its new index from the kernel,
+  never from the delegator's payload, so a delegator cannot point it at one of its *own*
+  capabilities (no confused deputy).
+- **The kernel's control channel.** Kernel calls (`bus::call`, PR-1's `greet` path) need no
+  capability and never enter the instance's inbox: still built and stamped by the kernel and
+  round-tripped through the envelope codec, but component traffic can neither delay nor
+  displace them. The inbox carries component traffic only.
+- **Authority before capacity.** An unauthorised sender gets `Denied`, never `Busy`, so it
+  learns nothing about the target's inbox; components see only `Denied`/`Busy`, the precise
+  reason goes to the denial log (§8).
+- **One leaf lock, no allocation.** The kernel-wide host (`bus::HOST`) holds every instance's
+  inbox arena, every capability table and the denial log in one fixed value sized at build
+  time — the bus allocates nothing, ever. Its lock is taken with interrupts masked, held for
+  bounded table/ring work only, never across a switch, never around an allocation or a
+  console write, and **nothing else is acquired while it is held** (a leaf: never nested with
+  `sched`'s queue → table locks, the console lock or the heap lock). Check, target resolution,
+  reply-capability mint and enqueue are one critical section. Against hal-tcb §5e's rule
+  (IRQ-reachable locks only with `IF = 0`; others may be held with `IF = 1` if no same-core
+  waiter spins): `HOST` is **never taken from IRQ context**, and is held with `IF = 0` anyway,
+  by choice — its holder is never preempted, so no same-core waiter can exist.
+- **No blocking primitive.** Dispatch is run-to-completion (§18.4), so the bus needs no
+  park/unpark; none is added to `sched`. When a component must block, the primitive is designed
+  once (park/unpark with a wake permit and an optional mono-clock deadline) and shared with
+  SentinelFS's commit task.
 
 ## 8. Capabilities
 
@@ -211,6 +260,90 @@ static CAP_TABLES: [SpinMutex<CapTable>; MAX_INSTANCES];   // fixed slab, kernel
 - Kani targets: "no capability exists in a table that was not produced by `grant` or by an
   attenuating `delegate`" over a bounded sequence of operations — the analogue of the
   scheduler's Invariant #4 proof.
+
+**As shipped in PR-2** (`kernel::cap`, 2026-10-03):
+
+- **Shape.** `Target = Instance(InstanceId) | Reply { to, tag }` (the per-request reply right;
+  never granted, never delegable). `OpSet` bits: `Send`, `Request`, `Reply`, `Delegate`;
+  well-formedness ties ops to the target (`Instance` ⊇ `{Send, Request, Delegate}`, `Reply` =
+  `{Reply}`) and the attenuation's kind to the target. `Attenuation::Message { max_len }`, a
+  total order (`max_len ≤ MAX_PAYLOAD`). `expires: Option<Tick>` on `clock::mono_ticks()`,
+  exclusive. `Service(ServiceId)` is not built yet: no service exists to designate.
+- **One predicate.** `Capability::is_attenuation_of` (`⊑`): same target, `ops' ⊆ ops`,
+  `attenuation' ⊑ attenuation`, `expires' ≤ expires` — total, decidable, and the only thing
+  `delegate` consults. What a capability *permits* is `Capability::permits(access, now)`; Kani
+  proves `⊑` sound against it (whatever a child permits at any tick, its parent permits) and
+  transitive.
+- **Grant** = `request ∧ policy`: the meet (ops ∩, attenuation by `⊑`, earliest expiry). The
+  policy is a static allow-list of `(holder id, target id, ops, attenuation, ttl)`, **deny by
+  default**, until the PolicyAgent (§9, PR-5). A manifest names component ids; the host binds
+  each to the **oldest live instance** of that component. Every request is resolved before
+  anything changes: a `Required` one that cannot be granted refuses the instantiation
+  (`MissingRequiredCap`), an `Optional` one is skipped; both are logged (A8). The requests are
+  not part of the id — threat model T-MAN-1, to close before any manifest is loaded from outside
+  the image.
+- **Delegate** requires `Delegate` on the parent and a `via` capability carrying `Send`: you can
+  hand authority only to an instance you can already reach. The child keeps the parent's
+  target and records its parent `(table, slot, generation)`.
+- **Revoke / release.** `revoke(cap)` frees everything derived from `cap`, at any depth, in
+  any table, and keeps `cap`; `release(cap)` frees `cap` too (for a reply capability: decline
+  to answer). Every removal finishes with an orphan sweep — read the slab once, let "parent
+  gone" flow down a flag map for at most `slots` rounds, write the slab once — so no live
+  capability ever has a dead parent. Expiry needs no cascade (a child never outlives its
+  parent) but gets the sweep anyway. `terminate` frees an instance's table and everything
+  anywhere that names it.
+- **Indices.** `CapIndex = generation:24 ‖ table:4 ‖ slot:4`. A foreign table field is refused
+  (*foreign*); every free bumps the slot's generation, and a slot that would wrap is retired, so
+  a revoked/used/reclaimed index is *stale* forever and never aliases a newer capability;
+  generation 0 is never issued (`CapIndex::KERNEL` is valid nowhere). Tables: 16 instances × 16
+  capabilities, a fixed slab inside the kernel-wide host.
+- **Denials are logged, rate-limited** (A8): `cap::deny::DenyLog`, fixed size, no allocation.
+  Each record: tick, the kernel-stamped holder (instance + component), the index presented,
+  the action, the reason. A token bucket per holder (burst 8, one per 50 ticks) — refusals at
+  instantiation use the kernel's bucket — suppresses, never loses: suppressed refusals are
+  counted and carried into the holder's next record, ring overwrites are counted, and
+  `logged + suppressed == total`. Nothing is printed per denial.
+- **Kani** (each discharged locally, the table harnesses on a 2 × 2 slab; times in §14's PR-2
+  row). The target above is `cap::table::proofs::no_capability_without_a_producer`: a bounded,
+  fully symbolic sequence from the empty slab, with a ghost of what each producer returned — two
+  steps fit the budget (three take 139 s). Three **inductive** harnesses lift the bound: each
+  starts from *any* table state satisfying the invariant (well formed; granted and reply
+  capabilities parentless; a delegated one ⊑ a live parent that may delegate — no orphans) and
+  applies one call of a mutator with symbolic arguments; between them they cover every mutator,
+  so what they prove holds after every sequence, of any length.
+  `producers_install_exactly_what_they_checked`: `grant`/`delegate`/`mint_reply` change exactly
+  the slot they return, previously empty, to exactly the meet, the requested child or the reply
+  right, and only ever add leaves to the delegation forest. `revoke_removes_every_descendant`
+  (`revoke`, `release`) and `reclamation_frees_the_chosen_and_their_descendants` (expiry,
+  `clear_table`, `free_where`): a capability is freed iff it was chosen or its parent was freed
+  — every descendant, nothing else — survivors are unchanged, and a freed slot's generation
+  moves on. These store `Token`, a 5-byte value whose ⊑ is an arbitrary symbolic relation (the
+  tables are generic over `cap::Authority`), so they hold for every relation, `Capability`'s
+  included. On `Capability` itself: `delegate_never_amplifies` (semantic: whatever the child
+  permits at any tick, the parent permits) and
+  `cap::proofs::attenuation_order_is_sound_and_transitive` (⊑ sound and transitive; the meet
+  below both; a well-formed reply right is `{Reply}` only). Plus
+  `cap::deny::proofs::deny_log_counts_every_denial`; the codec round-trip harness now covers
+  `Grant`. Three code shapes exist for the verifier and cost nothing at run time (constant-range
+  scans; a slot at a run-time position copied, never borrowed; the read-once/write-once sweep;
+  recorded in `cap::table`): on a 2 × 3 slab they took the revocation harness from over ten
+  minutes (stopped) to 75 s, and the old sweep alone cost 2.4× on the 2 × 2 slab (72 s → 30 s).
+  2 × 3 still overran for the removal steps (reclamation: 198 s), hence 2 × 2 for all of them —
+  one size, so the induction composes.
+
+**Extension point — storage capabilities (SentinelFS FS-1c).** Storage slots in as a purely
+additive change, written against the same predicate: (1) `Target::Storage(..)` with its
+`allowed_ops` arm, using new `Op` bits (reserved: bits 8–12 for `Read`, `Write`, `Snapshot`,
+`Rollback`, `Format`; existing bits never move); (2) `Attenuation::Storage(..)` carrying the
+SentinelFS §9 lattice (tree `Live | SnapshotRo(name)`, path prefix by components, blobs
+`None | Domain(d) | RefSet`, quota) with its arms of `is_attenuation_of`, `admits` and `fits`
+(cross-kind is `false`, so no new variant can weaken an existing one); (3)
+`Access::Storage { op, path, bytes }`. `Attenuation::meet` (used by `grant`) is defined from
+`⊑` alone — incomparable values simply do not grant — so it needs no new code; `delegate`,
+`revoke`, the tables and every Kani harness are written against `⊑`/`admits`/`permits` and do
+not change; FS-1c extends the harnesses' symbolic generators (`cap::proofs::any_target`,
+`any_attenuation`, `any_access`) with the new variants and re-runs them, which turns the existing
+"never amplifies" proofs into its own.
 
 ## 9. Delegates
 
@@ -341,9 +474,9 @@ envelope codec is a few hundred lines we can prove. Revisit when the ecosystem s
 | Module | Role | Notes |
 |---|---|---|
 | `kernel::hash` | SHA-256 | pure; test vectors + Kani on padding arithmetic |
-| `kernel::host` | instantiate / verify id / run on `ComponentRuntime`; per-instance fuel + memory caps; one pinned task per instance | uses `sched::spawn_on`; instance = task |
-| `kernel::cap` | fixed slab of per-instance tables; `grant` / `delegate` / `revoke` / `check` | Kani: no forgery |
-| `kernel::bus` | inbox rings + payload arenas; `send` stamps `from`; reply caps | fixed-size; no alloc under lock |
+| `kernel::host` | instantiate / verify id / run on `ComponentRuntime`; per-instance fuel + memory caps; manifests with required/optional caps | PR-2: kernel-wide (`bus::HOST`); run-to-completion dispatch, not instance = task (§18.4) |
+| `kernel::cap` | fixed slab of per-instance tables; `grant` / `delegate` / `revoke` / `check`; denial log | shipped PR-2; Kani: no forgery, never amplifies, revoke removes every descendant |
+| `kernel::bus` | inbox rings + payload arenas; `send` stamps `from`; reply caps | shipped PR-2; allocates nothing; one leaf lock |
 | `kernel::secrets` | per-delegate store; encrypted via `fs` | key sealing: §18 |
 | `kernel::state` | drives state-object exports; load-time `validate`; persistence | monoid proofs on host |
 | `kernel::services::*` | compute (`ml`), compositor (`wm`/`ui`), storage (`fs`), net, clock, integrity vectors | thin capability-checked shims over existing modules |
@@ -353,6 +486,14 @@ PR-1 as shipped: `kernel::hash` and `kernel::host::{codec, inbox, native}` insid
 crate (`#![forbid(unsafe_code)]`); `Host<R: ComponentRuntime>` is built by the boot proof and
 becomes a kernel-wide instance in PR-2 when the bus needs it. `crates/host` appears at the gate,
 when there is a dependency to isolate.
+
+PR-2 as shipped: `kernel::cap::{table, deny}` and `kernel::bus` (with `bus::proof`), plus
+`kernel::host::probe` (the three first-party probe components of the boot proof). The host is
+kernel-wide (`bus::HOST`, a `static` of ~60 KiB: every arena and table is inside it, nothing is
+allocated). `ComponentRuntime` gained `release` and `entry`, and runs component code through
+associated functions over a `Copy` entry (`call`, `deliver`) so the host can invoke it with no
+lock held; native components gained a message handler and receive a `bus::Ctx`. The PR-1 hello
+proof runs on the kernel-wide host and terminates its instance afterwards. `hal` delta: none.
 
 **`hal` delta: none** for PR-1 through PR-5. Ring-3 support (GDT user segments, TSS `rsp0`,
 `syscall`/`sysret` or `int` gate, user-pointer validation) is *only* needed if native
@@ -366,7 +507,7 @@ Each PR is independently bootable and adds one hard assertion to `cargo xtask te
 |---|---|---|
 | **PR-1** hash + host (native) — **shipped 2026-09-18** | `kernel::hash` (SHA-256, framed id §6), `kernel::host` with `ComponentRuntime` + `native::NativeRuntime`, the embedded native `hello` component: a one-bit-wrong id refused before the runtime sees the bytes, the honest id verified, `greet` called through the inbox ring and the envelope codec with the kernel stamping `from` on request and reply. **Zero time-dependent semantics.** Kani (4 new harnesses): id framing injective, codec round-trip, decode total, inbox ring FIFO / never loses / never overwrites; plus SHA-256 padding. | `[comp] hello: id=<first 8 hex> verified=yes wrong-id=refused runtime=native reply=ok ok` |
 | **PR-1b** clock (SMP 3b-i) — **shipped 2026-09-18** | `kernel::clock`: a core-independent monotonic clock — the max over per-core tick counts aligned on each core's first tick, advanced by *any* core's LAPIC tick via `fetch_max`, never backwards, at most one per tick (Kani). `sched::wait_on_other_core` and the preemption-proof tasks tick off it; hal-tcb invariant 4.15 retired as a hazard. LAPIC-derived, not TSC: zero `hal` delta. No IOAPIC, no MADT walk. Landed before PR-2 because `expires` and reply timeouts must not tick off a counter another core can stall. | `[clock] mono: source=lapic cores=4 ticking=4 lag-max=N pit-frozen=yes bsp-stalled-advance=yes rate=N/N rate-ok=yes ok` |
-| **PR-2** bus + capabilities | `kernel::bus`, `kernel::cap`; two components; one holds a Send cap to the other, a third holds none. `expires` on the mono clock. **Denials logged, rate-limited.** Manifests declare `required` vs `optional` caps: a component missing a required cap refuses to start. | `[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=N ok` |
+| **PR-2** bus + capabilities — **shipped 2026-10-03** | `kernel::cap`: a fixed 16 × 16 slab of per-instance tables; `grant` = manifest ∧ policy, `delegate` attenuated-or-equal by the one predicate `⊑`, `revoke`/`release` cascading through the recorded delegation tree, `check`; generation-tagged `CapIndex`; the allocation-free, rate-limited deny log. `kernel::bus`: the kernel-wide host — `bus::Ctx` send / request / reply / delegate / revoke, `from` stamped from the running instance's record, full inbox → `Busy`, a one-shot reply capability per request (revoked on use or timeout; the host never fabricates a reply). Three first-party native probes: alice holds a `Send` capability to bob; carol holds none (her manifest asks, the policy refuses; marked required, she refuses to start). `expires` and reply timeouts on the mono clock; **denials logged, rate-limited**; §18.4 decided (run-to-completion dispatch). Kani (7 new harnesses, each measured locally on a shared 4-core machine): no capability without a producer — bounded, 48 s — and its inductive steps (producers 19 s, revoke/release 29 s, reclamation 46 s); delegate never amplifies 7 s; `⊑` sound and transitive 3 s; deny log counts every denial 14 s. The PR-1 codec round-trip harness, extended to `Grant`, takes 82 s (86 s without the new kind: not a PR-2 regression, left at PR-1's bound). | `[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=N ok` (N = 13 on the reference boot) |
 | **PR-3** delegates + secrets | `kernel::secrets`, **KeyAgent** with an **ephemeral, memory-only key** (§18.1); zeroization of payload arenas on revoke/exit; a component requests a signature and verifies it; a probe tries to read the secret. | `[delegate] keyagent: signed=ok verified=yes secret-readable=no sealing=none secrets-persist=no ok` |
 | **Gate** memory boundary | Docs: the wasm-vs-ring-3 decision spec with the §12 conditions checked off; `external-tcb.md`; the fuzz lane gating. Must merge **before PR-3**. | n/a |
 | **PR-4** state objects | `kernel::state`, **IntegrityLog**; records carry a signing-key id resolved through IdentityDir (A6), so a new boot's key does not quarantine the previous boot's log; two divergent logs merged both ways; a tampered record rejected | `[state] integrity-log: merge-commutes=yes idempotent=yes tamper-rejected=yes ok` |
@@ -392,47 +533,16 @@ Every PR: host tests for the pure parts, Kani where the design names it (§8, §
 
 ## 16. Threat model (what a component can and cannot do)
 
-**Assumption (Kerckhoffs).** The adversary knows every byte of the kernel and of every
-component; the only secrets are the delegates' keys. Nothing below depends on obscurity.
-
-**Two boundaries, landed one at a time.**
-
-- *Authority boundary* (PR-1 onward, every runtime): a component is confined by what it can
-  **name** (`CapIndex`) and **reach** (the bus). The kernel stamps `from`; deny by default;
-  silence is denial. PR-1 already proves the first half: the wrong id is refused before any
-  runtime sees the bytes, and `from` on both request and reply is written by the kernel.
-- *Memory boundary* (the gate before PR-3): whether a component can touch memory it was not
-  handed. **Native components have none.** A native component runs in ring 0 in the kernel
-  address space, so the authority boundary stops a *confused* component, not a *malicious*
-  one. Therefore only **first-party** components (compiled into the image, reviewed as kernel
-  code) run on the native runtime, and **no non-first-party component runs anywhere** until
-  the gate lands a memory boundary (wasm under the §12 conditions, or ring-3).
-
-**A component can:** consume its own budgets (by count now; fuel and memory once a metering
-runtime exists); send to targets it holds capabilities for; refuse to answer; lie in its own
-payloads; on the native runtime, do anything kernel code can — which is exactly why that
-runtime is first-party only.
-
-**A component cannot, on any runtime (authority):** forge `from`; reach a target without a
-capability; amplify a capability; make the kernel fabricate a reply; escape its identity (the
-host hashed what it runs).
-
-**A component cannot, after the gate (memory):** read another instance's memory or a
-delegate's secret; touch hardware; overrun its linear memory or its stack.
-
-**What "cannot exhaust the machine" honestly means today.** Inboxes are bounded (`Busy`,
-never growth), instance tables are fixed slabs, payload arenas are pre-sized. But the kernel
-runs `panic = "abort"` with an infallible allocator over a 4 MiB heap and 16 KiB guard-paged
-thread stacks, so an allocation failure or a stack overrun **halts the machine** rather than
-corrupting it. A wasm runtime must therefore cap linear memory *before* it allocates and prove
-its stack high-water mark stays under the guard page (§12 conditions). Until then the claim
-is: *bounded by construction where we allocate; halt, not corrupt, where we cannot.*
-
-**Trusted:** `hal`; the safe kernel, `kernel::host` included; the component runtime (native:
-the kernel itself; external: the gated external TCB). Delegates are components under the same
-rules, but the KeyAgent and PolicyAgent are first-party and reviewed as TCB; they get registry
-rows when `external-tcb.md` lands (A5, A9). A bug in any of these is a bug in the root of
-trust, handled by the TCB discipline, not by this model.
+**Moved to [`docs/security/threat-model.md`](../security/threat-model.md)** (amendment A10,
+PR-2, 2026-10-03), where it is a living document with a threat register: every entry names
+the mechanism that defeats the threat and the evidence (boot proof, Kani harness or host test)
+that it works. What used to be here — the Kerckhoffs assumption, the two boundaries
+(*authority* from PR-1 on, every runtime; *memory* at the gate before PR-3, none on the native
+runtime, hence first-party only), what a component can and cannot do, what "cannot exhaust the
+machine" honestly means under `panic = "abort"`, and what is trusted — is there verbatim in
+substance (§1–§4), extended with the PR-2 register (§5: T-ATT-1 … T-SEC-1) and the open items
+(§6), among them **T-MAN-1** (manifest capability declarations are not yet bound into the
+content address) and **T-NAT-1** (a native component is ring 0).
 
 ## 17. What this changes in the roadmap
 
@@ -461,7 +571,24 @@ trust, handled by the TCB discipline, not by this model.
    with draw commands.
 4. **Instance = task.** One pinned task per component instance is simple and reuses
    `spawn_on`; a run-to-completion actor model over fewer tasks may scale better. Measure at
-   PR-2.
+   PR-2. **Decided at PR-2 (2026-10-03): run-to-completion dispatch** — the simplest model that
+   meets the proof. *Measured* on the PR-2 boot (`[cap] measure:` line, informational; TCG,
+   `-smp 4`, the unoptimised `make test` kernel, 100 Hz ticks, four boots; no KVM in the
+   measuring environment): one complete delivery in the dispatch model — an attested
+   `Ctx::send` plus one `bus::dispatch` that runs the handler — 1 300–2 371 per 5 ticks
+   (≈ 21–38 µs); one context-switch round trip — the least instance = task adds to *every*
+   delivery (switch to the instance's task and back, each switch with the eager per-task
+   `xsave`/`xrstor`) — 1 209–1 836 per 5 ticks (≈ 27–41 µs), so instance = task would cost
+   ≈ 1.9–2.3× per delivery (per boot: 1 + deliveries ÷ round trips). TCG timings are noisy
+   and say little about hardware; the decision rests as much on what is counted. *Counted*: instance = task needs, per instance, a 16 KiB guard-paged stack, a
+   4 160-byte `XsaveArea` on the heap and one of the scheduler's `MAX_TASKS = 64` slots (16
+   instances = a quarter of every task the kernel can run); dispatch needs none — each
+   instance's arena is part of the static host. *Missing*: instance = task also needs a
+   block-on-inbox primitive (tasks can only yield or spin today) and a way to stop a task from
+   outside for `terminate` (tasks only exit themselves); neither exists. Revisit when a
+   component must block on something (the KeyAgent's user-confirmation path, PR-3) or when an
+   instance needs its own stack for isolation (ring-3 at the memory gate). The `bus::Ctx`
+   design does not change either way: a per-instance task would mint its `Ctx` the same way.
 5. **Literal Freenet compatibility.** Could a Freenet contract or delegate run unmodified
    (`freenet-stdlib` ABI)? Tempting and out of scope; the ABI here is ours. Keep the door open
    by not inventing an incompatible *state* interface where theirs already fits (§10 mirrors
@@ -502,9 +629,9 @@ third-party crate (`limine`). This is the baseline the §18.6 trigger is measure
 | A5 | hal-tcb §1 | External dependencies need their own class: `kernel/docs/external-tcb.md`, admitted by an amendment to hal-tcb §1. `crates/host` own code `#![forbid(unsafe_code)]`; only the dependency is exempt. | gate |
 | A6 | §10 vs §18.1 | An ephemeral key means IntegrityLog `validate` against "the KeyAgent's public key" quarantines the previous boot's log on reload. Records carry a signing-key id resolved through IdentityDir, or PR-4's log is explicitly in-memory. | PR-4 |
 | A7 | §15 | No fuzz lane exists (hal-tcb §3: **pending**); nothing that depends on fuzz merges before the lane gates. "Differential host vs kernel" is one hand-picked vector, not a property; say so or drop it. The upstream `wasmi` suite is `std`-only. Missing: a Kani ring harness (full → `Err(Busy)`, never overwrite, never lose) and a host-side threaded model of the bus rings for data races (Miri only sees host threads). | ring harness applied (PR-1); fuzz + race model at the gate |
-| A8 | §8/§11 | Denials are asserted but never logged; §11 sells the capability log as an integrity vector. Log denies, rate-limited. Manifests need `required` vs `optional` caps: refuse to start rather than run degraded. | PR-2 |
+| A8 | §8/§11 | Denials are asserted but never logged; §11 sells the capability log as an integrity vector. Log denies, rate-limited. Manifests need `required` vs `optional` caps: refuse to start rather than run degraded. | **applied (PR-2)**: `cap::deny::DenyLog` — every refusal logged with the kernel-stamped holder, index, action and reason; per-holder token bucket, suppressed counted and carried, never lost; `CapNeed::{Required, Optional}`, a missing required capability refuses the start (`MissingRequiredCap`) |
 | A9 | §7/§9 | Zeroization: payload arenas are reused, so signatures and plaintext replies linger; zero on revoke and exit. Delegates are either TCB with registry rows or not trusted — §16 currently assumes both. | PR-3 |
-| A10 | §16 | Eight lines in a design doc is not a threat model; `docs/security/` does not exist. Split §16 out when PR-2 lands. | PR-2 |
+| A10 | §16 | Eight lines in a design doc is not a threat model; `docs/security/` does not exist. Split §16 out when PR-2 lands. | **applied (PR-2)**: `docs/security/threat-model.md` (§16 moved, extended with the PR-2 threat register); §16 is a pointer |
 | A11 | §12 | `wasmi` 2.0.0 was 17 days old at review. No brand-new major into the TCB; pin and vendor a version with an audit trail when the gate opens. | recorded |
 
 **Minds change on.** Architect and verification: a `wasmi` executor whose `unsafe` is confined and

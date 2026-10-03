@@ -20,6 +20,8 @@
 extern crate alloc;
 
 pub mod app;
+pub mod bus;
+pub mod cap;
 pub mod clock;
 pub mod fs;
 pub mod hash;
@@ -249,6 +251,18 @@ pub fn kmain() -> ! {
     // before the banner: it sits on the heap and the console only, touches no
     // hardware and no clock (zero time-dependent semantics, spec §19).
     host::prove_hello();
+
+    // Component model PR-2 boot proof (component-model design doc §14): the
+    // bus and capabilities on the kernel-wide host. Three first-party probe
+    // components act through their own code: alice holds a capability to bob,
+    // carol holds none. `from` is kernel-stamped on every delivery, carol is
+    // denied by default, and forged indices (never issued, another instance's,
+    // revoked, expired) are refused and logged, rate-limited. Expiry and reply
+    // timeouts tick off `clock::mono_ticks`, so this runs after `prove_mono`.
+    // Its §18.4 measurement runs one short BSP task and waits (bounded) for
+    // this thread's own yields to reap it, so it must stay ahead of any proof
+    // that leaves an always-runnable task on the BSP (SentinelFS's mount proof).
+    bus::proof::prove_caps();
 
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");

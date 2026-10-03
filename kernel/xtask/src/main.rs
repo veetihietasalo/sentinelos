@@ -442,6 +442,26 @@ const COMP_HELLO_REQUIRED: &[&str] = &[
     "runtime=native",
     "reply=ok",
 ];
+/// Component model PR-2 (`docs/specs/2026-09-18-component-model-design.md`
+/// §14): bus + capabilities on the kernel-wide host. `from` is kernel-stamped
+/// on every delivery, a component with no capability is denied by default,
+/// forged indices (never issued, another instance's, revoked, expired) are
+/// refused, and every denial is logged, rate-limited. Asserted exactly, with
+/// `N >= 1`: [`cap_proof_passed`].
+const CAP_PROOF_PREFIX: &str = "[cap] attested-from=";
+
+/// Whether `line` is exactly `[cap] attested-from=yes deny-by-default=yes
+/// forge-attempt=refused denies-logged=N ok` with a decimal `N >= 1`.
+fn cap_proof_passed(line: &str) -> bool {
+    const HEAD: &str =
+        "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=";
+    line.trim_end()
+        .strip_prefix(HEAD)
+        .and_then(|rest| rest.strip_suffix(" ok"))
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|n| n.parse::<u64>().ok())
+        .is_some_and(|n| n >= 1)
+}
 /// The `[ml]` `active=` values that mean a *vector* tier is live — a real SIMD
 /// int8-GEMM kernel runs (its boot self-test passed), not the scalar fallback. We
 /// accept **any** implemented vector tier because the runner fleet is heterogeneous:
@@ -1108,6 +1128,26 @@ fn boot_test(kvm: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Component model PR-2: attested `from`, deny by default, forgeries refused,
+    // denials logged — the exact line, with denies-logged >= 1.
+    let Some(cap_line) = log.lines().find(|l| l.contains(CAP_PROOF_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: capability proof line '{}…' missing (did \
+             `kernel::bus::proof::prove_caps` run?).",
+            CAP_PROOF_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    if !cap_proof_passed(cap_line) {
+        eprintln!(
+            "TEST FAILED: the capability proof did not pass (expected exactly '[cap] \
+             attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=N ok' \
+             with N >= 1): '{}'",
+            cap_line
+        );
+        return ExitCode::FAILURE;
+    }
+
     // A vector int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is a
     // real SIMD kernel — proving the hand-written `asm!` kernels execute and compute
     // correctly. `-cpu Haswell` (TCG) exposes avx2; `-cpu host` (KVM) exposes avx2
@@ -1670,6 +1710,28 @@ ffffffff80105000 <isr_common>:\n\
                      preempted=0 FAIL";
         assert_eq!(parse_u64_after(line, "preempted="), Some(0));
         assert_eq!(parse_u64_after(line, "nope="), None);
+    }
+
+    #[test]
+    fn cap_proof_passed_accepts_only_the_exact_line() {
+        use super::cap_proof_passed;
+
+        let good = "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused \
+                    denies-logged=13 ok";
+        assert!(cap_proof_passed(good));
+        assert!(cap_proof_passed(&format!("{good}\r")));
+        for bad in [
+            "[cap] attested-from=no deny-by-default=yes forge-attempt=refused denies-logged=13 ok",
+            "[cap] attested-from=yes deny-by-default=no forge-attempt=refused denies-logged=13 ok",
+            "[cap] attested-from=yes deny-by-default=yes forge-attempt=ACCEPTED denies-logged=13 ok",
+            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=0 ok",
+            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged= ok",
+            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=13 FAIL",
+            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=1x ok",
+            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=13 ok x",
+        ] {
+            assert!(!cap_proof_passed(bad), "{bad}");
+        }
     }
 
     #[test]
