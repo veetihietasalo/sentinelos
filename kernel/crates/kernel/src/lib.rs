@@ -20,6 +20,7 @@
 extern crate alloc;
 
 pub mod app;
+pub mod clock;
 pub mod fs;
 pub mod hash;
 pub mod host;
@@ -230,6 +231,14 @@ pub fn kmain() -> ! {
     // which yields — only that core's LAPIC-timer tick can switch them — with
     // the GEMM's live vector accumulators surviving each preemption bit-exact.
     sched::prove_ap_preemptive();
+
+    // SMP phase 3b-i boot proof: the core-independent monotonic clock. With the
+    // BSP's interrupts DISABLED the PIT must stand still while `clock::mono_ticks`
+    // keeps advancing — carried by the application processors' LAPIC ticks — and
+    // with them enabled it must run at the PIT's rate. This is what lets a core
+    // wait on another with `IF = 0` (hal-tcb invariant 4.15, retired) and what
+    // component PR-2's capability expiry will tick off.
+    clock::prove_mono();
 
     // Component model PR-1 boot proof (component-model design doc §14): the
     // host hashes the embedded `hello` component's bytes (framed, §6), refuses

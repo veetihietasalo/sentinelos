@@ -2,7 +2,7 @@
 
 One page for a fresh session (or a fresh container) to pick the kernel work back
 up without re-deriving state from git. Update it at the end of any session that
-changes direction; keep it short. Last updated **2026-09-18** (component model PR-1 shipped).
+changes direction; keep it short. Last updated **2026-09-18** (SentinelFS spec review round 1).
 
 ## Landed (main)
 
@@ -28,6 +28,13 @@ changes direction; keep it short. Last updated **2026-09-18** (component model P
   every core (vector 0xF1) driving `sched::on_tick`; the PIT is wall clock only;
   `[sched] ap-preemptive: cpu1 … tick-preempted=N ok` proves timer preemption
   on an AP with bit-exact GEMM state.
+- **Core-independent monotonic clock (SMP 3b-i).** `kernel::clock::mono_ticks()`:
+  max over per-core LAPIC-tick counts aligned on first tick, `fetch_max`, never
+  backwards, ≤1 per tick (Kani). `sched::wait_on_other_core` + the preemption-proof
+  tasks tick off it; hal-tcb invariant 4.15 retired as a hazard (`smp::wait_online`
+  still opens interrupts: the AP it waits for is not ticking yet). Boot proof
+  `[clock] mono: … pit-frozen=yes bsp-stalled-advance=yes rate-ok=yes ok` asserted.
+  Zero `hal` delta.
 - **Component model PR-1 (native).** `kernel::hash` (SHA-256, framed
   `ComponentId`), `kernel::host`: `ComponentRuntime` trait + `native::NativeRuntime`,
   envelope codec (60-byte header, ≤256 B payload), per-instance `InboxRing<Wire, 8>`,
@@ -43,29 +50,45 @@ changes direction; keep it short. Last updated **2026-09-18** (component model P
 
 ## Next (in sequencing order — consensus of 2026-09-18, spec §19)
 
-0. **Core-independent monotonic clock** (SMP 3b-i). LAPIC-tick or TSC derived; retires
-   hal-tcb invariant 4.15 (`pit::ticks()` stalls when the BSP is not servicing IRQ0). Small,
-   no IOAPIC, no MADT walk. Must land before component PR-2 because `expires` and reply
-   timeouts must not tick off a counter another core can stall.
-1. **Component-model PR-2** bus + capabilities: `kernel::cap` fixed slab, `bus::send(cap,
+**Direction (Veeti, 2026-09-18): the filesystem and the login/identity system are the
+next big tracks — "aim for perfection".** Today's `kernel::fs` is a toy (one heap tree
+serialised as a single CRC-32-guarded image over ATA PIO, rewritten whole; a crash mid-write
+loses everything to the seeded fallback) and the Cyber Dusk lock screen checks nothing
+(right arrow unlocks). **SentinelFS spec written and through review round 1**
+(`docs/specs/2026-09-18-sentinelfs-design.md`, §15): copy-on-write, whole-block SHA-256
+hashes on every pointer, two generation-numbered superblock slots (no journal), per-domain
+content-addressed blobs, logged privileged snapshots/rollback, one 64-block cache slab, an
+`sfs-commit` task that does all I/O (never PIO under the lock), deterministic allocation,
+metadata reserve. **Zero new `hal` rows** (`FLUSH CACHE` already exists; FS-1b splits the
+API). Staging: **FS-1a** (blk + superblocks + `MemDevice` with the unflushed-subset crash
+model + cap lattice) → **FS-1b** (CoW tree + transactions + torn-commit proof + flush split)
+→ **FS-2** (files + facade; `read_file` becomes into-buffer, `Corrupt`/`NoSpace` errors;
+fuzz lane lands) → **FS-4** (blobs, snapshots, cap enforcement) → **identity spec** →
+**FS-5** (superblock hash signed into the IntegrityLog). Login/identity spec next: it must
+solve Argon2id's ≥19 MiB vs the 4 MiB heap, wrap both the tree key and the KeyAgent key from
+one unlock secret (resolving component §18.1), and decide the rollback anchor. Component
+PR-2 continues in parallel.
+
+0. **Component-model PR-2** bus + capabilities: `kernel::cap` fixed slab, `bus::send(cap,
    payload)` (the sender never names a target), `Host` becomes kernel-wide, two components +
    one with no cap, denials logged rate-limited, `required`/`optional` caps in manifests.
-   Boot line `[cap] attested-from=yes deny-by-default=yes forge-attempt=refused
-   denies-logged=N ok`. Then **PR-3** delegates with an **ephemeral memory-only key**
-   (`sealing=none secrets-persist=no`). fs key file refused 4/4.
-2. **Memory-boundary gate** (docs, before PR-3 merges): wasm via `wasmi` under the §12
+   `expires` ticks off `clock::mono_ticks()`. Boot line `[cap] attested-from=yes
+   deny-by-default=yes forge-attempt=refused denies-logged=N ok`. Then **PR-3**
+   delegates with an **ephemeral memory-only key** (`sealing=none secrets-persist=no`).
+   fs key file refused 4/4.
+1. **Memory-boundary gate** (docs, before PR-3 merges): wasm via `wasmi` under the §12
    conditions vs ring-3 ELF. Preconditions either way: a gating fuzz lane (none exists),
    `kernel/docs/external-tcb.md` + hal-tcb §1 amendment. Spike baseline in spec §19:
    `wasmi` 2.0 builds for the target, 10 crates, ~135 k lines, 303 `unsafe` sites in `wasmi`
    alone.
-3. **IOAPIC** (SMP 3b-ii) — ACPI MADT walk as a pure `&[u8] -> Result` parser (Kani + fuzz),
+2. **IOAPIC** (SMP 3b-ii) — ACPI MADT walk as a pure `&[u8] -> Result` parser (Kani + fuzz),
    explicit device-IRQ routing, PIC masked. Blocks nothing above; after PR-3. Then: load
    balancing / stealing is a product decision, not a default.
-4. **Component-model PR-4** state objects (signing-key id in records), **PR-5** Sentinel as
+3. **Component-model PR-4** state objects (signing-key id in records), **PR-5** Sentinel as
    components.
-5. **AMX tier / inference workload 2** — `docs/specs/2026-07-16-inference-workload2-design.md`.
-6. **Tiered memory** — `docs/specs/2026-07-14-tiered-memory-design.md` (design only).
-7. **CPU security step 2** — `docs/specs/2026-07-14-cpu-security-features-design.md`.
+4. **AMX tier / inference workload 2** — `docs/specs/2026-07-16-inference-workload2-design.md`.
+5. **Tiered memory** — `docs/specs/2026-07-14-tiered-memory-design.md` (design only).
+6. **CPU security step 2** — `docs/specs/2026-07-14-cpu-security-features-design.md`.
 
 ## Decisions worth remembering
 

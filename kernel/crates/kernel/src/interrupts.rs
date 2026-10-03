@@ -224,8 +224,11 @@ fn handle_timer(_frame: &InterruptFrame) {
     hal::pit::on_tick();
     // Once the LAPIC timer carries the scheduler tick (SMP phase 3), the PIT is
     // wall clock only; before that (or without a LAPIC access path) it still
-    // drives preemption on the BSP as it always did.
+    // drives preemption on the BSP as it always did — and feeds the BSP's
+    // contribution to the monotonic clock (phase 3b-i), so that clock is
+    // continuous across the switch to the LAPIC timer.
     if SCHED_TICK_FROM_PIT.load(Ordering::Relaxed) {
+        crate::clock::on_tick(0);
         crate::sched::on_tick();
     }
 }
@@ -237,9 +240,12 @@ fn handle_timer(_frame: &InterruptFrame) {
 /// [`handle_resched_ipi`] does), then [`crate::sched::on_tick`] on the core
 /// that received it — which may switch this core away right here at the ISR
 /// tail, exactly as the PIT path did on the BSP before phase 3. Does not touch
-/// the PIT tick counter: `hal::pit::ticks` stays the single wall clock.
+/// the PIT tick counter (`hal::pit::ticks` stays the wall clock); it feeds this
+/// core's tick to the core-independent monotonic clock (`crate::clock`, phase
+/// 3b-i) first, so that clock advances whichever core is servicing its timer.
 fn handle_lapic_timer(_frame: &InterruptFrame) {
     hal::apic::eoi();
+    crate::clock::on_tick(crate::smp::this_cpu_index().map_or(0, |i| i as usize));
     crate::sched::on_tick();
 }
 

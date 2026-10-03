@@ -1754,10 +1754,10 @@ fn proof_task_gemm() {
     );
 
     let mut c = [0i32; PREEMPT_PROOF_M * PREEMPT_PROOF_N];
-    let start = hal::pit::ticks();
+    let start = crate::clock::mono_ticks();
     let mut iters: u64 = 0;
     let mut exact = true;
-    while hal::pit::ticks().wrapping_sub(start) < PREEMPT_PROOF_RUN_TICKS
+    while crate::clock::mono_ticks().wrapping_sub(start) < PREEMPT_PROOF_RUN_TICKS
         && iters < PREEMPT_PROOF_ITER_CAP
     {
         crate::ml::gemm_i8(
@@ -1785,9 +1785,9 @@ fn proof_task_gemm() {
 /// also makes progress under the same timer-preemption pressure. Records its
 /// total in [`SPIN_ITERS`].
 fn proof_task_spinner() {
-    let start = hal::pit::ticks();
+    let start = crate::clock::mono_ticks();
     let mut iters: u64 = 0;
-    while hal::pit::ticks().wrapping_sub(start) < PREEMPT_PROOF_RUN_TICKS
+    while crate::clock::mono_ticks().wrapping_sub(start) < PREEMPT_PROOF_RUN_TICKS
         && iters < PREEMPT_PROOF_ITER_CAP
     {
         core::hint::spin_loop();
@@ -1939,24 +1939,26 @@ fn prove_preemptive_on(cpu: u32, label: &str) {
 
 // ── Waiting on another core ─────────────────────────────────────────────────
 
-/// Spin — with interrupts **enabled** on this core — until `done()` holds or
-/// `timeout_ticks` PIT ticks elapse; restores the prior interrupt state and
-/// returns `done()`.
+/// Spin until `done()` holds or `timeout_ticks` ticks of the core-independent
+/// monotonic clock (`crate::clock::mono_ticks`) elapse; returns `done()`.
 ///
-/// Why the interrupt window matters: `kmain` runs its boot proofs with
-/// interrupts disabled between steps, and the PIT wall clock (`hal::pit::ticks`)
-/// advances **only** when the BSP services IRQ0. A BSP that spins with `IF = 0`
-/// waiting for work on another core therefore freezes the very clock that work
-/// is timing itself against (the preemption-proof tasks run for a fixed number
-/// of ticks), and its own timeout never fires either — a mutual wait, observed
-/// as a silent hang the first time two timer-driven tasks ran on an AP. Same
-/// shape as `kernel::smp::wait_online`. Idle-on-the-BSP with interrupts open is
-/// harmless: a tick on an empty queue is a no-op.
+/// History: this used to *have* to run with interrupts enabled, because the
+/// only clock was the PIT and the PIT advances only when the BSP services
+/// IRQ0. A BSP spinning with `IF = 0` for work on another core froze the very
+/// clock that work was timing itself against (the preemption-proof tasks run
+/// for a fixed number of ticks) and its own timeout never fired either — a
+/// mutual wait, observed as a silent hang the first time two timer-driven
+/// tasks ran on an AP (hal-tcb invariant 4.15). Since SMP phase 3b-i both this
+/// deadline and the proof tasks tick off `clock::mono_ticks`, which any ticking
+/// core advances, so the wait is correct with `IF = 0` too. Interrupts are
+/// still opened here on purpose: this core's own tick then also carries the
+/// clock, and a tick on an empty queue is a no-op — belt and braces, not a
+/// requirement.
 fn wait_on_other_core(done: impl Fn() -> bool, timeout_ticks: u64) -> bool {
     let were_enabled = hal::cpu::interrupts_enabled();
     hal::cpu::enable_interrupts();
-    let deadline = hal::pit::ticks().saturating_add(timeout_ticks);
-    while !done() && hal::pit::ticks() < deadline {
+    let deadline = crate::clock::mono_ticks().saturating_add(timeout_ticks);
+    while !done() && crate::clock::mono_ticks() < deadline {
         core::hint::spin_loop();
     }
     if !were_enabled {

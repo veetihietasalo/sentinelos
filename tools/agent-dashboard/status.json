@@ -16,7 +16,7 @@
       "role": "Subsystem design & framekernel decomposition",
       "model": "opus",
       "status": "done",
-      "task": "architect verdicts on Q1-Q3: PR-1 native-first, clock split from IOAPIC, ephemeral key",
+      "task": "SentinelFS spec review (architect seat): layering ok, staging + \u00a77 hash coverage objections",
       "history": [
         {
           "ts": "2026-09-18T16:27:47",
@@ -29,6 +29,18 @@
           "kind": "status",
           "status": "done",
           "task": "architect verdicts on Q1-Q3: PR-1 native-first, clock split from IOAPIC, ephemeral key"
+        },
+        {
+          "ts": "2026-09-18T17:20:29",
+          "kind": "status",
+          "status": "working",
+          "task": "reviewing SentinelFS design spec"
+        },
+        {
+          "ts": "2026-09-18T17:22:44",
+          "kind": "status",
+          "status": "done",
+          "task": "SentinelFS spec review (architect seat): layering ok, staging + \u00a77 hash coverage objections"
         }
       ]
     },
@@ -51,7 +63,7 @@
       "role": "Miri + Kani + fuzz CI gate",
       "model": "opus",
       "status": "done",
-      "task": "Verification-seat view on next PR: native-only PR-1 + fuzz lane",
+      "task": "independent verification-seat review of SentinelFS design (crash-test design, Kani bounding, fuzz/Miri scope)",
       "history": [
         {
           "ts": "2026-09-18T16:28:21",
@@ -64,6 +76,18 @@
           "kind": "status",
           "status": "done",
           "task": "Verification-seat view on next PR: native-only PR-1 + fuzz lane"
+        },
+        {
+          "ts": "2026-09-18T17:21:16",
+          "kind": "status",
+          "status": "working",
+          "task": "reviewing SentinelFS design from verification seat"
+        },
+        {
+          "ts": "2026-09-18T17:23:50",
+          "kind": "status",
+          "status": "done",
+          "task": "independent verification-seat review of SentinelFS design (crash-test design, Kani bounding, fuzz/Miri scope)"
         }
       ]
     },
@@ -86,7 +110,7 @@
       "role": "Adversarial review / human-gate",
       "model": "opus",
       "status": "done",
-      "task": "merge-gate verdict: 3b first, wasmi blocked as written, 5 spec blockers",
+      "task": "SentinelFS design review: 6 blocking items (hal row miscount, extent hash granularity, mid-mutation commit, lock hold time)",
       "history": [
         {
           "ts": "2026-09-18T16:27:57",
@@ -99,6 +123,18 @@
           "kind": "status",
           "status": "done",
           "task": "merge-gate verdict: 3b first, wasmi blocked as written, 5 spec blockers"
+        },
+        {
+          "ts": "2026-09-18T17:20:43",
+          "kind": "status",
+          "status": "working",
+          "task": "Reviewing SentinelFS design spec as merge gate"
+        },
+        {
+          "ts": "2026-09-18T17:23:36",
+          "kind": "status",
+          "status": "done",
+          "task": "SentinelFS design review: 6 blocking items (hal row miscount, extent hash granularity, mid-mutation commit, lock hold time)"
         }
       ]
     },
@@ -128,7 +164,7 @@
       "role": "sentinel-core integration, capabilities, sandbox",
       "model": "opus",
       "status": "done",
-      "task": "Security-seat verdict on next kernel PR: native-only PR-1 (C), ring-3 as trusted boundary, ephemeral key for PR-3",
+      "task": "Security-seat review of SentinelFS design (attestation record, threat-model gaps, encryption placement)",
       "history": [
         {
           "ts": "2026-09-18T16:28:41",
@@ -141,6 +177,18 @@
           "kind": "status",
           "status": "done",
           "task": "Security-seat verdict on next kernel PR: native-only PR-1 (C), ring-3 as trusted boundary, ephemeral key for PR-3"
+        },
+        {
+          "ts": "2026-09-18T17:20:56",
+          "kind": "status",
+          "status": "working",
+          "task": "Security review of SentinelFS design spec"
+        },
+        {
+          "ts": "2026-09-18T17:25:17",
+          "kind": "status",
+          "status": "done",
+          "task": "Security-seat review of SentinelFS design (attestation record, threat-model gaps, encryption placement)"
         }
       ]
     },
@@ -166,5 +214,5 @@
       "task": "\u2014"
     }
   ],
-  "updatedAt": "2026-09-18T16:30:03"
+  "updatedAt": "2026-09-18T17:25:17"
 }

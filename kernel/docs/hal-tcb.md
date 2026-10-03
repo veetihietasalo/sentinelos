@@ -988,9 +988,17 @@ Context` — see the design doc's "sealed capability" argument, mirrored in
     own LAPIC-timer tick (phase 3), so tasks on any core are timer-preempted;
     the PIT (BSP only, via the PIC) is the wall clock `hal::pit::ticks` and the
     LAPIC timer's calibration reference, nothing else.
-15. **The PIT wall clock advances only when the BSP services IRQ0.** Code on the
-    BSP that waits for work on another core must do so with interrupts
-    **enabled** (`kernel::sched::wait_on_other_core`, `kernel::smp::wait_online`);
-    spinning with `IF = 0` freezes the clock that the other core's work may be
-    timing itself against — a mutual wait, seen once as a silent hang. A
-    core-independent clock (LAPIC-timer-derived) is phase-3b work.
+15. **The PIT wall clock advances only when the BSP services IRQ0; nothing that
+    waits across cores may time itself on it.** (Retired as a hazard in SMP
+    phase 3b-i, 2026-09-18.) The safe kernel's `kernel::clock::mono_ticks` is
+    the max over per-core aligned tick counts — advanced by *any* core's LAPIC
+    tick, never backwards, at most one per tick (Kani) — so a BSP spinning with
+    `IF = 0` no longer freezes the clock another core's work is timing itself
+    against, as long as that core is ticking. `sched::wait_on_other_core` and
+    the preemption-proof tasks tick off it; proven at boot by
+    `[clock] mono: … pit-frozen=yes bsp-stalled-advance=yes rate-ok=yes ok`.
+    The one place that still needs the interrupt window is
+    `kernel::smp::wait_online`: it waits for an AP whose timer is not running
+    yet, so only the BSP's own tick can carry either clock there. The PIT
+    remains the wall clock for uptime display and the LAPIC calibration
+    reference (invariant 14).

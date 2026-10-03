@@ -207,9 +207,17 @@ plan; the work shipped in a different order):
 - **Per-core LAPIC timer** (not in the original table): shipped — calibrated against
   the PIT on the BSP, periodic at 100 Hz on every core (vector `0xF1`), carrying
   `sched::on_tick`; the PIT is wall clock only. Proof: `[sched] ap-preemptive: …`.
-- **Phase 2 (IOAPIC)**: still proposed. Device IRQs remain PIC-routed to the BSP
-  through LINT0 = ExtINT. Needs an ACPI MADT walk for the IOAPIC base/GSIs; it is
-  the next SMP step (3b), together with a core-independent wall clock.
+- **Core-independent monotonic clock (3b-i, 2026-09-18)**: shipped as
+  `kernel::clock` — the max over per-core aligned LAPIC-tick counts, advanced by
+  any core, never backwards, at most one per tick (Kani). Cross-core waits and
+  the preemption-proof tasks time on it, so a BSP with `IF = 0` no longer stalls
+  them (hal-tcb invariant 4.15 retired as a hazard). Proof: `[clock] mono: …
+  pit-frozen=yes bsp-stalled-advance=yes rate-ok=yes ok`. The PIT stays the
+  wall clock for uptime and the LAPIC calibration reference.
+- **Phase 2 (IOAPIC, 3b-ii)**: still proposed. Device IRQs remain PIC-routed to
+  the BSP through LINT0 = ExtINT. Needs an ACPI MADT walk for the IOAPIC
+  base/GSIs (a pure `&[u8] -> Result` parser in the safe kernel, Kani + fuzz).
+  Sequenced after component PR-3 (2026-09-18 consensus).
 - **Phase 5 (SMP-safe kernel)**: partially shipped alongside — cross-core console
   lock, the no-allocation-under-IRQ-lock rule, per-core preempt state; the
   input/mouse rings and driver locks are still unaudited for real concurrency.

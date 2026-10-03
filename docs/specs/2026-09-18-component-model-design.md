@@ -1,7 +1,8 @@
 # Component Model — attested messaging, delegates, and content-addressed components
 
-Status: **PR-1 implemented (2026-09-18)** — `kernel::hash`, `kernel::host` (native runtime,
-envelope codec, inbox ring), boot line asserted; review round 1 complete, sequencing and the
+Status: **PR-1 + PR-1b implemented (2026-09-18)** — `kernel::hash`, `kernel::host` (native
+runtime, envelope codec, inbox ring), `kernel::clock` (core-independent monotonic clock), boot
+lines asserted; review round 1 complete, sequencing and the
 three open decisions settled in §19; amendments A5–A10 land with the PRs named there · Tracks A (kernel core)
 + D (security subsystem) · Author: kernel-architect
 Depends on: SMP phases 1–3a (shipped: per-CPU scheduler, IPIs, per-core tick), `kernel::fs`
@@ -364,7 +365,7 @@ Each PR is independently bootable and adds one hard assertion to `cargo xtask te
 | PR | Lands | Boot-proof line (asserted) |
 |---|---|---|
 | **PR-1** hash + host (native) — **shipped 2026-09-18** | `kernel::hash` (SHA-256, framed id §6), `kernel::host` with `ComponentRuntime` + `native::NativeRuntime`, the embedded native `hello` component: a one-bit-wrong id refused before the runtime sees the bytes, the honest id verified, `greet` called through the inbox ring and the envelope codec with the kernel stamping `from` on request and reply. **Zero time-dependent semantics.** Kani (4 new harnesses): id framing injective, codec round-trip, decode total, inbox ring FIFO / never loses / never overwrites; plus SHA-256 padding. | `[comp] hello: id=<first 8 hex> verified=yes wrong-id=refused runtime=native reply=ok ok` |
-| **PR-1b** clock (SMP 3b-i) | A core-independent monotonic clock (LAPIC-tick or TSC derived) so `pit::ticks()` is no longer the only clock; hal-tcb invariant 4.15 retired. No IOAPIC, no MADT walk. **Lands before PR-2** because `expires` and reply timeouts must not tick off a counter another core can stall. | `[clock] mono: source=<lapic\|tsc> cores=N skew-max=N ok` |
+| **PR-1b** clock (SMP 3b-i) — **shipped 2026-09-18** | `kernel::clock`: a core-independent monotonic clock — the max over per-core tick counts aligned on each core's first tick, advanced by *any* core's LAPIC tick via `fetch_max`, never backwards, at most one per tick (Kani). `sched::wait_on_other_core` and the preemption-proof tasks tick off it; hal-tcb invariant 4.15 retired as a hazard. LAPIC-derived, not TSC: zero `hal` delta. No IOAPIC, no MADT walk. Landed before PR-2 because `expires` and reply timeouts must not tick off a counter another core can stall. | `[clock] mono: source=lapic cores=4 ticking=4 lag-max=N pit-frozen=yes bsp-stalled-advance=yes rate=N/N rate-ok=yes ok` |
 | **PR-2** bus + capabilities | `kernel::bus`, `kernel::cap`; two components; one holds a Send cap to the other, a third holds none. `expires` on the mono clock. **Denials logged, rate-limited.** Manifests declare `required` vs `optional` caps: a component missing a required cap refuses to start. | `[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=N ok` |
 | **PR-3** delegates + secrets | `kernel::secrets`, **KeyAgent** with an **ephemeral, memory-only key** (§18.1); zeroization of payload arenas on revoke/exit; a component requests a signature and verifies it; a probe tries to read the secret. | `[delegate] keyagent: signed=ok verified=yes secret-readable=no sealing=none secrets-persist=no ok` |
 | **Gate** memory boundary | Docs: the wasm-vs-ring-3 decision spec with the §12 conditions checked off; `external-tcb.md`; the fuzz lane gating. Must merge **before PR-3**. | n/a |
