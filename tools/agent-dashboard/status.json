@@ -55,14 +55,20 @@
       "name": "kernel-engineer",
       "role": "Safe-Rust kernel implementation",
       "model": "sonnet",
-      "status": "working",
-      "task": "SentinelFS FS-1a: blk + verified cache + superblocks + sfs-commit (cap lattice deferred to FS-1c)",
+      "status": "done",
+      "task": "SentinelFS FS-1a: PR #38 approved (2 review rounds), CI green",
       "history": [
         {
           "ts": "2026-10-03T12:18:31",
           "kind": "status",
           "status": "working",
           "task": "SentinelFS FS-1a: blk + verified cache + superblocks + sfs-commit (cap lattice deferred to FS-1c)"
+        },
+        {
+          "ts": "2026-10-03T16:07:37",
+          "kind": "status",
+          "status": "done",
+          "task": "SentinelFS FS-1a: PR #38 approved (2 review rounds), CI green"
         }
       ]
     },
@@ -117,8 +123,8 @@
       "name": "kernel-reviewer",
       "role": "Adversarial review / human-gate",
       "model": "opus",
-      "status": "done",
-      "task": "SentinelFS design review: 6 blocking items (hal row miscount, extent hash granularity, mid-mutation commit, lock hold time)",
+      "status": "working",
+      "task": "Adversarial review of component-model PR-2 (bus + capabilities)",
       "history": [
         {
           "ts": "2026-09-18T16:27:57",
@@ -143,6 +149,36 @@
           "kind": "status",
           "status": "done",
           "task": "SentinelFS design review: 6 blocking items (hal row miscount, extent hash granularity, mid-mutation commit, lock hold time)"
+        },
+        {
+          "ts": "2026-10-03T13:37:14",
+          "kind": "status",
+          "status": "working",
+          "task": "Adversarial review of SentinelFS FS-1a (c75f2cd)"
+        },
+        {
+          "ts": "2026-10-03T14:02:18",
+          "kind": "status",
+          "status": "done",
+          "task": "FS-1a review: BLOCKED on 1 CI item (cached disk image); code approval-quality, notes filed"
+        },
+        {
+          "ts": "2026-10-03T15:05:43",
+          "kind": "status",
+          "status": "working",
+          "task": "Re-review FS-1a round 2 (d6ee131 + 08edb05)"
+        },
+        {
+          "ts": "2026-10-03T15:18:48",
+          "kind": "status",
+          "status": "done",
+          "task": "FS-1a round 2: APPROVED WITH NOTES (fix no-op cache exclusions before leaving draft)"
+        },
+        {
+          "ts": "2026-10-03T16:07:05",
+          "kind": "status",
+          "status": "working",
+          "task": "Adversarial review of component-model PR-2 (bus + capabilities)"
         }
       ]
     },
@@ -171,8 +207,8 @@
       "name": "security-engineer",
       "role": "sentinel-core integration, capabilities, sandbox",
       "model": "opus",
-      "status": "working",
-      "task": "component PR-2: kernel::cap + kernel::bus, attested from, deny by default",
+      "status": "done",
+      "task": "component PR-2: bus + capabilities committed (e130631), PR #37 under review",
       "history": [
         {
           "ts": "2026-09-18T16:28:41",
@@ -203,6 +239,12 @@
           "kind": "status",
           "status": "working",
           "task": "component PR-2: kernel::cap + kernel::bus, attested from, deny by default"
+        },
+        {
+          "ts": "2026-10-03T16:07:38",
+          "kind": "status",
+          "status": "done",
+          "task": "component PR-2: bus + capabilities committed (e130631), PR #37 under review"
         }
       ]
     },
@@ -228,5 +270,5 @@
       "task": "\u2014"
     }
   ],
-  "updatedAt": "2026-10-03T12:18:31"
+  "updatedAt": "2026-10-03T16:07:38"
 }
