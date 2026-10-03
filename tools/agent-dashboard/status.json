@@ -15,8 +15,8 @@
       "name": "kernel-architect",
       "role": "Subsystem design & framekernel decomposition",
       "model": "opus",
-      "status": "done",
-      "task": "SentinelFS spec review (architect seat): layering ok, staging + \u00a77 hash coverage objections",
+      "status": "working",
+      "task": "T-MAN-1: bind manifest declarations into ComponentId? + CapIndex generation exhaustion",
       "history": [
         {
           "ts": "2026-09-18T16:27:47",
@@ -41,6 +41,12 @@
           "kind": "status",
           "status": "done",
           "task": "SentinelFS spec review (architect seat): layering ok, staging + \u00a77 hash coverage objections"
+        },
+        {
+          "ts": "2026-10-03T16:46:37",
+          "kind": "status",
+          "status": "working",
+          "task": "T-MAN-1: bind manifest declarations into ComponentId? + CapIndex generation exhaustion"
         }
       ]
     },
@@ -123,8 +129,8 @@
       "name": "kernel-reviewer",
       "role": "Adversarial review / human-gate",
       "model": "opus",
-      "status": "working",
-      "task": "Adversarial review of component-model PR-2 (bus + capabilities)",
+      "status": "done",
+      "task": "PR-2 review: BLOCKED (3 small fixes: reply-right lockout, FS-1a pong wait, prod-size sweep test)",
       "history": [
         {
           "ts": "2026-09-18T16:27:57",
@@ -179,6 +185,12 @@
           "kind": "status",
           "status": "working",
           "task": "Adversarial review of component-model PR-2 (bus + capabilities)"
+        },
+        {
+          "ts": "2026-10-03T16:43:00",
+          "kind": "status",
+          "status": "done",
+          "task": "PR-2 review: BLOCKED (3 small fixes: reply-right lockout, FS-1a pong wait, prod-size sweep test)"
         }
       ]
     },
@@ -207,8 +219,8 @@
       "name": "security-engineer",
       "role": "sentinel-core integration, capabilities, sandbox",
       "model": "opus",
-      "status": "done",
-      "task": "component PR-2: bus + capabilities committed (e130631), PR #37 under review",
+      "status": "working",
+      "task": "PR-2 review round 1 fixes: silent-responder lockout, pong exit flag, full-slab sweep test, T-NAT-1 guard",
       "history": [
         {
           "ts": "2026-09-18T16:28:41",
@@ -245,6 +257,12 @@
           "kind": "status",
           "status": "done",
           "task": "component PR-2: bus + capabilities committed (e130631), PR #37 under review"
+        },
+        {
+          "ts": "2026-10-03T16:46:37",
+          "kind": "status",
+          "status": "working",
+          "task": "PR-2 review round 1 fixes: silent-responder lockout, pong exit flag, full-slab sweep test, T-NAT-1 guard"
         }
       ]
     },
@@ -270,5 +288,5 @@
       "task": "\u2014"
     }
   ],
-  "updatedAt": "2026-10-03T16:07:38"
+  "updatedAt": "2026-10-03T16:46:37"
 }
