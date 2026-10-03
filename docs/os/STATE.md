@@ -2,7 +2,7 @@
 
 One page for a fresh session (or a fresh container) to pick the kernel work back
 up without re-deriving state from git. Update it at the end of any session that
-changes direction; keep it short. Last updated **2026-09-18** (SentinelFS spec review round 1).
+changes direction; keep it short. Last updated **2026-10-03** (SentinelFS FS-1a; component PR-2 in flight).
 
 ## Landed (main)
 
@@ -42,9 +42,22 @@ changes direction; keep it short. Last updated **2026-09-18** (SentinelFS spec r
   wrong-id=refused runtime=native reply=ok ok` asserted by `make test`. Five new Kani
   harnesses (framing injective, codec round-trip, decode total, ring FIFO/no-loss,
   SHA padding). Zero `hal` delta; zero time-dependent semantics.
-- **Verification.** Miri (hal + kernel ml/sched) and Kani (hal + kernel) are
-  **gating** CI; every workflow job carries a timeout, machine-checked. Boot
-  timing harness (`make boot-timing`) is informational.
+- **SentinelFS FS-1a (block layer + superblocks).** `kernel::blk`: DMA-shaped
+  `BlockDevice`, `AtaDevice` as an LBA window (SentinelFS lives from LBA 2048 to the end
+  of the dev image until FS-2 moves it to LBA 0; the toy `kernel::fs` keeps LBA 0), host
+  `MemDevice` with the unflushed-subset / torn-sector crash model, verified reads into one
+  64-block slab, per-group bitmaps + one-level index + metadata reserve. `kernel::sfs`:
+  §7.1 superblocks (whole-block hash, `Corrupt` never formatted over), the `sfs-commit`
+  task (64 KiB stack via `sched::spawn_on_with_stack`) as the only device user, commit =
+  dirty → flush → inactive slot → flush. Every `hal::ata` call goes through
+  `blk::ata`'s channel lock (`make check-ata-callers` in CI). `make test` now double-boots a
+  fresh test disk and asserts the chain (`[sfs] mount: gen=2 slot=0 sb=<boot 1's commit>`)
+  plus the toy FS's `persistence PROVEN` line. Scheduler: zombies are reaped only on the
+  idle path (`sched::idle_reap`), never in `reschedule`. Zero `hal` code delta (hal-tcb §5e
+  and §7 text corrected).
+- **Verification.** Miri (hal + kernel ml/hash/host/blk/sfs) and Kani (hal + kernel,
+  28 kernel harnesses, ~5 min) are **gating** CI; every workflow job carries a timeout,
+  machine-checked. Boot timing harness (`make boot-timing`) is informational.
 - **TCB registry.** `kernel/docs/hal-tcb.md` — every `unsafe` op, its argument,
   its evidence. Keep it in step with any `hal` change; reviewers read it first.
 
@@ -60,14 +73,21 @@ hashes on every pointer, two generation-numbered superblock slots (no journal), 
 content-addressed blobs, logged privileged snapshots/rollback, one 64-block cache slab, an
 `sfs-commit` task that does all I/O (never PIO under the lock), deterministic allocation,
 metadata reserve. **Zero new `hal` rows** (`FLUSH CACHE` already exists; FS-1b splits the
-API). Staging: **FS-1a** (blk + superblocks + `MemDevice` with the unflushed-subset crash
-model + cap lattice) → **FS-1b** (CoW tree + transactions + torn-commit proof + flush split)
-→ **FS-2** (files + facade; `read_file` becomes into-buffer, `Corrupt`/`NoSpace` errors;
-fuzz lane lands) → **FS-4** (blobs, snapshots, cap enforcement) → **identity spec** →
-**FS-5** (superblock hash signed into the IntegrityLog). Login/identity spec next: it must
-solve Argon2id's ≥19 MiB vs the 4 MiB heap, wrap both the tree key and the KeyAgent key from
-one unlock secret (resolving component §18.1), and decide the rollback anchor. Component
-PR-2 continues in parallel.
+API). Staging: **FS-1a** (landed, see above) → **FS-1c** (storage-cap lattice type + `⊑` +
+Kani never-amplifies, on top of component PR-2's `kernel::cap`; moved out of FS-1a
+2026-10-03 because `kernel::cap` did not exist yet) → **FS-1b** (CoW tree + transactions +
+torn-commit proof + flush split) → **FS-2** (files + facade; `read_file` becomes
+into-buffer, `Corrupt`/`NoSpace` errors; fuzz lane; persistent orphan list for removes
+beyond `PENDING_MAX`; real entropy for the format seed) → **FS-4** (blobs, snapshots, cap
+enforcement) → **identity spec** → **FS-5** (superblock hash signed into the IntegrityLog).
+Follow-ups owned in the spec as A25–A31. Before FS-2 adds callers that block on the commit
+task: one **sched park/unpark** primitive (wake permit + optional mono deadline), designed
+with component PR-2's blocking bus receive, replacing the task's yield-poll.
+Login/identity spec next: it must solve Argon2id's ≥19 MiB vs the 4 MiB heap (a `hal::mm`
+arena outside the heap), wrap both the tree key and the KeyAgent key from one unlock secret
+(resolving component §18.1), and decide the rollback anchor. The superblock already reserves
+the KDF params at [352,384) and a `keys` pointer at [392,440) to a kind-6 keyring block
+(spec §7.1), so login needs no format bump.
 
 0. **Component-model PR-2** bus + capabilities: `kernel::cap` fixed slab, `bus::send(cap,
    payload)` (the sender never names a target), `Host` becomes kernel-wide, two components +
@@ -121,6 +141,14 @@ PR-2 continues in parallel.
   time is not worth halving a gating proof's margin.
 - **Kernel-crate Kani harnesses must be discharged locally before merge**
   (`cargo kani -p kernel --harness NAME`); see `.github/workflows/verify.yml`.
+- **Boot tests own their disk** (2026-10-03). `make test` / `test-kvm` / `boot-timing` use
+  `target/sentinelos-test-disk.img`, recreated blank every run (`SENTINELOS_KEEP_TEST_DISK=1`
+  opts out); `make run`'s dev image is never touched by a test; CI caches exclude both
+  images. A cached image once made CI's result depend on whoever created the cache.
+- **Reap only on the idle path** (2026-10-03). `reschedule` reaping at IF=0 took the heap
+  lock and could deadlock a core against a task preempted inside the allocator; exits park
+  in a per-core zombie ring and `sched::idle_reap` frees them with interrupts and
+  preemption on. Never allocate or free with interrupts or preemption off (hal-tcb §5e).
 
 ## Working agreements
 
