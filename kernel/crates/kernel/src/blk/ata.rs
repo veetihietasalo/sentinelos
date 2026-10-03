@@ -24,16 +24,23 @@
 //! # Serialising the channel
 //!
 //! `hal::ata` requires that no two command sequences interleave on the primary
-//! channel ("the single-threaded caller guarantees" it). There are now two
-//! callers — the `sfs-commit` task and `kernel::fs` — so every `hal::ata` call
-//! from the kernel goes through [`with_channel`], which holds a kernel-side
-//! channel lock for exactly one command. A holder preempted mid-command is
-//! waited for by **yielding**, never by spinning: on the BSP, where both callers
-//! run, the yield hands the core straight back to the holder.
+//! channel. There are now two callers — the `sfs-commit` task and `kernel::fs`
+//! — so this file is the kernel's **only** door to `hal::ata`: [`identify`],
+//! [`read_sectors`] and [`write_sectors`] each hold a kernel-side channel lock
+//! (`CHANNEL`) for exactly one command, and [`AtaDevice`] is built on them.
+//! `cargo xtask check-ata-callers` (run in CI) fails the build if any other
+//! kernel file names `hal::ata`. A holder preempted mid-command is waited for
+//! by **yielding**, never by spinning: on the BSP, where both callers run, the
+//! yield hands the core straight back to the holder.
+//!
+//! This is disk integrity, not memory safety: `hal::ata`'s port accesses are
+//! sound however they interleave; interleaved commands would only corrupt the
+//! transfer.
 
 use super::{check_range, BlkError, Block, BlockDevice, BlockNo, SECTORS_PER_BLOCK};
-use hal::ata::AtaError;
 use hal::sync::SpinMutex;
+
+pub use hal::ata::{AtaError, DiskInfo, SECTOR_SIZE};
 
 /// First disk sector of the SentinelFS window: 1 MiB in, clear of the old
 /// `kernel::fs` image (sector 0 plus at most 128 payload sectors).
@@ -49,14 +56,44 @@ static CHANNEL: SpinMutex<()> = SpinMutex::new(());
 ///
 /// Waits for a holder by yielding to the scheduler (the holder is on this core
 /// in every current configuration, so it runs next), never by spinning with
-/// the lock contended. Never call this with the `Sfs` lock held.
-pub fn with_channel<R>(op: impl FnOnce() -> R) -> R {
+/// the lock contended. Never called with the `Sfs` lock held (nothing under
+/// that lock does I/O).
+fn with_channel<R>(op: impl FnOnce() -> R) -> R {
     loop {
         if let Some(_held) = CHANNEL.try_lock() {
             return op();
         }
         crate::sched::yield_now();
     }
+}
+
+/// `hal::ata::identify` with the channel held: probe the primary master.
+///
+/// # Errors
+///
+/// As `hal::ata::identify`.
+pub fn identify() -> Result<DiskInfo, AtaError> {
+    with_channel(hal::ata::identify)
+}
+
+/// `hal::ata::read_sectors` with the channel held: read `count` sectors from
+/// `lba` into `buf`.
+///
+/// # Errors
+///
+/// As `hal::ata::read_sectors`.
+pub fn read_sectors(lba: u32, count: u16, buf: &mut [u8]) -> Result<(), AtaError> {
+    with_channel(|| hal::ata::read_sectors(lba, count, buf))
+}
+
+/// `hal::ata::write_sectors` with the channel held: write `count` sectors at
+/// `lba` from `buf` (`hal` ends the command with `FLUSH CACHE`).
+///
+/// # Errors
+///
+/// As `hal::ata::write_sectors`.
+pub fn write_sectors(lba: u32, count: u16, buf: &[u8]) -> Result<(), AtaError> {
+    with_channel(|| hal::ata::write_sectors(lba, count, buf))
 }
 
 fn map_err(e: AtaError) -> BlkError {
@@ -88,7 +125,7 @@ impl AtaDevice {
     /// disk ends at or before `base_lba`; [`BlkError::Io`] on a controller
     /// error.
     pub fn open(base_lba: u32) -> Result<AtaDevice, BlkError> {
-        let info = with_channel(hal::ata::identify).map_err(map_err)?;
+        let info = identify().map_err(map_err)?;
         let sectors = u64::from(info.sectors);
         let base = u64::from(base_lba);
         if sectors <= base {
@@ -128,7 +165,7 @@ impl BlockDevice for AtaDevice {
             let lba = self.lba_of(at)?;
             let sectors = (chunk.len() * SECTORS_PER_BLOCK) as u16;
             let bytes = chunk.as_flattened_mut();
-            with_channel(|| hal::ata::read_sectors(lba, sectors, bytes)).map_err(map_err)?;
+            read_sectors(lba, sectors, bytes).map_err(map_err)?;
             at += chunk.len() as u64;
         }
         Ok(())
@@ -142,7 +179,7 @@ impl BlockDevice for AtaDevice {
             let sectors = (chunk.len() * SECTORS_PER_BLOCK) as u16;
             let bytes = chunk.as_flattened();
             // `hal::ata::write_sectors` ends with FLUSH CACHE (module docs).
-            with_channel(|| hal::ata::write_sectors(lba, sectors, bytes)).map_err(map_err)?;
+            write_sectors(lba, sectors, bytes).map_err(map_err)?;
             at += chunk.len() as u64;
         }
         Ok(())

@@ -9,11 +9,16 @@
 //! 128   48  root: Pointer        176  48  blobs: Pointer    224  48  roots: Pointer
 //! 272   48  free: Pointer (the group index)
 //! 320    8  next_obj             328   8  committed_at (mono ticks; informational)
-//! 336   16  dirent_key           352  32  kdf_params + wrap slot (zero until the
-//!                                          identity spec defines it)
+//! 336   16  dirent_key           352  32  kdf_params (zero until the identity
+//!                                          spec defines them)
 //! 384    8  reserve_blocks_per_group
-//! 392    …  zero
+//! 392   48  keys: Pointer        reserved: the keyring block (kind 6); null
+//! 440    …  zero
 //! ```
+//!
+//! The reserved fields are named here ([`KDF_ALG`] … [`KDF_SALT`], [`OFF_KEYS`])
+//! but not decoded: v2 refuses a slot unless `kdf_params` and everything from
+//! [`SB_END`] on (so `keys` too) is zero.
 //!
 //! Every meaningful byte lives in the block's **first sector**; sectors 1–7
 //! are zero. So on a slot whose old content is zero (format zeroes both slots
@@ -36,12 +41,35 @@ use crate::blk::{Block, BLOCK_SIZE, SECTOR_SIZE};
 pub const MAGIC: [u8; 8] = *b"SNTLFS02";
 /// The format version.
 pub const VERSION: u32 = 2;
-/// Length of the KDF-parameters + wrapped-key slot.
+/// Length of the KDF-parameters field at offset 352 (§7.1), reserved for the
+/// identity spec: `alg u16 | ver u16 | m_kib u32 | t u32 | p u32 | salt [16]`.
+/// Wrapped keys do **not** live here (an AEAD-wrapped 256-bit key alone needs
+/// 48 bytes) but in the keyring block [`OFF_KEYS`] names.
 pub const KDF_LEN: usize = 32;
+/// Offset of `alg` (u16) inside the KDF field.
+pub const KDF_ALG: usize = 0;
+/// Offset of `ver` (u16) inside the KDF field.
+pub const KDF_VER: usize = 2;
+/// Offset of `m_kib` (u32, memory cost in KiB) inside the KDF field.
+pub const KDF_M_KIB: usize = 4;
+/// Offset of `t` (u32, time cost) inside the KDF field.
+pub const KDF_T: usize = 8;
+/// Offset of `p` (u32, parallelism) inside the KDF field.
+pub const KDF_P: usize = 12;
+/// Offset of the 16-byte `salt` inside the KDF field.
+pub const KDF_SALT: usize = 16;
 /// Length of the dirent-name hash key.
 pub const DIRENT_KEY_LEN: usize = 16;
-/// End of the encoded fields; everything after is zero.
+/// End of the encoded fields; everything after is zero in v2.
 pub const SB_END: usize = 392;
+/// Reserved: offset of the `keys` [`Pointer`] to the copy-on-write keyring
+/// metadata block (kind 6) that will hold every wrapped key — the tree key,
+/// the KeyAgent key, later recovery and per-user slots. Null in v2, so v2's
+/// zero check of `[SB_END, 4096)` covers it unchanged.
+pub const OFF_KEYS: usize = SB_END;
+/// End of the reserved `keys` pointer: superblock content stays below the
+/// first sector's end.
+pub const KEYS_END: usize = OFF_KEYS + POINTER_LEN;
 
 const OFF_MAGIC: usize = 64;
 const OFF_VERSION: usize = 72;
@@ -59,9 +87,13 @@ const OFF_DIRENT_KEY: usize = 336;
 const OFF_KDF: usize = 352;
 const OFF_RESERVE: usize = 384;
 
-// The single-sector property the module docs rely on, and the fields start
-// after the metadata header.
-const _: () = assert!(SB_END <= SECTOR_SIZE && HEADER_LEN <= OFF_MAGIC);
+// The single-sector property the module docs rely on (reserved fields
+// included), the fields start after the metadata header, and the KDF layout
+// fills its field exactly.
+const _: () = assert!(KEYS_END <= SECTOR_SIZE && HEADER_LEN <= OFF_MAGIC);
+const _: () = assert!(KDF_ALG + 2 == KDF_VER && KDF_VER + 2 == KDF_M_KIB);
+const _: () = assert!(KDF_M_KIB + 4 == KDF_T && KDF_T + 4 == KDF_P && KDF_P + 4 == KDF_SALT);
+const _: () = assert!(KDF_SALT + 16 == KDF_LEN && OFF_KDF + KDF_LEN == OFF_RESERVE);
 
 /// A decoded superblock.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,8 +118,9 @@ pub struct Superblock {
     pub committed_at: u64,
     /// Key for the dirent name hash (§7.2): not secret.
     pub dirent_key: [u8; DIRENT_KEY_LEN],
-    /// Reserved for the identity spec (§10): KDF parameters and the wrapped
-    /// tree key, inside the hashed superblock. Must be zero in v2 until then.
+    /// Reserved for the identity spec (§10): the KDF parameters
+    /// ([`KDF_ALG`] … [`KDF_SALT`]), inside the hashed superblock. Must be
+    /// zero in v2 until then.
     pub kdf: [u8; KDF_LEN],
     /// The metadata reserve per group (§5.8).
     pub reserve_per_group: u64,
@@ -427,8 +460,12 @@ mod tests {
             reject(&|s| s.reserve_per_group = u64::from(GROUP_BLOCKS) + 1),
             Err(SlotError::Malformed)
         );
+        // Not validated at mount (§7.1): the dirent key, `committed_at` (per
+        // boot, informational) and `next_obj`.
         assert!(reject(&|s| s.dirent_key = [0; 16]).is_ok());
         assert!(reject(&|s| s.committed_at = u64::MAX).is_ok());
+        assert!(reject(&|s| s.next_obj = 0).is_ok());
+        assert!(reject(&|s| s.next_obj = u64::MAX).is_ok());
     }
 
     #[test]
@@ -467,6 +504,16 @@ mod tests {
             Err(SlotError::Malformed)
         );
         assert_eq!(reseal(&|x| x[OFF_FREE + 5] = 1), Err(SlotError::Malformed));
+        // The reserved fields: KDF parameters and the `keys` pointer are zero
+        // in v2 (a kernel that cannot unwrap must never mount as plaintext).
+        for off in [
+            OFF_KDF + KDF_ALG,
+            OFF_KDF + KDF_SALT + 15,
+            OFF_KEYS,
+            KEYS_END - 1,
+        ] {
+            assert_eq!(reseal(&|x| x[off] = 1), Err(SlotError::Malformed), "{off}");
+        }
     }
 
     #[test]

@@ -210,6 +210,15 @@ trampoline path needs no lock hand-off.
   3. `PREEMPT_COUNT` is 0 across every `switch` (both leaving and entering sides).
   4. `ready` never contains `current`; every live `TaskId` is in `tasks`; no id is duplicated across `current`/`ready`/`zombie`.
   5. A task never frees its own running stack: `exit()` parks its TCB in `zombie`, switches away, and the *next* scheduler pass reaps it.
+     **As built since the FS-1a review:** no scheduler pass reaps. A reap inside
+     `schedule()` runs with interrupts disabled, and freeing takes the heap lock:
+     if a task preempted on the same core held it, the next yield (or draining
+     `preempt_enable`) spun forever and froze the core. `exit()` now parks the id
+     in a per-core zombie *ring* (`CpuSched::zombies`, capacity `MAX_TASKS`, so
+     several exits between idle passes are all kept), and only the idle task frees
+     zombies — `sched::idle_reap`, called from kmain's idle loop and `ap_idle_loop`
+     — dropping each `Box<Task>` with no lock held and interrupts and preemption
+     enabled. Kani: `zombies_wait_for_the_idle_and_are_never_lost_bounded`.
 - **Stack sizing:** default 4 pages (16 KiB). A task preempted in the timer IRQ
   holds one `isr_common` frame + its 4 KiB per-IRQ xsave area on its stack; interrupt
   gates keep IF clear in the handler so timer nesting depth is 1 (bounded).

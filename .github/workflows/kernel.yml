@@ -57,11 +57,16 @@ jobs:
       - name: Cache Cargo registry + build artefacts
         uses: actions/cache@v4
         with:
+          # Never cache a disk image: a stale one would make the boot test depend
+          # on whatever an older kernel wrote. (The boot tests also recreate
+          # their own image every run; the dev image is `make run`'s.)
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             kernel/target
+            !kernel/target/sentinelos-disk.img
+            !kernel/target/sentinelos-test-disk.img
           key: ${{ runner.os }}-cargo-${{ hashFiles('kernel/Cargo.lock', 'kernel/xtask/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
@@ -136,12 +141,24 @@ jobs:
             --target x86_64-unknown-linux-gnu --target-dir target/xtask
           make check-no-vector
 
+      # ── 8d. One door to the ATA channel ───────────────────────────────────
+      # `kernel::blk::ata` holds the IDE channel lock around every `hal::ata`
+      # command (the toy FS and the `sfs-commit` task share the disk). Fail the
+      # build if any other kernel file names `hal::ata` (comments and strings
+      # ignored), so the lock cannot be bypassed by accident.
+      - name: check-ata-callers
+        working-directory: kernel
+        run: make check-ata-callers
+
       # ── 9. Boot test (deterministic QEMU serial-output check) ─────────────
       # `make test` (host-detecting wrapper over xtask — works on this Linux
-      # runner and on macOS) builds the ISO, boots QEMU headless, captures serial
-      # output to target/serial.log, and asserts the "SentinelOS — boot bring-up
-      # OK" banner plus the boot-bringup-ok end-marker (now including the
-      # interrupts-on GEMM proof `gemm-under-irq: … -> ok`).
+      # runner and on macOS) builds the ISO, recreates its own blank test disk
+      # (target/sentinelos-test-disk.img), and boots QEMU headless TWICE on it,
+      # capturing serial output to target/serial.log and target/serial-boot2.log.
+      # Every boot line is asserted on both boots, plus the persistence chain
+      # between them (SentinelFS: format → gen 1 → commit gen 2, then mount gen 2
+      # with boot 1's superblock hash → commit gen 3; the toy FS: first boot,
+      # then PROVEN).
       - name: make test (boot test)
         working-directory: kernel
         run: make test
@@ -152,5 +169,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: serial-log
-          path: kernel/target/serial.log
+          path: |
+            kernel/target/serial.log
+            kernel/target/serial-boot2.log
           if-no-files-found: ignore

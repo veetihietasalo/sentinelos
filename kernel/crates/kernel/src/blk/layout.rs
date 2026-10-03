@@ -8,6 +8,7 @@
 //!                    covers kind, gen, tree_id, fs_uuid and the payload (A1)
 //! 32    8  gen       generation that wrote this block (informational)
 //! 40    4  kind      1 superblock · 2 tree node · 3 bitmap · 5 group index
+//!                    (6 keyring: reserved for the identity spec, refused in v2)
 //! 44    4  tree_id   0 none · 1 root · 2 blobs · 3 roots · 4 free
 //! 48   16  fs_uuid   the filesystem this block belongs to
 //! ```

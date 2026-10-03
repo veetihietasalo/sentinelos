@@ -12,7 +12,7 @@
 //! - [`key`] — the 17-byte item key (A10) and the blob-domain encoding (A12).
 //! - [`volume`] — format, mount, and the §8 commit protocol (dirty blocks →
 //!   flush → superblock into the inactive slot → flush), over any
-//!   [`crate::blk::BlockDevice`]; host-tested on [`crate::blk::mem::MemDevice`]
+//!   [`crate::blk::BlockDevice`]; host-tested on `crate::blk::mem::MemDevice`
 //!   with the crash model.
 //! - [`service`] — the kernel instance: the `sfs-commit` task (the only code
 //!   that touches the device; never I/O under the `Sfs` lock; pacing off

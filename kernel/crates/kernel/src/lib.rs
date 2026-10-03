@@ -345,6 +345,9 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
     loop {
         // Sleep until the next interrupt (a PIT tick or a keystroke).
         hal::cpu::halt();
+        // Free the tasks that exited on this core since the last pass — only
+        // the idle task reaps (see `sched::idle_reap`).
+        sched::idle_reap();
 
         // 1) Service all pending keyboard bytes through the safe decoder. While
         //    locked, the right-arrow (or Enter) starts the unlock; on the desktop

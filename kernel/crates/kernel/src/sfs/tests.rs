@@ -402,11 +402,81 @@ fn an_evicted_bitmap_is_a_miss_that_a_verified_read_resolves() {
     assert!(v.drop_clean(p.block));
     assert_eq!(v.alloc(AllocClass::Normal, None), Err(AllocError::Miss(p)));
     assert!(!v.is_dirty(), "a miss changes nothing");
-    let mut wrong = p;
-    wrong.hash[0] ^= 1;
-    assert_eq!(v.load(&mut d, &mut ws, &wrong), Err(CommitError::Corrupt));
     v.load(&mut d, &mut ws, &p).unwrap();
+    assert!(!v.is_read_only());
     assert_eq!(v.alloc(AllocClass::Normal, None), Ok(BlockNo(5)));
+}
+
+/// A two-group image whose next transaction can be made to miss at seal time.
+fn two_groups() -> MemDevice {
+    formatted(u64::from(crate::blk::geometry::GROUP_BLOCKS) + 200)
+}
+
+/// Mount `d`, open a transaction confined to group 1 and evict group 0's
+/// committed bitmap: the seal then misses on it (the index lives in group 0).
+fn missing_group0(d: &mut MemDevice) -> (Box<Volume>, Pointer) {
+    let mut v = mount(d).unwrap();
+    v.alloc(AllocClass::Normal, Some(1)).unwrap();
+    let p0 = v.allocator().group_pointer(0).unwrap();
+    assert!(v.drop_clean(p0.block));
+    (v, p0)
+}
+
+/// FS-1a review: a miss that cannot be resolved — the read failed, the block
+/// no longer matches its pointer — leaves the volume read-only, so the commit
+/// task stops instead of re-reading the bad block every commit interval. The
+/// committed generation on disk is untouched.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn an_unresolvable_miss_leaves_the_volume_read_only() {
+    let mut d = two_groups();
+    let mut flipped = zeroed_blocks(1);
+
+    for case in 0..2 {
+        let (mut v, p0) = missing_group0(&mut d);
+        // The service's shape: the seal misses, the task reads (no lock held)
+        // and hands the result back.
+        assert_eq!(v.begin_commit(3), Err(CommitError::Miss(p0)));
+        let (read, want) = if case == 0 {
+            (Err(BlkError::Io), CommitError::Io(BlkError::Io))
+        } else {
+            d.read_blocks(p0.block, &mut flipped).unwrap();
+            flipped[0][HEADER_LEN] ^= 1;
+            (Ok(&flipped[0]), CommitError::Corrupt)
+        };
+        assert_eq!(v.resolve_miss(&p0, read), Err(want));
+        assert!(v.is_read_only());
+        assert_eq!(v.begin_commit(4), Err(CommitError::ReadOnly), "no retry");
+        assert_eq!(v.alloc(AllocClass::Normal, None), Err(AllocError::Sealed));
+    }
+
+    // The synchronous form, with the block on disk itself gone bad.
+    let (mut v, p0) = missing_group0(&mut d);
+    let at = p0.block.0 as usize * BLOCK_SIZE + HEADER_LEN;
+    d.image_mut()[at] ^= 1;
+    let mut ws = Workspace::new();
+    assert_eq!(v.commit(&mut d, &mut ws, 5), Err(CommitError::Corrupt));
+    assert!(v.is_read_only());
+    assert_eq!(v.commit(&mut d, &mut ws, 6), Err(CommitError::ReadOnly));
+    // Nothing was written: with the byte restored, generation 1 mounts.
+    d.image_mut()[at] ^= 1;
+    assert_eq!(mount(&mut d).unwrap().info().gen, 1);
+}
+
+/// A seal that keeps missing cannot loop a caller forever: after
+/// `MAX_SEAL_RETRIES` misses the volume gives up, read-only.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_seal_that_keeps_missing_gives_up_read_only() {
+    use super::volume::MAX_SEAL_RETRIES;
+    let mut d = two_groups();
+    let (mut v, p0) = missing_group0(&mut d);
+    for _ in 0..MAX_SEAL_RETRIES {
+        assert_eq!(v.begin_commit(1), Err(CommitError::Miss(p0)));
+        assert!(!v.is_read_only());
+    }
+    assert_eq!(v.begin_commit(1), Err(CommitError::Internal));
+    assert!(v.is_read_only());
 }
 
 /// A transaction confined to group 1 still needs group 0 at seal time (the
@@ -630,6 +700,9 @@ fn corpus_base_is_what_the_cases_assume() {
     );
 }
 
+/// One corpus entry: a name, the image, and the outcome it must classify as.
+type CorpusCase = (&'static str, Vec<u8>, fn(Outcome) -> bool);
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn adversarial_mount_corpus() {
@@ -641,9 +714,9 @@ fn adversarial_mount_corpus() {
     };
     let index = active_index_block(&base);
     let bitmap = active_bitmap_block(&base);
-    let mut cases: Vec<(&str, Vec<u8>, fn(Outcome) -> bool)> = Vec::new();
+    let mut cases: Vec<CorpusCase> = Vec::new();
     let case = |name: &'static str,
-                cases: &mut Vec<(&str, Vec<u8>, fn(Outcome) -> bool)>,
+                cases: &mut Vec<CorpusCase>,
                 f: &dyn Fn(&mut Vec<u8>),
                 want: fn(Outcome) -> bool| {
         let mut img = base.clone();

@@ -4,7 +4,9 @@
 //!
 //! This module carries the crate's `#![forbid(unsafe_code)]` and keeps the tree
 //! itself entirely on the kernel heap (`alloc`); all disk access is delegated to
-//! the safe [`hal::ata`] block API (the `unsafe` port I/O lives in the TCB). It
+//! the safe [`hal::ata`] block API (the `unsafe` port I/O lives in the TCB),
+//! through [`crate::blk::ata`]'s wrappers, which hold the IDE channel for each
+//! command (the `sfs-commit` task shares the disk). It
 //! uses no `core::fmt` — it is a pure data structure plus a small path resolver
 //! and a byte-oriented (de)serialiser.
 //!
@@ -570,12 +572,10 @@ fn split_parent(components: &[String]) -> Result<(&[String], &str), FsError> {
 /// ```
 mod disk {
     use super::Node;
-    #[cfg(not(test))]
-    use crate::blk::ata::with_channel;
+    use crate::blk::ata::{self, SECTOR_SIZE};
     use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
-    use hal::ata::{self, SECTOR_SIZE};
 
     /// The 8-byte magic identifying a SentinelOS filesystem image (`"SNTLFS01"`).
     const MAGIC: &[u8; 8] = b"SNTLFS01";
@@ -607,9 +607,7 @@ mod disk {
     /// `cfg(test)` so host unit tests never perform port I/O.
     #[cfg(not(test))]
     pub(super) fn probe() -> Option<Geometry> {
-        // Every `hal::ata` command runs with the IDE channel held: the
-        // `sfs-commit` task shares the disk (`kernel::blk::ata::with_channel`).
-        match with_channel(ata::identify) {
+        match ata::identify() {
             Ok(info) => Some(Geometry {
                 sectors: info.sectors,
             }),
@@ -650,7 +648,7 @@ mod disk {
 
         // Read the superblock (sector 0).
         let mut sb = vec![0u8; SECTOR_SIZE];
-        with_channel(|| ata::read_sectors(0, 1, &mut sb)).ok()?;
+        ata::read_sectors(0, 1, &mut sb).ok()?;
         if &sb[0..8] != MAGIC {
             return None;
         }
@@ -677,13 +675,11 @@ mod disk {
         while done < sectors {
             let chunk = (sectors - done).min(256);
             let off = done * SECTOR_SIZE;
-            with_channel(|| {
-                ata::read_sectors(
-                    (1 + done) as u32,
-                    chunk as u16,
-                    &mut buf[off..off + chunk * SECTOR_SIZE],
-                )
-            })
+            ata::read_sectors(
+                (1 + done) as u32,
+                chunk as u16,
+                &mut buf[off..off + chunk * SECTOR_SIZE],
+            )
             .ok()?;
             done += chunk;
         }
@@ -740,13 +736,11 @@ mod disk {
         while done < total_sectors {
             let chunk = (total_sectors - done).min(256);
             let off = done * SECTOR_SIZE;
-            with_channel(|| {
-                ata::write_sectors(
-                    done as u32,
-                    chunk as u16,
-                    &image[off..off + chunk * SECTOR_SIZE],
-                )
-            })
+            ata::write_sectors(
+                done as u32,
+                chunk as u16,
+                &image[off..off + chunk * SECTOR_SIZE],
+            )
             .map_err(|_| ())?;
             done += chunk;
         }

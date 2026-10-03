@@ -44,10 +44,11 @@ use alloc::vec;
 
 /// First object id a fresh filesystem hands out.
 pub const FIRST_OBJ: u64 = 1;
-/// How many times a commit re-tries its seal after reading a missing
-/// committed bitmap. Today a seal can only miss group 0's (every other group
-/// it touches was copied when the transaction changed it); the bound is
-/// generous so a later caller cannot loop forever.
+/// How many misses one commit's seal may report before the volume gives up
+/// and goes read-only ([`Volume::begin_commit`] counts them). Today a seal can
+/// only miss group 0's committed bitmap (every other group it touches was
+/// copied when the transaction changed it); the bound is generous, and it is
+/// what guarantees a caller's resolve-and-retry loop ends.
 pub const MAX_SEAL_RETRIES: usize = MAX_GROUPS as usize + 2;
 
 /// Caller-owned I/O scratch for format / mount / commit: two staging blocks
@@ -454,6 +455,8 @@ pub struct Volume {
     nplan: usize,
     next: Option<Staged>,
     sb_buf: Blocks,
+    /// Misses the current seal has reported (reset once a seal succeeds).
+    seal_misses: usize,
 }
 
 /// Read `p` into the cache through `staging`, verifying its metadata hash
@@ -576,6 +579,7 @@ impl Volume {
             nplan: 0,
             next: None,
             sb_buf: zeroed_blocks(1),
+            seal_misses: 0,
         }))
     }
 
@@ -605,7 +609,8 @@ impl Volume {
         self.alloc.is_dirty() || self.cache.dirty_count() > 0
     }
 
-    /// Whether the volume refuses changes after a failed commit.
+    /// Whether the volume refuses changes after a failed commit or a failed
+    /// miss resolution ([`Volume::resolve_miss`], [`Volume::load`]).
     #[must_use]
     pub fn is_read_only(&self) -> bool {
         self.state == State::ReadOnly
@@ -675,23 +680,45 @@ impl Volume {
         self.cache.evict(block)
     }
 
-    /// Insert a block read to resolve a [`AllocError::Miss`] /
-    /// [`CommitError::Miss`]: verified against `p` before it enters the cache.
+    /// Resolve a miss ([`AllocError::Miss`] / [`CommitError::Miss`]) for `p`
+    /// with `read`, the outcome of reading block `p.block` from the device
+    /// (the caller does the I/O, with no lock held): the block enters the
+    /// cache only if it hashes to `p`.
+    ///
+    /// **A failed read, or a block that no longer matches its hash, leaves the
+    /// volume read-only.** Committed metadata that cannot be read back intact
+    /// means this transaction can never be sealed; staying writable would
+    /// only re-read the same bad block every commit interval. The committed
+    /// generation on disk is untouched either way.
     ///
     /// # Errors
     ///
-    /// [`CacheError::Corrupt`] if `block` does not hash to `p`.
-    pub fn insert_loaded(&mut self, p: &Pointer, block: &Block) -> Result<(), CacheError> {
-        self.cache
+    /// [`CommitError::Io`] (the read failed), [`CommitError::Corrupt`] (the
+    /// block failed its hash) or [`CommitError::Internal`] (the cache refused
+    /// a verified block) — the volume is read-only after each.
+    pub fn resolve_miss(
+        &mut self,
+        p: &Pointer,
+        read: Result<&Block, BlkError>,
+    ) -> Result<(), CommitError> {
+        let block = read.map_err(|e| self.fail(CommitError::Io(e)))?;
+        match self
+            .cache
             .insert_verified(p.block, HashRule::Metadata, &p.hash, block)
-            .map(|_| ())
+        {
+            Ok(_) => Ok(()),
+            Err(CacheError::Corrupt) => Err(self.fail(CommitError::Corrupt)),
+            Err(_) => Err(self.fail(CommitError::Internal)),
+        }
     }
 
-    /// Read `p` from `dev` and insert it (synchronous form of a miss).
+    /// Read `p` from `dev` and insert it — the synchronous form of
+    /// [`Volume::resolve_miss`], with the same rule: on failure the volume
+    /// is read-only. A resident verified copy is reused without I/O.
     ///
     /// # Errors
     ///
-    /// [`CommitError::Io`] / [`CommitError::Corrupt`].
+    /// [`CommitError::Io`] / [`CommitError::Corrupt`], volume read-only.
     pub fn load<D: BlockDevice>(
         &mut self,
         dev: &mut D,
@@ -700,8 +727,8 @@ impl Volume {
     ) -> Result<(), CommitError> {
         match read_verified(dev, &mut self.cache, ws.one(), p) {
             Ok(_) => Ok(()),
-            Err(ReadError::Io(e)) => Err(CommitError::Io(e)),
-            Err(ReadError::Corrupt) => Err(CommitError::Corrupt),
+            Err(ReadError::Io(e)) => Err(self.fail(CommitError::Io(e))),
+            Err(ReadError::Corrupt) => Err(self.fail(CommitError::Corrupt)),
         }
     }
 
@@ -726,8 +753,10 @@ impl Volume {
     /// Phase 1: seal the transaction and stage the next superblock (`gen + 1`
     /// into the inactive slot, `committed_at = now`). In memory and bounded;
     /// the kernel holds the `Sfs` lock around it. A [`CommitError::Miss`]
-    /// changes nothing: read the block ([`insert_loaded`](Self::insert_loaded))
-    /// and call again.
+    /// changes nothing but a count: read the block, hand it to
+    /// [`resolve_miss`](Self::resolve_miss) and call again. Past
+    /// [`MAX_SEAL_RETRIES`] misses in one seal the volume goes read-only
+    /// ([`CommitError::Internal`]), so that loop always ends.
     ///
     /// # Errors
     ///
@@ -747,9 +776,16 @@ impl Volume {
             .ok_or(CommitError::GenExhausted)?;
         let index = match self.alloc.seal(&mut self.cache, gen) {
             Ok(i) => i,
-            Err(AllocError::Miss(p)) => return Err(CommitError::Miss(p)),
+            Err(AllocError::Miss(_)) if self.seal_misses >= MAX_SEAL_RETRIES => {
+                return Err(self.fail(CommitError::Internal))
+            }
+            Err(AllocError::Miss(p)) => {
+                self.seal_misses += 1;
+                return Err(CommitError::Miss(p));
+            }
             Err(e) => return Err(self.fail(CommitError::Alloc(e))),
         };
+        self.seal_misses = 0;
         let n = match self.alloc.sealed_entries(&mut self.plan) {
             Ok(n) => n,
             Err(e) => return Err(self.fail(CommitError::Alloc(e))),
@@ -846,21 +882,19 @@ impl Volume {
     ///
     /// # Errors
     ///
-    /// As the three phases.
+    /// As the three phases; a miss that cannot be resolved leaves the volume
+    /// read-only ([`Volume::load`]).
     pub fn commit<D: BlockDevice>(
         &mut self,
         dev: &mut D,
         ws: &mut Workspace,
         now: u64,
     ) -> Result<CommitInfo, CommitError> {
-        let mut retries = 0;
+        // Ends: `begin_commit` stops reporting misses after MAX_SEAL_RETRIES.
         let plan = loop {
             match self.begin_commit(now) {
                 Ok(plan) => break plan,
-                Err(CommitError::Miss(p)) if retries < MAX_SEAL_RETRIES => {
-                    retries += 1;
-                    self.load(dev, ws, &p)?;
-                }
+                Err(CommitError::Miss(p)) => self.load(dev, ws, &p)?,
                 Err(e) => return Err(e),
             }
         };

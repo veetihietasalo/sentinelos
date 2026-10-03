@@ -37,7 +37,7 @@
 use super::short_hex;
 use super::volume::{
     self, write_commit, CommitError, CommitInfo, FormatError, FormatInfo, FormatParams, MountError,
-    MountInfo, Volume, Workspace, MAX_SEAL_RETRIES,
+    MountInfo, Volume, Workspace,
 };
 use crate::blk::ata::{AtaDevice, SFS_BASE_LBA};
 use crate::blk::{BlkError, BlockDevice};
@@ -285,26 +285,28 @@ fn commit_task() {
 fn run_commit(dev: &mut AtaDevice, ws: &mut Workspace) {
     let now = clock::mono_ticks();
     let ticket = with_sfs(|s| s.requested);
-    // Phase 1 under the lock; a miss is read with the lock released.
-    let mut retries = 0;
+    // Phase 1 under the lock; a miss is read with the lock released and
+    // handed back to the volume, which goes read-only if the read failed or
+    // the block no longer matches its hash. Ends: `begin_commit` stops
+    // reporting misses after `MAX_SEAL_RETRIES`.
     let plan = loop {
         let begun = with_sfs(|s| match s.volume.as_mut() {
             Some(v) => v.begin_commit(now),
             None => Err(CommitError::Internal),
         });
-        match begun {
-            Err(CommitError::Miss(p)) if retries < MAX_SEAL_RETRIES => {
-                retries += 1;
-                let staging = ws.block();
-                if let Err(e) = dev.read_blocks(p.block, core::slice::from_mut(staging)) {
-                    break Err(CommitError::Io(e));
-                }
-                let loaded = with_sfs(|s| s.volume.as_mut().map(|v| v.insert_loaded(&p, staging)));
-                if !matches!(loaded, Some(Ok(()))) {
-                    break Err(CommitError::Corrupt);
-                }
-            }
-            other => break other,
+        let Err(CommitError::Miss(p)) = begun else {
+            break begun;
+        };
+        let staging = ws.block();
+        let read = dev
+            .read_blocks(p.block, core::slice::from_mut(staging))
+            .map(|()| &*staging);
+        let resolved = with_sfs(|s| match s.volume.as_mut() {
+            Some(v) => v.resolve_miss(&p, read),
+            None => Err(CommitError::Internal),
+        });
+        if let Err(e) = resolved {
+            break Err(e);
         }
     };
     // Phase 2 without the lock (each block is copied out under it), then

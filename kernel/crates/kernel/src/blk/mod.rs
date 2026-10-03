@@ -7,9 +7,10 @@
 //!   [`BlockDevice::flush`], shaped for DMA now (amendment A11) so the format
 //!   never changes when NVMe / virtio-blk arrive. Two implementations:
 //!   [`ata::AtaDevice`] (8 ATA sectors per block over `hal::ata`'s existing safe
-//!   API, inside a block *window* of the disk) and [`mem::MemDevice`] (the host
+//!   API, inside a block *window* of the disk) and `mem::MemDevice` (the host
 //!   model with the §8 crash model: crash at a write index, torn sectors on the
-//!   superblock slots, and the unflushed-subset durability model, A16).
+//!   superblock slots, and the unflushed-subset durability model, A16; host
+//!   builds only — it is not compiled into the bare-metal image).
 //! - [`layout`] — the 64-byte metadata header, [`layout::Pointer`], and the two
 //!   hash rules (metadata: the whole block with the hash field zeroed, A1;
 //!   data: the whole block).
@@ -36,6 +37,9 @@ pub mod bitmap;
 pub mod cache;
 pub mod geometry;
 pub mod layout;
+// The crash-model device is for host builds (tests, Kani, the FS-2 fuzz lane)
+// only: nothing in the bare-metal image uses it.
+#[cfg(not(target_os = "none"))]
 pub mod mem;
 
 use alloc::boxed::Box;
@@ -79,7 +83,7 @@ pub enum BlkError {
     /// The device reported an error or did not complete in time.
     Io,
     /// The (modelled) device lost power: every operation fails until the host
-    /// test power-cycles it ([`mem::MemDevice::power_cycle`]).
+    /// test power-cycles it (`mem::MemDevice::power_cycle`).
     PowerLost,
 }
 

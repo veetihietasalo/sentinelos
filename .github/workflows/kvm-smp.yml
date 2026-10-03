@@ -78,11 +78,16 @@ jobs:
         if: steps.kvm.outputs.available == 'yes'
         uses: actions/cache@v4
         with:
+          # Never cache a disk image: a stale one would make the boot test depend
+          # on whatever an older kernel wrote. (The boot tests also recreate
+          # their own image every run; the dev image is `make run`'s.)
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             kernel/target
+            !kernel/target/sentinelos-disk.img
+            !kernel/target/sentinelos-test-disk.img
           key: ${{ runner.os }}-cargo-kvm-${{ hashFiles('kernel/Cargo.lock', 'kernel/xtask/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
@@ -177,11 +182,16 @@ jobs:
         if: steps.kvm.outputs.available == 'yes'
         uses: actions/cache@v4
         with:
+          # Never cache a disk image: a stale one would make the boot test depend
+          # on whatever an older kernel wrote. (The boot tests also recreate
+          # their own image every run; the dev image is `make run`'s.)
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             kernel/target
+            !kernel/target/sentinelos-disk.img
+            !kernel/target/sentinelos-test-disk.img
           key: ${{ runner.os }}-cargo-kvm-${{ hashFiles('kernel/Cargo.lock', 'kernel/xtask/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-

@@ -594,6 +594,13 @@ impl Allocator {
     /// Allocate `len` (`1..=MAX_EXTENT`) contiguous blocks inside one group,
     /// first-fit, trying groups in preference order (module docs).
     ///
+    /// The group and the run are chosen first, without changing anything
+    /// ([`choose_run`](Self::choose_run)); only then is the group's bitmap
+    /// copied (if this transaction has not yet) and the run marked. So a
+    /// refusal — from any group, for any reason — leaves the allocator exactly
+    /// as it was. (Past the copy only a broken internal invariant can fail,
+    /// reported as [`AllocError::Corrupt`].)
+    ///
     /// # Errors
     ///
     /// [`AllocError::Sealed`] during a commit; [`AllocError::Invalid`] for a
@@ -613,6 +620,38 @@ impl Allocator {
         if len == 0 || len > MAX_EXTENT {
             return Err(AllocError::Invalid);
         }
+        let (g, start) = self.choose_run(cache, len, class, hint)?;
+        // `ensure_work` is itself atomic; past it nothing can be refused (the
+        // run was chosen around the bit its copy takes).
+        let work = self.ensure_work(cache, g)?;
+        let dst = cache.dirty_mut(work.slot).ok_or(AllocError::Corrupt)?;
+        if bitmap::find_zero_run(bits(dst), len, start, start + len) != Some(start) {
+            return Err(AllocError::Corrupt);
+        }
+        bitmap::set_range(bits_mut(dst), start, start + len);
+        self.group_mut(g)?.free -= len;
+        let first = self.geo.block_at(g, start).ok_or(AllocError::Corrupt)?;
+        Extent::new(first, len).map_err(|_| AllocError::Corrupt)
+    }
+
+    /// Where a run of `len` goes: the first group, in preference order, that
+    /// keeps its `class` floor and has `len` contiguous free blocks once its
+    /// copy-on-write (if it still needs one) has taken the group's first free
+    /// block — and the run's first-fit start there. Reads only: a group that
+    /// cannot take the run is skipped untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`AllocError::Miss`] for a non-resident committed bitmap,
+    /// [`AllocError::NoSpace`] when no group fits, [`AllocError::Corrupt`]
+    /// on a broken invariant.
+    fn choose_run(
+        &self,
+        cache: &mut Cache,
+        len: u32,
+        class: AllocClass,
+        hint: Option<u32>,
+    ) -> Result<(u32, u32), AllocError> {
         let (order, n) = self.preference(hint);
         for &g in order.iter().take(n) {
             let g = u32::from(g);
@@ -621,25 +660,18 @@ impl Allocator {
             if grp.free < len + cow + self.floor(g, class) {
                 continue;
             }
-            // Enough free blocks may still not be contiguous: look before
-            // copying anything.
+            // Enough free blocks may still not be contiguous.
             let glen = self.geo.group_len(g).ok_or(AllocError::Corrupt)?;
             let view = self.current_view(cache, g)?;
-            let current = cache.read(view).ok_or(AllocError::Corrupt)?;
-            if bitmap::find_zero_run(bits(current), len, 0, glen).is_none() {
-                continue;
-            }
-            let work = self.ensure_work(cache, g)?;
-            let dst = cache.dirty_mut(work.slot).ok_or(AllocError::Corrupt)?;
-            let Some(start) = bitmap::find_zero_run(bits(dst), len, 0, glen) else {
-                // The copy took the only gap: the group stays changed (net-zero
-                // after the commit), the search moves on.
-                continue;
+            let current = bits(cache.read(view).ok_or(AllocError::Corrupt)?);
+            // `ensure_work` puts the copy at the first free block.
+            let cow_bit = match grp.work {
+                Some(_) => None,
+                None => Some(bitmap::find_zero(current, 0, glen).ok_or(AllocError::Corrupt)?),
             };
-            bitmap::set_range(bits_mut(dst), start, start + len);
-            self.group_mut(g)?.free -= len;
-            let first = self.geo.block_at(g, start).ok_or(AllocError::Corrupt)?;
-            return Extent::new(first, len).map_err(|_| AllocError::Corrupt);
+            if let Some(start) = bitmap::find_zero_run_except(current, len, 0, glen, cow_bit) {
+                return Ok((g, start));
+            }
         }
         Err(AllocError::NoSpace)
     }
@@ -864,6 +896,12 @@ mod tests {
     /// Format-like setup entirely in memory: an allocator whose committed
     /// bitmaps and index are clean, verified cache entries.
     fn fresh(total: u64) -> (Allocator, Cache) {
+        fresh_with(total, |_, _| false)
+    }
+
+    /// [`fresh`], with every bit `(group, bit)` for which `used` holds also
+    /// committed as in use.
+    fn fresh_with(total: u64, used: impl Fn(u32, u32) -> bool) -> (Allocator, Cache) {
         let geo = Geometry::new(total).unwrap();
         let mut cache = Cache::new();
         let mut buf = zeroed_blocks(1);
@@ -874,6 +912,11 @@ mod tests {
             let (own, idx) = format_bitmap(&mut buf[0], &geo, g).unwrap();
             if let Some(i) = idx {
                 index_at = i;
+            }
+            for bit in 0..geo.group_len(g).unwrap() {
+                if used(g, bit) {
+                    bitmap::set(bits_mut(&mut buf[0]), bit);
+                }
             }
             let hash = seal_bitmap(&mut buf[0], &UUID, 1);
             ptrs.push(Pointer {
@@ -1018,6 +1061,46 @@ mod tests {
             Err(AllocError::Invalid)
         );
         commit(&mut a, &mut c, 2).unwrap();
+    }
+
+    /// FS-1a review: `alloc_run` used to copy a group's bitmap, find that the
+    /// copy had taken the only gap, and move on to the next group — so a
+    /// refusal from a later group left the first one changed. The run is now
+    /// placed around the copy's block before anything changes.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_refused_run_changes_nothing_in_any_group() {
+        // Group 0's free blocks: the gap {10, 11}, then singletons — 6 free,
+        // exactly `2 + 1 (its copy) + 3 (Reclaim floor in group 0)`. Its copy
+        // would land on 10, leaving no gap of 2.
+        let free0 = [10u32, 11, 13, 15, 17, 19];
+        let total = u64::from(GROUP_BLOCKS) + 200;
+        for fill_group1 in [false, true] {
+            let (mut a, mut c) = fresh_with(total, |g, bit| {
+                (g == 0 && !free0.contains(&bit)) || (g == 1 && fill_group1)
+            });
+            assert_eq!(a.working_free(), if fill_group1 { 6 } else { 6 + 199 });
+            let p1 = a.group_pointer(1).unwrap();
+            let expected = if fill_group1 {
+                // Group 1 is full too: nothing fits anywhere.
+                AllocError::NoSpace
+            } else {
+                // Group 1 could take it, but its bitmap must be read first.
+                assert!(c.evict(p1.block));
+                AllocError::Miss(p1)
+            };
+            assert_eq!(
+                a.alloc_run(&mut c, 2, AllocClass::Reclaim, Some(0)),
+                Err(expected)
+            );
+            assert!(!a.is_dirty(), "group 0 was not copied");
+            assert_eq!(a.pending_frees(), 0);
+            assert_eq!(c.dirty_count(), 0);
+            assert_eq!(a.working_free(), if fill_group1 { 6 } else { 6 + 199 });
+            // A single block still fits in group 0 — after its copy (on 10).
+            let b = a.alloc(&mut c, AllocClass::Reclaim, Some(0)).unwrap();
+            assert_eq!(b, BlockNo(11));
+        }
     }
 
     #[test]

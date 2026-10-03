@@ -28,7 +28,7 @@
 //! # SMP scope (PR-2 of the AP bring-up design — per-CPU, no work stealing)
 //!
 //! Every core has its **own** run queue ([`CPU_SCHED`]`[cpu]`: `current`,
-//! `ready`, `zombie`) and its own preemption state ([`PREEMPT`]`[cpu]`), indexed
+//! `ready`, `zombies`) and its own preemption state ([`PREEMPT`]`[cpu]`), indexed
 //! by the dense cpu index `kernel::smp` assigns (BSP = 0). Tasks are **pinned**:
 //! [`spawn_on`] places a task on one core's queue and it never migrates; the BSP
 //! decides placement ([`spawn`] = the local core). A remote placement is
@@ -84,15 +84,21 @@
 //! therefore potentially deallocating — right there in IRQ context. The fix
 //! is two standing invariants:
 //!
-//! 1. **Reaping never happens on the IRQ path.** Only [`reap_zombie`] ever
-//!    drops a `Box<Task>`, and its sole caller is [`reschedule`] (the
-//!    voluntary/cooperative wrapper, always thread context) — never
-//!    [`on_tick`]'s direct call into [`reschedule_locked`]. [`reschedule_locked`]
-//!    itself performs no allocation or deallocation at all.
+//! 1. **Reaping happens only in an idle loop.** Only [`idle_reap`] ever drops
+//!    a `Box<Task>`, and only the idle tasks call it (kmain's idle loop and
+//!    [`ap_idle_loop`]) — never [`on_tick`]'s direct call into
+//!    [`reschedule_locked_on`], which performs no allocation or deallocation
+//!    at all. Nor does [`reschedule`] reap any more (FS-1a review): it runs with
+//!    interrupts disabled, so a reap there — on every [`yield_now`] and every
+//!    draining [`preempt_enable`] — would spin forever on the heap lock if a
+//!    task preempted on the same core held it, freezing the core. The idle
+//!    frees with interrupts *and* preemption enabled, so a contended heap lock
+//!    is waited out preemptibly (the holder runs at the next tick).
 //! 2. **`ready` never allocates.** [`pick_next`]'s `ready.push_back` is
 //!    reachable from [`on_tick`] and [`on_resched_ipi`]; every ready queue is a
 //!    fixed-capacity [`ReadyRing`] (capacity [`MAX_TASKS`], the size of the task
-//!    slab, so it can never fill), so that push is a plain array store.
+//!    slab, so it can never fill), so that push is a plain array store. The
+//!    zombie list an exit appends to is the same kind of ring.
 //!
 //! Net invariant, restated: **the ISR-context scheduler path (`on_tick` /
 //! `on_resched_ipi` → `reschedule_locked_on` → `pick_next` →
@@ -185,9 +191,9 @@ enum TaskState {
     /// The task currently executing on its core — exactly one per core, named
     /// by that core's [`CpuSched::current`].
     Running,
-    /// Departed for good; its id is parked in its core's [`CpuSched::zombie`]
-    /// awaiting reap on a later scheduling pass on that core (never the pass
-    /// that switched away from it — see [`reschedule`]).
+    /// Departed for good; its id is parked in its core's [`CpuSched::zombies`]
+    /// until that core's idle task reaps it ([`idle_reap`]) — always after the
+    /// switch that left it has completed.
     Exited,
 }
 
@@ -199,12 +205,13 @@ enum TaskState {
 /// (e.g. between map operations) — moving a `Box` moves the pointer, not the
 /// pointee.
 ///
-/// **Invariant:** a `Box<Task>` is dropped only by [`reap_zombie_on`] — called
-/// solely from [`reschedule`] and the AP idle loop's [`idle_reap`], i.e. thread
-/// context, **never** from the IRQ-context paths of [`on_tick`]/
-/// [`on_resched_ipi`] (see the module docs' "ISR-context allocation freedom"
-/// section) — *after* the task has been removed from its core's
-/// `current`/`ready`/`zombie` bookkeeping in a way that makes it permanently
+/// **Invariant:** a `Box<Task>` is dropped only by [`idle_reap`] — called
+/// solely from the idle loops (kmain's and [`ap_idle_loop`]), in thread
+/// context with interrupts and preemption enabled; **never** from the
+/// IRQ-context paths of [`on_tick`]/[`on_resched_ipi`] nor from [`reschedule`]
+/// (see the module docs' "ISR-context allocation freedom" section) — *after*
+/// the task has been removed from its core's
+/// `current`/`ready`/`zombies` bookkeeping in a way that makes it permanently
 /// unreachable as a switch target — so every `TaskHandle` minted from it
 /// outlives its uses. A task lives on exactly one core's bookkeeping, so no
 /// other core can ever hold a handle to it. Dropping it also drops the boxed [`hal::context::XsaveArea`],
@@ -260,13 +267,14 @@ struct Task {
 /// [`SpawnError::TooManyTasks`] rather than growing anything under a lock.
 pub const MAX_TASKS: usize = 64;
 
-/// Fixed-capacity FIFO of task ids — the production ready queue.
+/// Fixed-capacity FIFO of task ids — the production ready queue (and each
+/// core's zombie list, [`CpuSched::zombies`]).
 ///
 /// A ring over a `[TaskId; N]` array: O(1) `pop_front`/`push_back`, **no
 /// allocation ever**, which is what lets [`pick_next`] run from IRQ context on
 /// any core without the heap-lock cycle described in the module docs. Capacity
 /// `N` is [`MAX_TASKS`] in production, so a ring can never fill: every task id
-/// is in at most one core's `current`/`ready`/`zombie` (Invariant #4), and the
+/// is in at most one core's `current`/`ready`/`zombies` (Invariant #4), and the
 /// slab holds at most `MAX_TASKS` tasks. The Kani harness proves the same
 /// [`pick_next`] over a small `ReadyRing<6>`.
 struct ReadyRing<const N: usize> {
@@ -334,10 +342,12 @@ struct CpuSched {
     /// Runnable tasks pinned to this core, in round-robin order. Invariant:
     /// never contains `current`.
     ready: ReadyRing<MAX_TASKS>,
-    /// An exited task awaiting reap, if any. Reaped by [`reap_zombie_on`] at
-    /// the top of the *next* [`reschedule`] on this core (or by the AP idle
-    /// loop's [`idle_reap`]) — thread context only, never from an IRQ path.
-    zombie: Option<TaskId>,
+    /// Exited tasks awaiting reap, oldest first. Freed only by this core's
+    /// idle task, through [`idle_reap`] (thread context, interrupts and
+    /// preemption enabled) — never by [`reschedule`], never from an IRQ path.
+    /// Every id here still owns its [`TASKS`] slot until reaped, so with
+    /// capacity [`MAX_TASKS`] the ring can never fill.
+    zombies: ReadyRing<MAX_TASKS>,
 }
 
 impl CpuSched {
@@ -345,7 +355,7 @@ impl CpuSched {
         Self {
             current: TaskId::IDLE,
             ready: ReadyRing::new(),
-            zombie: None,
+            zombies: ReadyRing::new(),
         }
     }
 }
@@ -786,6 +796,26 @@ fn pick_next<Q: ReadyQueue>(
     Some(next_id)
 }
 
+/// [`pick_next`] plus the exit bookkeeping around it — the whole pure part of
+/// [`reschedule_locked_on`]: an exiting `prev_id` is appended to `zombies`
+/// (oldest first), where it waits for the core's idle task ([`idle_reap`]).
+/// Nothing is freed here, and several exits may queue up between two idle
+/// passes without any being lost. Shared by production, the host tests and the
+/// Kani harness, so the glue they check is the glue that runs.
+fn pick_next_parking_exits<Q: ReadyQueue, Z: ReadyQueue>(
+    ready: &mut Q,
+    zombies: &mut Z,
+    prev_id: TaskId,
+    prev_exiting: bool,
+) -> Option<TaskId> {
+    let mut exited = None;
+    let next_id = pick_next(ready, &mut exited, prev_id, prev_exiting)?;
+    if let Some(id) = exited {
+        zombies.push_back(id);
+    }
+    Some(next_id)
+}
+
 /// The scheduler's core reschedule step **for core `cpu`**: decide the next
 /// runnable task via [`pick_next`] over that core's queue, update task states,
 /// and — with both locks **dropped** first — perform the actual
@@ -800,8 +830,9 @@ fn pick_next<Q: ReadyQueue>(
 ///
 /// This function performs **no heap allocation or deallocation** — see the
 /// module docs' "ISR-context allocation freedom" and locking sections. It
-/// never reaps a zombie (that is [`reap_zombie_on`]'s job, thread context only),
-/// and [`pick_next`]'s `ready.push_back` is a store into a fixed [`ReadyRing`].
+/// never reaps a zombie (that is [`idle_reap`]'s job, idle task only), and
+/// both pushes ([`pick_next`]'s `ready.push_back`, an exit's
+/// `zombies.push_back`) are stores into a fixed [`ReadyRing`].
 /// This is what makes it sound for [`on_tick`] and [`on_resched_ipi`] to call
 /// this function directly from genuine interrupt-gate context.
 ///
@@ -826,20 +857,21 @@ fn pick_next<Q: ReadyQueue>(
 ///
 /// - Lock order queue → table; both guards go out of scope **before** `switch`
 ///   runs — never held across it.
-/// - A zombie a *previous* pass recorded is left untouched here (never reaped
-///   by this function), so a task never frees its own running stack and the
-///   reap step never runs in IRQ context.
+/// - An exiting task is only appended to `zombies` here, never freed: it is
+///   still running on its own stack until the `switch` below completes, and
+///   only the idle task of this same core (which cannot run before then — `IF`
+///   is clear throughout) ever reaps it.
 fn reschedule_locked_on(cpu: usize, exiting: bool) -> bool {
     let switch_pair = {
         let mut queue = CPU_SCHED[cpu].lock();
         // One real `&mut CpuSched` (through `DerefMut`, taken exactly once) so
-        // the borrow checker can see `state.ready`/`state.zombie` as disjoint
+        // the borrow checker can see `state.ready`/`state.zombies` as disjoint
         // fields below.
         let state: &mut CpuSched = &mut queue;
         let mut tasks = TASKS.lock();
 
         let prev_id = state.current;
-        match pick_next(&mut state.ready, &mut state.zombie, prev_id, exiting) {
+        match pick_next_parking_exits(&mut state.ready, &mut state.zombies, prev_id, exiting) {
             Some(next_id) => {
                 if let Some(t) = tasks.get_mut(prev_id) {
                     t.state = if exiting {
@@ -875,34 +907,28 @@ fn reschedule_locked_on(cpu: usize, exiting: bool) -> bool {
     switched
 }
 
-/// Reap a task that exited on a **previous** scheduling pass on core `cpu`, if
-/// any — the **only** place a `Box<Task>` (and its boxed
-/// [`hal::context::XsaveArea`]) is ever dropped, which is also therefore the
-/// only place either can be deallocated. Deliberately **thread-context only**:
-/// dropping the `Box` calls into the heap allocator (`hal::mm::LockedHeap`),
-/// whose lock does not itself disable interrupts, so this must never run from
-/// inside an ISR (see the module docs). Its callers are [`reschedule`] (with
-/// interrupts already disabled around this call) and the AP idle loop's
-/// [`idle_reap`] — never the IRQ-context calls into [`reschedule_locked_on`].
+/// Unlink the oldest zombie of core `cpu` from the scheduler: pop it from the
+/// core's `zombies` and remove its `Box<Task>` from [`TASKS`], with
+/// interrupts disabled (both are scheduler locks; the queue lock is released
+/// before the table lock is taken). `None` once the core has no zombie left.
 ///
-/// Lock discipline: the queue lock is released before the table lock is taken
-/// (no nesting needed), and **both** are released before the `Box` is dropped
-/// — the drop is the one heap operation here and must not run under a lock an
-/// IRQ path can take.
-///
-/// Never reaps the task departing the *current* call (it is still running on
-/// its own stack until the `switch` inside [`reschedule_locked_on`] hands
-/// control away) — only a zombie a *prior* pass already recorded.
-fn reap_zombie_on(cpu: usize) {
-    let zombie = CPU_SCHED[cpu].lock().zombie.take();
-    let dead = zombie.and_then(|zid| TASKS.lock().remove(zid)); // table guard dropped here
-    drop(dead);
+/// Frees nothing: the caller, [`idle_reap`], drops the returned box after every
+/// lock is released and with interrupts back on.
+fn take_zombie_on(cpu: usize) -> Option<Box<Task>> {
+    with_interrupts_disabled(|| loop {
+        let zid = CPU_SCHED[cpu].lock().zombies.pop_front()?;
+        if let Some(dead) = TASKS.lock().remove(zid) {
+            return Some(dead);
+        }
+        // A zombie keeps its table slot until reaped, so this is unreachable;
+        // if it ever happened there would be nothing to free — skip the id.
+    })
 }
 
 /// Voluntary/cooperative reschedule wrapper for the **calling core**: saves the
-/// caller's actual `IF` state, disables interrupts, reaps any previously-exited
-/// zombie on this core ([`reap_zombie_on`]), runs [`reschedule_locked_on`], and
-/// restores exactly the saved state afterward (via [`with_interrupts_disabled`]) — **not** an
+/// caller's actual `IF` state, disables interrupts, runs
+/// [`reschedule_locked_on`], and restores exactly the saved state afterward
+/// (via [`with_interrupts_disabled`]) — **not** an
 /// unconditional `sti`, unlike PR-A's original implementation (the
 /// combined-review carry-item this PR fixes). Used by [`yield_now`],
 /// [`exit`], and the deferred drain in [`preempt_enable`] — every caller runs
@@ -910,17 +936,13 @@ fn reap_zombie_on(cpu: usize) {
 /// [`reschedule_locked_on`]'s docs for that path). Returns whether a switch
 /// actually happened.
 ///
-/// Reaping runs first, still under [`with_interrupts_disabled`]'s protection
-/// (so it can never race a reentrant [`on_tick`]/[`on_resched_ipi`]), and
-/// strictly before [`reschedule_locked_on`] — necessary because an exiting call
-/// would otherwise overwrite this core's `zombie` with the newly-exiting task
-/// before the old one was ever reaped, leaking it.
+/// It does **not** reap. It used to, first thing, with interrupts disabled —
+/// and a reap frees heap memory: had a task on this core been preempted while
+/// holding the heap lock, the very next yield here would have spun on that
+/// lock at `IF = 0` forever (nothing could switch back to the holder), freezing
+/// the core. Zombies now wait in [`CpuSched::zombies`] for [`idle_reap`].
 fn reschedule(exiting: bool) -> bool {
-    with_interrupts_disabled(|| {
-        let cpu = local_cpu();
-        reap_zombie_on(cpu);
-        reschedule_locked_on(cpu, exiting)
-    })
+    with_interrupts_disabled(|| reschedule_locked_on(local_cpu(), exiting))
 }
 
 /// Voluntarily reschedule (round-robin), keeping `current` runnable. Returns
@@ -1012,6 +1034,9 @@ pub enum SpawnError {
     StackAllocation,
     /// The task table already holds [`MAX_TASKS`] live tasks.
     TooManyTasks,
+    /// [`spawn_on_with_stack`] was asked for a stack of this many pages,
+    /// outside `1..=`[`MAX_STACK_PAGES`]. Nothing was allocated.
+    StackSize(usize),
 }
 
 impl SpawnError {
@@ -1022,6 +1047,7 @@ impl SpawnError {
             SpawnError::CpuNotOnline(_) => "target cpu not online",
             SpawnError::StackAllocation => "could not allocate a kernel stack",
             SpawnError::TooManyTasks => "task table full",
+            SpawnError::StackSize(_) => "stack size out of range",
         }
     }
 }
@@ -1095,8 +1121,8 @@ pub const MAX_STACK_PAGES: usize = 64;
 ///
 /// # Errors
 ///
-/// As [`spawn_on`]; [`SpawnError::StackAllocation`] also for `stack_pages`
-/// outside `1..=MAX_STACK_PAGES`.
+/// As [`spawn_on`], plus [`SpawnError::StackSize`] for `stack_pages` outside
+/// `1..=MAX_STACK_PAGES`.
 pub fn spawn_on_with_stack(
     cpu: u32,
     name: &'static str,
@@ -1118,7 +1144,7 @@ fn spawn_with_id(
         return Err(SpawnError::CpuNotOnline(cpu));
     }
     if stack_pages == 0 || stack_pages > MAX_STACK_PAGES {
-        return Err(SpawnError::StackAllocation);
+        return Err(SpawnError::StackSize(stack_pages));
     }
     let stack =
         hal::mm::alloc_kernel_stack(stack_pages).map_err(|_| SpawnError::StackAllocation)?;
@@ -1188,7 +1214,7 @@ pub fn yield_now() {
 /// Never returns: the exiting task's stack is abandoned mid-call (its id is
 /// never pushed back onto `ready`, so nothing will ever switch back into it),
 /// and its `Box<Task>` — stack, saved context, and vector-state area — is
-/// reaped on a *later* scheduling pass (never this one; see [`reschedule`]).
+/// reaped later by this core's idle task ([`idle_reap`]), never by this call.
 ///
 /// If, structurally, nothing else were runnable (should not happen — the
 /// adopted idle task is always eventually back in `ready`), park the core
@@ -1306,20 +1332,49 @@ fn task_prologue() {
 
 // ── Application-processor idle (PR-2) ───────────────────────────────────────
 
-/// Reap any zombie on the **calling** core — thread context (the heap free
-/// runs with no scheduler lock held). The AP idle loop's way of freeing tasks
-/// that exited on that core, since an idle that only `hlt`s never passes
-/// through [`reschedule`]'s reap step.
+/// Free every task that has exited on the **calling** core — the only place a
+/// `Box<Task>` (and its boxed [`hal::context::XsaveArea`], which zeroizes on
+/// drop) is ever dropped. Call it from an idle loop only: kmain's (the BSP's
+/// idle) and [`ap_idle_loop`] do, on every wake-up.
+///
+/// Each zombie is unlinked with interrupts disabled ([`take_zombie_on`]: only
+/// scheduler locks, no heap), then dropped with **no lock held and interrupts
+/// and preemption enabled**. The drop takes the heap lock, which another task
+/// on this core may hold while preempted. A preemptible waiter is switched away
+/// by the next tick and the holder runs and releases it; a waiter at `IF = 0`
+/// or with preemption disabled would spin forever and freeze the core. So when
+/// the caller has either disabled, this returns at once and reaps nothing (an
+/// AP's very first pass, before its first `sti`, is such a call); the next
+/// pass catches up.
+///
+/// Never frees a running stack: a task enters `zombies` inside its own exit
+/// path with interrupts disabled until its final switch away, so by the time
+/// this core's idle runs, every queued zombie is parked for good — and the
+/// idle itself never exits.
 pub fn idle_reap() {
-    with_interrupts_disabled(|| reap_zombie_on(local_cpu()));
+    let cpu = local_cpu();
+    let preemptible =
+        hal::cpu::interrupts_enabled() && PREEMPT[cpu].count.load(Ordering::Relaxed) == 0;
+    if !preemptible {
+        return;
+    }
+    // Bounded: at most `MAX_TASKS` zombies can be queued at once; any that
+    // exit while this loop runs are left to the next pass.
+    for _ in 0..MAX_TASKS {
+        let Some(dead) = take_zombie_on(cpu) else {
+            return;
+        };
+        drop(dead);
+    }
 }
 
 /// The application-processor idle task body: reap what exited here, then
 /// `sti; hlt` until the next interrupt — a reschedule IPI, whose handler
 /// ([`on_resched_ipi`]) switches this core to the placed task at the ISR tail;
 /// when that task exits, this idle resumes inside that handler and returns
-/// through the stub's `iretq` to here, loops, reaps it, and sleeps again. The
-/// core's LAPIC-timer tick also wakes it every quantum (a cheap reap + re-halt).
+/// through the stub's `iretq` (interrupts back on) to here, loops, reaps it,
+/// and sleeps again. The core's LAPIC-timer tick also wakes it every quantum
+/// (a cheap reap + re-halt).
 ///
 /// `hal::cpu::enable_interrupts_and_halt` is one `sti; hlt` pair so a wake-up
 /// that arrives in between cannot be lost. Entered by `kernel::smp::ap_main`
@@ -2179,21 +2234,18 @@ mod tests {
     }
 
     #[test]
-    fn zombie_is_reaped_before_the_next_pick_in_practice() {
-        // Mirrors `reschedule`'s ordering contract: a caller must drain
-        // `zombie` (reap) BEFORE calling `pick_next` for the pass that follows
-        // an exit, never during the exiting pass itself. This test documents
-        // that `pick_next` alone does not reap — it only records; reaping is
-        // the caller's separate, explicit step.
+    fn pick_next_records_an_exit_but_never_reaps() {
+        // `pick_next` alone does not reap — it only records; reaping is a
+        // separate step (`idle_reap`, in the idle task). Production hands it a
+        // fresh slot per pass and moves an exit into the core's zombie ring
+        // (`pick_next_parking_exits`).
         let mut ready = ids(&[1]);
         let mut zombie = None;
         // Task 2 exits: recorded as zombie, not requeued.
         let next = pick_next(&mut ready, &mut zombie, TaskId(2), true);
         assert_eq!(next, Some(TaskId(1)));
         assert_eq!(zombie, Some(TaskId(2)));
-        // A subsequent (non-exiting) step must NOT touch `zombie` itself —
-        // that is `reschedule`'s job, taken care of before it calls
-        // `pick_next` again.
+        // A subsequent (non-exiting) step must NOT touch `zombie` itself.
         let next2 = pick_next(&mut ready, &mut zombie, TaskId(1), false);
         assert_eq!(next2, None); // nothing else runnable
         assert_eq!(zombie, Some(TaskId(2)), "pick_next never reaps on its own");
@@ -2375,6 +2427,47 @@ mod tests {
         // The exiting task was not requeued: only the idle remains.
         assert_eq!(ring.len(), 1);
         assert_eq!(ring.get(0), Some(TaskId(0)));
+    }
+
+    #[test]
+    fn exits_between_idle_passes_all_wait_in_the_zombie_ring() {
+        // Regression (FS-1a review): `reschedule` no longer reaps, so several
+        // tasks can exit on a core before its idle task next runs
+        // `idle_reap`. With the old single `zombie` slot the second exit would
+        // overwrite the first, leaking its `Box<Task>` and its table slot.
+        use super::{pick_next_parking_exits, ReadyQueue, ReadyRing};
+
+        let mut ready: ReadyRing<8> = ReadyRing::new();
+        for id in [1, 2, 3] {
+            ready.push_back(TaskId(id));
+        }
+        let mut zombies: ReadyRing<8> = ReadyRing::new();
+        let mut pass = |prev: u64, exiting: bool| {
+            pick_next_parking_exits(&mut ready, &mut zombies, TaskId(prev), exiting)
+        };
+        // The idle (0) yields to 1; 1 and 2 exit back to back; 3 yields back
+        // to the idle.
+        assert_eq!(pass(0, false), Some(TaskId(1)));
+        assert_eq!(pass(1, true), Some(TaskId(2)));
+        assert_eq!(pass(2, true), Some(TaskId(3)));
+        assert_eq!(pass(3, false), Some(TaskId(0)));
+        // Both exits wait, oldest first; neither is runnable.
+        assert_eq!(
+            (zombies.len(), zombies.get(0), zombies.get(1)),
+            (2, Some(TaskId(1)), Some(TaskId(2)))
+        );
+        assert_eq!((ready.len(), ready.get(0)), (1, Some(TaskId(3))));
+        // A pass with nothing else runnable parks nothing, even if exiting.
+        let mut empty: ReadyRing<8> = ReadyRing::new();
+        assert_eq!(
+            pick_next_parking_exits(&mut empty, &mut zombies, TaskId(9), true),
+            None
+        );
+        assert_eq!(zombies.len(), 2);
+        // The idle's drain takes them in order and then stops.
+        assert_eq!(zombies.pop_front(), Some(TaskId(1)));
+        assert_eq!(zombies.pop_front(), Some(TaskId(2)));
+        assert_eq!(zombies.pop_front(), None);
     }
 
     #[test]
@@ -2712,17 +2805,16 @@ mod proofs {
         ready.push_back(TaskId::from_usize(5));
         let mut current = TaskId::from_usize(0);
         let mut zombie: Option<TaskId> = None;
-        // Whether each of the 4 universe ids has not yet been reaped — mirrors
-        // `reschedule`'s "reap the PREVIOUS zombie (via `reap_zombie`) before
-        // picking next (via `reschedule_locked`)" ordering (a zombie is only
-        // removed from the live set on the pass *after* the one that recorded
-        // it, never the departing pass itself).
+        // Whether each universe id has not yet been reaped. This harness reaps
+        // eagerly — the previous pass's zombie, before every pass, never the
+        // departing pass itself. Production defers reaping to the idle task;
+        // that schedule is proven by
+        // `zombies_wait_for_the_idle_and_are_never_lost_bounded`.
         let mut alive: [bool; 6] = [true; 6];
 
         for _ in 0..STEPS {
             // Reap any zombie from a PREVIOUS step first (never the current
-            // one), exactly like `reap_zombie` (called by `reschedule` ahead
-            // of `reschedule_locked`).
+            // one).
             if let Some(z) = zombie.take() {
                 alive[z.as_usize()] = false;
             }
@@ -2764,6 +2856,73 @@ mod proofs {
                     assert!(ready.len() == 0);
                     break;
                 }
+            }
+        }
+    }
+
+    /// Kani proof — the reaping schedule production uses (FS-1a review):
+    /// [`super::pick_next_parking_exits`] parks every exit in the core's zombie ring,
+    /// and only the idle task (id 0, which never exits) frees zombies, oldest
+    /// first, any number at a time ([`super::idle_reap`] may be preempted
+    /// between two frees, or skip a pass with `IF` clear). Over every
+    /// interleaving of yields, exits and partial drains in `STEPS` passes:
+    ///
+    /// - every id is in exactly one of `current`/`ready`/`zombies`/freed — so
+    ///   several exits between two idle passes are never lost (the old single
+    ///   zombie slot would have overwritten one), and none is duplicated;
+    /// - a freed id is never selected to run again;
+    /// - the drain never frees the task that is running it;
+    /// - when nothing is runnable, the idle is the one left running.
+    ///
+    /// Rings of capacity 8 (a power of two keeps CBMC's index arithmetic
+    /// cheap) over 6 ids; the same `STEPS = 8` as the harness above.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn zombies_wait_for_the_idle_and_are_never_lost_bounded() {
+        const STEPS: usize = 8;
+        const IDS: usize = 6;
+        let mut ready: ReadyRing<8> = ReadyRing::new();
+        for i in 1..IDS {
+            ready.push_back(TaskId::from_usize(i));
+        }
+        let mut zombies: ReadyRing<8> = ReadyRing::new();
+        let mut current = TaskId::IDLE;
+        let mut freed = [false; IDS];
+
+        for _ in 0..STEPS {
+            if current == TaskId::IDLE {
+                // `idle_reap`: free the first `k` zombies, `k` unconstrained.
+                let k: usize = kani::any();
+                for i in 0..IDS {
+                    if i < k {
+                        if let Some(z) = zombies.pop_front() {
+                            assert!(z != current);
+                            freed[z.as_usize()] = true;
+                        }
+                    }
+                }
+            }
+            let exiting = current != TaskId::IDLE && kani::any::<bool>();
+            match super::pick_next_parking_exits(&mut ready, &mut zombies, current, exiting) {
+                Some(next) => {
+                    assert!(!freed[next.as_usize()]);
+                    current = next;
+                }
+                None => assert!(current == TaskId::IDLE && ready.len() == 0),
+            }
+            // Count where each id is: exactly one place, every pass.
+            let mut places = [0u8; IDS];
+            places[current.as_usize()] += 1;
+            for i in 0..8 {
+                if let Some(q) = ready.get(i) {
+                    places[q.as_usize()] += 1;
+                }
+                if let Some(z) = zombies.get(i) {
+                    places[z.as_usize()] += 1;
+                }
+            }
+            for id in 0..IDS {
+                assert!(places[id] + u8::from(freed[id]) == 1);
             }
         }
     }
