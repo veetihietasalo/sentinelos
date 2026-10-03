@@ -513,7 +513,9 @@ FS-1 splits in two, and attestation waits for the identity spec.
   **twice**, asserting every boot line on both boots and the chain between them: boot 1
   `format: … (was unformatted)`, `mount: gen=1 slot=1`, `commit: gen=2 slot=0`; boot 2
   `mount: gen=2 slot=0 sb=<boot 1's commit sb>`, `commit: gen=3 slot=1`; and the old toy FS's
-  `first boot` line on boot 1 and `persistence PROVEN` on boot 2. CI caches no disk image.
+  `first boot` line on boot 1 and `persistence PROVEN` on boot 2. CI caches no disk image: each
+  job's last step deletes both images before the cache's post-job save (a `!` exclusion cannot
+  reach a file inside the cached `kernel/target` directory).
 - *`flush` on today's ATA.* `hal::ata::write_sectors` already ends every command with
   `FLUSH CACHE`, and `hal` has no separate flush, so every `AtaDevice` write is as durable as
   `hal` makes it when it returns and `AtaDevice::flush` is a no-op that returns `Ok`. The §8

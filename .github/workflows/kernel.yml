@@ -57,16 +57,16 @@ jobs:
       - name: Cache Cargo registry + build artefacts
         uses: actions/cache@v4
         with:
-          # Never cache a disk image: a stale one would make the boot test depend
-          # on whatever an older kernel wrote. (The boot tests also recreate
-          # their own image every run; the dev image is `make run`'s.)
+          # Disk images never ride in the cache. actions/cache archives
+          # `kernel/target` as ONE directory entry, so a `!` path cannot exclude
+          # a file inside it; this job's last step deletes the images instead,
+          # before the post-job save. (The boot tests also recreate their own
+          # image every run; the dev image is `make run`'s.)
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             kernel/target
-            !kernel/target/sentinelos-disk.img
-            !kernel/target/sentinelos-test-disk.img
           key: ${{ runner.os }}-cargo-${{ hashFiles('kernel/Cargo.lock', 'kernel/xtask/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
@@ -173,3 +173,9 @@ jobs:
             kernel/target/serial.log
             kernel/target/serial-boot2.log
           if-no-files-found: ignore
+
+      # Keep disk images out of the cache: the cache's post-job save runs after
+      # this step (see the note on the cache step).
+      - name: Drop disk images before the cache save
+        if: always()
+        run: rm -f kernel/target/sentinelos-disk.img kernel/target/sentinelos-test-disk.img

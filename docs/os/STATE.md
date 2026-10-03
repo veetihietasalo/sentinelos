@@ -143,12 +143,15 @@ the KDF params at [352,384) and a `keys` pointer at [392,440) to a kind-6 keyrin
   (`cargo kani -p kernel --harness NAME`); see `.github/workflows/verify.yml`.
 - **Boot tests own their disk** (2026-10-03). `make test` / `test-kvm` / `boot-timing` use
   `target/sentinelos-test-disk.img`, recreated blank every run (`SENTINELOS_KEEP_TEST_DISK=1`
-  opts out); `make run`'s dev image is never touched by a test; CI caches exclude both
-  images. A cached image once made CI's result depend on whoever created the cache.
+  opts out); `make run`'s dev image is never touched by a test; each CI job deletes both
+  images before the cache save (a `!` cache path cannot exclude a file inside `kernel/target`).
+  A cached image once made CI's result depend on whoever created the cache.
 - **Reap only on the idle path** (2026-10-03). `reschedule` reaping at IF=0 took the heap
   lock and could deadlock a core against a task preempted inside the allocator; exits park
   in a per-core zombie ring and `sched::idle_reap` frees them with interrupts and
-  preemption on. Never allocate or free with interrupts or preemption off (hal-tcb §5e).
+  preemption on. Never allocate or free with interrupts or preemption off while another
+  task on the core may be suspended inside the allocator (hal-tcb §5e; kmain's IF=0 boot
+  sequence qualifies only because it is never preempted).
 
 ## Working agreements
 

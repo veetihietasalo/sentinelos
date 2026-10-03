@@ -598,9 +598,11 @@ is taken with interrupts already masked, which was never true of the heap):
   are taken with `IF = 1` from any task, and a same-core waiter *does* spin.
   That is safe only while the waiter is itself preemptible (`IF = 1`,
   preemption enabled): the next tick switches the core to the holder. Hence
-  the rule, once a core runs more than one task: never allocate or free with
-  interrupts or preemption disabled, or under a lock of the first two kinds
-  (single-threaded early boot is exempt) — the reason `kernel::sched` frees exited
+  the rule: never allocate or free with interrupts or preemption disabled, or
+  under a lock of the first two kinds, while another task on this core may be
+  suspended inside the allocator. kmain's `IF = 0` boot sequence qualifies only
+  because it is never preempted: the other BSP tasks run solely during its
+  yields, none of which happens inside an allocation — the reason `kernel::sched` frees exited
   tasks only from the idle task, with both enabled (FS-1a review fix; it used
   to free them inside `reschedule`, with `IF = 0`).
 

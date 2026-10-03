@@ -219,6 +219,11 @@ trampoline path needs no lock hand-off.
      zombies — `sched::idle_reap`, called from kmain's idle loop and `ap_idle_loop`
      — dropping each `Box<Task>` with no lock held and interrupts and preemption
      enabled. Kani: `zombies_wait_for_the_idle_and_are_never_lost_bounded`.
+     Consequence: kmain runs the boot proofs with `IF = 0`, where `idle_reap` is a
+     no-op, so BSP tasks that exit during boot keep their `TASKS` slot and xsave box
+     until kmain reaches its idle loop (4 of 64 today: the cooperative pair, gemm,
+     spin). A boot proof that spawns many short-lived BSP tasks must budget for
+     that or call `idle_reap` from a preemptible wait.
 - **Stack sizing:** default 4 pages (16 KiB). A task preempted in the timer IRQ
   holds one `isr_common` frame + its 4 KiB per-IRQ xsave area on its stack; interrupt
   gates keep IF clear in the handler so timer nesting depth is 1 (bounded).
