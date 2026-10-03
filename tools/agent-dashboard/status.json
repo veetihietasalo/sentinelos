@@ -15,8 +15,8 @@
       "name": "kernel-architect",
       "role": "Subsystem design & framekernel decomposition",
       "model": "opus",
-      "status": "working",
-      "task": "T-MAN-1: bind manifest declarations into ComponentId? + CapIndex generation exhaustion",
+      "status": "done",
+      "task": "T-MAN-1: bind declarations naming services (A12, PR-2b); CapIndex u64 (A13, PR-2b)",
       "history": [
         {
           "ts": "2026-09-18T16:27:47",
@@ -47,6 +47,24 @@
           "kind": "status",
           "status": "working",
           "task": "T-MAN-1: bind manifest declarations into ComponentId? + CapIndex generation exhaustion"
+        },
+        {
+          "ts": "2026-10-03T16:46:51",
+          "kind": "status",
+          "status": "working",
+          "task": "T-MAN-1 identity verdict + CapIndex generation-exhaustion design (PR-2 fix round)"
+        },
+        {
+          "ts": "2026-10-03T17:04:53",
+          "kind": "status",
+          "status": "done",
+          "task": "T-MAN-1: defer to PR-2b (before PR-3) with service-named v2 framing; CapIndex: widen to u64 (gen:48|table:8|slot:8) in PR-2b; verdict + amendment text handed back"
+        },
+        {
+          "ts": "2026-10-03T17:22:12",
+          "kind": "status",
+          "status": "done",
+          "task": "T-MAN-1: bind declarations naming services (A12, PR-2b); CapIndex u64 (A13, PR-2b)"
         }
       ]
     },
@@ -129,8 +147,8 @@
       "name": "kernel-reviewer",
       "role": "Adversarial review / human-gate",
       "model": "opus",
-      "status": "done",
-      "task": "PR-2 review: BLOCKED (3 small fixes: reply-right lockout, FS-1a pong wait, prod-size sweep test)",
+      "status": "working",
+      "task": "Re-review component PR-2 round-1 fixes",
       "history": [
         {
           "ts": "2026-09-18T16:27:57",
@@ -191,6 +209,12 @@
           "kind": "status",
           "status": "done",
           "task": "PR-2 review: BLOCKED (3 small fixes: reply-right lockout, FS-1a pong wait, prod-size sweep test)"
+        },
+        {
+          "ts": "2026-10-03T17:22:12",
+          "kind": "status",
+          "status": "working",
+          "task": "Re-review component PR-2 round-1 fixes"
         }
       ]
     },
@@ -219,8 +243,8 @@
       "name": "security-engineer",
       "role": "sentinel-core integration, capabilities, sandbox",
       "model": "opus",
-      "status": "working",
-      "task": "PR-2 review round 1 fixes: silent-responder lockout, pong exit flag, full-slab sweep test, T-NAT-1 guard",
+      "status": "done",
+      "task": "PR-2 review round 1 fixed (5f272dc, ab4886f); awaiting re-review",
       "history": [
         {
           "ts": "2026-09-18T16:28:41",
@@ -263,6 +287,12 @@
           "kind": "status",
           "status": "working",
           "task": "PR-2 review round 1 fixes: silent-responder lockout, pong exit flag, full-slab sweep test, T-NAT-1 guard"
+        },
+        {
+          "ts": "2026-10-03T17:22:12",
+          "kind": "status",
+          "status": "done",
+          "task": "PR-2 review round 1 fixed (5f272dc, ab4886f); awaiting re-review"
         }
       ]
     },
@@ -288,5 +318,5 @@
       "task": "\u2014"
     }
   ],
-  "updatedAt": "2026-10-03T16:46:37"
+  "updatedAt": "2026-10-03T17:22:12"
 }

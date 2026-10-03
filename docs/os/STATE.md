@@ -2,7 +2,7 @@
 
 One page for a fresh session (or a fresh container) to pick the kernel work back
 up without re-deriving state from git. Update it at the end of any session that
-changes direction; keep it short. Last updated **2026-09-18** (SentinelFS spec review round 1).
+changes direction; keep it short. Last updated **2026-10-03** (component PR-2; PR-2b decided).
 
 ## Landed (main)
 
@@ -42,6 +42,19 @@ changes direction; keep it short. Last updated **2026-09-18** (SentinelFS spec r
   wrong-id=refused runtime=native reply=ok ok` asserted by `make test`. Five new Kani
   harnesses (framing injective, codec round-trip, decode total, ring FIFO/no-loss,
   SHA padding). Zero `hal` delta; zero time-dependent semantics.
+- **Component model PR-2 (bus + capabilities).** `kernel::cap`: a fixed 16 × 16 slab of
+  per-instance tables behind an opaque `CapIndex` (generation ‖ table ‖ slot); exactly three
+  producers — `grant` (manifest ∩ policy, Required/Optional planned against usable slots before
+  any state changes), `delegate` (attenuated or equal via one decidable `is_attenuation_of`,
+  checked before install), `mint_reply` (one-shot, ≤ 4 pending); cascading `revoke`/`release`;
+  deny by default; allocation-free, rate-limited denial log. `kernel::bus`: one kernel-wide host
+  under one leaf lock; components act only through a per-dispatch `bus::Ctx` (no API names a
+  sender or a target; the kernel stamps `from`); a full inbox is `Busy`; silence is denial;
+  run-to-completion dispatch with a per-instance `running` flag (no task per instance, §18.4).
+  `make check-component-imports` keeps component code to `Ctx`/`BusError`/`Delegation`.
+  Threat model: `docs/security/threat-model.md`. Kani: no forgery (bounded + three inductive
+  steps), never amplifies, revoke removes every descendant. Boot proof `[cap] attested-from=yes
+  deny-by-default=yes forge-attempt=refused denies-logged=13 ok`. Zero `hal` delta.
 - **Verification.** Miri (hal + kernel ml/sched) and Kani (hal + kernel) are
   **gating** CI; every workflow job carries a timeout, machine-checked. Boot
   timing harness (`make boot-timing`) is informational.
@@ -69,13 +82,17 @@ solve Argon2id's ≥19 MiB vs the 4 MiB heap, wrap both the tree key and the Key
 one unlock secret (resolving component §18.1), and decide the rollback anchor. Component
 PR-2 continues in parallel.
 
-0. **Component-model PR-2** bus + capabilities: `kernel::cap` fixed slab, `bus::send(cap,
-   payload)` (the sender never names a target), `Host` becomes kernel-wide, two components +
-   one with no cap, denials logged rate-limited, `required`/`optional` caps in manifests.
-   `expires` ticks off `clock::mono_ticks()`. Boot line `[cap] attested-from=yes
-   deny-by-default=yes forge-attempt=refused denies-logged=N ok`. Then **PR-3**
-   delegates with an **ephemeral memory-only key** (`sealing=none secrets-persist=no`).
-   fs key file refused 4/4.
+0. **Component-model PR-2b** identity v2 + wide indices (decided 2026-10-03, component spec
+   A12/A13; **merges before PR-3 is opened**): manifest declarations bound into `ComponentId`
+   (v2 framing) with records naming **services**, not ids — policy becomes routes (honoured only
+   to a provider whose id-bound manifest provides the service) + an allow-list; `CapIndex(u64) =
+   generation:48 ‖ table:8 ‖ slot:8` (24-bit generations let any client retire a responder's
+   table at bus speed, T-DOS-5); codec `WIRE_VERSION` 2; every id literal regenerated; boot line
+   gains `manifest-tamper=refused`. Open for PR-2b: inline code vs `SHA-256(code)` by reference
+   (then amend SentinelFS §7.3/§9: the stored component image is the v2 frame). Then **PR-3**
+   delegates with an **ephemeral memory-only key** (`sealing=none secrets-persist=no`), fs key
+   file refused 4/4; PR-3 must also decide the run-to-completion driver (which core drains
+   which inbox) and grant re-binding after a provider restarts (`Ctx::rebind`).
 1. **Memory-boundary gate** (docs, before PR-3 merges): wasm via `wasmi` under the §12
    conditions vs ring-3 ELF. Preconditions either way: a gating fuzz lane (none exists),
    `kernel/docs/external-tcb.md` + hal-tcb §1 amendment. Spike baseline in spec §19:
@@ -119,6 +136,10 @@ PR-2 continues in parallel.
   Every cross-core wait opens the interrupt window.
 - **Keep the preemption proof at 40 ticks** (PR #31 analysis): 200 ms of boot
   time is not worth halving a gating proof's margin.
+- **Declarations name services, not component ids** (2026-10-03, component A12). Binding a
+  target's id into a client's id rekeys every transitive dependent on each update and makes
+  mutual declarations (KeyAgent ↔ Security Center) a hash cycle; the policy route records
+  "reviewed against exactly B" instead.
 - **Kernel-crate Kani harnesses must be discharged locally before merge**
   (`cargo kani -p kernel --harness NAME`); see `.github/workflows/verify.yml`.
 
