@@ -1,6 +1,6 @@
 {
   "project": "SentinelOS",
-  "updated": "2026-09-18",
+  "updated": "2026-10-03",
   "pipeline": [
     "spec",
     "architect",
@@ -55,8 +55,16 @@
       "name": "kernel-engineer",
       "role": "Safe-Rust kernel implementation",
       "model": "sonnet",
-      "status": "done",
-      "task": "Exception handlers (#BP/#PF/#DF/#GP) registered; init wired into kmain"
+      "status": "working",
+      "task": "SentinelFS FS-1a: blk + verified cache + superblocks + sfs-commit (cap lattice deferred to FS-1c)",
+      "history": [
+        {
+          "ts": "2026-10-03T12:18:31",
+          "kind": "status",
+          "status": "working",
+          "task": "SentinelFS FS-1a: blk + verified cache + superblocks + sfs-commit (cap lattice deferred to FS-1c)"
+        }
+      ]
     },
     {
       "name": "verification-engineer",
@@ -163,8 +171,8 @@
       "name": "security-engineer",
       "role": "sentinel-core integration, capabilities, sandbox",
       "model": "opus",
-      "status": "done",
-      "task": "Security-seat review of SentinelFS design (attestation record, threat-model gaps, encryption placement)",
+      "status": "working",
+      "task": "component PR-2: kernel::cap + kernel::bus, attested from, deny by default",
       "history": [
         {
           "ts": "2026-09-18T16:28:41",
@@ -189,6 +197,12 @@
           "kind": "status",
           "status": "done",
           "task": "Security-seat review of SentinelFS design (attestation record, threat-model gaps, encryption placement)"
+        },
+        {
+          "ts": "2026-10-03T12:18:31",
+          "kind": "status",
+          "status": "working",
+          "task": "component PR-2: kernel::cap + kernel::bus, attested from, deny by default"
         }
       ]
     },
@@ -214,5 +228,5 @@
       "task": "\u2014"
     }
   ],
-  "updatedAt": "2026-09-18T17:25:17"
+  "updatedAt": "2026-10-03T12:18:31"
 }
