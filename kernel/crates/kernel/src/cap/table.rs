@@ -221,19 +221,22 @@ impl<const T: usize, const S: usize, C: Authority> CapSpace<T, S, C> {
         )
     }
 
-    /// **Producer 2.** Install `child`, derived from `holder`'s capability
-    /// `idx`, in `recipient`'s table. The parent must be live and may
-    /// delegate; the child must be well formed and `⊑` the parent — the one
-    /// predicate, `Authority::is_attenuation_of`, which for `Capability`
-    /// includes "same target". Never modifies the parent.
-    pub fn delegate(
-        &mut self,
+    /// Everything [`Self::delegate`] checks before it installs, in the same
+    /// order, changing nothing: `holder`'s capability `idx` is live and may
+    /// delegate, `child` is well formed and `⊑` it — the one predicate,
+    /// `Authority::is_attenuation_of`, which for `Capability` includes "same
+    /// target" — and `recipient` is a table. On success, the parent's exact
+    /// reference, which `delegate` records. Callers check authority with this
+    /// before any capacity they own (the bus: the recipient's inbox), so a
+    /// refusal or a `Busy` never spends a generation of anyone's table.
+    pub fn check_delegate(
+        &self,
         holder: usize,
         idx: CapIndex,
         recipient: usize,
         child: &C,
         now: Tick,
-    ) -> Result<CapIndex, CapError> {
+    ) -> Result<CapRef, CapError> {
         let s = self.locate(holder, idx).map_err(CapError::Deny)?;
         let parent_gen = self.tables[holder][s].gen;
         let parent = self.tables[holder][s]
@@ -254,15 +257,31 @@ impl<const T: usize, const S: usize, C: Authority> CapSpace<T, S, C> {
         if recipient >= T {
             return Err(CapError::NoSuchTable);
         }
+        Ok(CapRef {
+            table: holder as u8,
+            slot: s as u8,
+            gen: parent_gen,
+        })
+    }
+
+    /// **Producer 2.** Install `child`, derived from `holder`'s capability
+    /// `idx`, in `recipient`'s table, after [`Self::check_delegate`]: the
+    /// parent must be live and may delegate; the child must be well formed
+    /// and `⊑` the parent. Never modifies the parent.
+    pub fn delegate(
+        &mut self,
+        holder: usize,
+        idx: CapIndex,
+        recipient: usize,
+        child: &C,
+        now: Tick,
+    ) -> Result<CapIndex, CapError> {
+        let parent = self.check_delegate(holder, idx, recipient, child, now)?;
         self.install(
             recipient,
             Entry {
                 cap: *child,
-                parent: Some(CapRef {
-                    table: holder as u8,
-                    slot: s as u8,
-                    gen: parent_gen,
-                }),
+                parent: Some(parent),
                 origin: Origin::Delegate,
             },
         )
@@ -396,6 +415,22 @@ impl<const T: usize, const S: usize, C: Authority> CapSpace<T, S, C> {
         table < T && self.free_slot(table).is_some()
     }
 
+    /// Slots of `table` a new capability could take now: empty and not
+    /// retired. Instantiation checks its grants fit before changing anything.
+    pub fn usable_slots(&self, table: usize) -> usize {
+        if table >= T {
+            return 0;
+        }
+        let mut n = 0;
+        for s in 0..S {
+            let slot = self.tables[table][s];
+            if slot.entry.is_none() && !slot.retired {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// The entry in `table`'s `slot` and its generation, if occupied
     /// (audit, tests, and the Kani invariants).
     pub fn entry_at(&self, table: usize, slot: usize) -> Option<(Entry<C>, u32)> {
@@ -406,8 +441,9 @@ impl<const T: usize, const S: usize, C: Authority> CapSpace<T, S, C> {
         s.entry.map(|e| (e, s.gen))
     }
 
-    // Three shapes in this impl are for the verifier, and cost nothing at run
-    // time (the Kani harnesses below are what they buy; times in the spec):
+    // Three shapes in this impl are for the verifier (the Kani harnesses
+    // below are what they buy; times in the spec). Their run-time cost is
+    // small but not zero:
     //
     // - The scans are constant-range index loops, not iterator chains: an
     //   iterator over a row picked by a symbolic table number leaves CBMC a
@@ -419,6 +455,10 @@ impl<const T: usize, const S: usize, C: Authority> CapSpace<T, S, C> {
     //   array read.
     // - The orphan sweep reads the slab once, propagates over a flag map and
     //   writes the slab once, instead of rescanning a slab it keeps changing.
+    //   So every removal pays at least three passes over all `T * S` slots
+    //   (scan, one propagation round, free), plus a round per chain link — up
+    //   to `(T * S)²` flag steps — under the host lock with interrupts masked
+    //   (spec §8, threat T-CON-3). No fast path: the code stays as verified.
 
     fn count(&self, table: usize, pred: impl Fn(&Entry<C>) -> bool) -> usize {
         if table >= T {
@@ -543,9 +583,15 @@ impl<const T: usize, const S: usize, C: Authority> CapSpace<T, S, C> {
         freed
     }
 
+    /// Test hook: the generation of `slot` of `table`, occupied or not.
+    #[cfg(test)]
+    pub(crate) fn gen_for_test(&self, table: usize, slot: usize) -> u32 {
+        self.tables[table][slot].gen
+    }
+
     /// Test hook: move `slot` of `table` to generation `gen` (empty slots only).
     #[cfg(test)]
-    fn set_gen_for_test(&mut self, table: usize, slot: usize, gen: u32) {
+    pub(crate) fn set_gen_for_test(&mut self, table: usize, slot: usize, gen: u32) {
         if self.tables[table][slot].entry.is_none() {
             self.tables[table][slot].gen = gen;
         }
@@ -586,6 +632,76 @@ mod tests {
     use crate::host::InstanceId;
 
     type Space = CapSpace<4, 4>;
+
+    /// A chain through all 256 slots of the production slab, each child at an
+    /// EARLIER scan position than its parent: each propagation round of the
+    /// orphan sweep can doom only one more link, so a round bound that is only
+    /// enough at the Kani size (2 × 2) leaves live orphans here (T-CAP-4).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn release_frees_a_full_slab_chain_in_worst_scan_order() {
+        const T: usize = crate::host::MAX_INSTANCES;
+        const S: usize = MAX_CAPS;
+        let c = Capability {
+            target: Target::Instance(InstanceId(1)),
+            ops: OpSet::of(&[Op::Send, Op::Delegate]),
+            attenuation: Attenuation::Message { max_len: 8 },
+            expires: None,
+        };
+        let filler = Capability {
+            ops: OpSet::of(&[Op::Send]),
+            ..c
+        };
+        let mut sp: CapSpace<T, S> = CapSpace::new();
+        let mut fill = [[CapIndex::KERNEL; S]; T];
+        for (t, row) in fill.iter_mut().enumerate() {
+            for cell in row.iter_mut() {
+                *cell = sp.grant(t, &filler, &filler).unwrap();
+            }
+        }
+        let (mut prev, mut root) = (None::<(usize, CapIndex)>, None);
+        for p in (0..T * S).rev() {
+            let (t, s) = (p / S, p % S);
+            sp.release(t, fill[t][s]).unwrap();
+            let idx = match prev {
+                None => sp.grant(t, &c, &c).unwrap(),
+                Some((pt, pidx)) => sp.delegate(pt, pidx, t, &c, 0).unwrap(),
+            };
+            assert_eq!((idx.parts().0, idx.parts().1), (t, s));
+            root.get_or_insert((t, idx));
+            prev = Some((t, idx));
+        }
+        let (rt, ridx) = root.unwrap();
+        assert_eq!(sp.release(rt, ridx), Ok(T * S));
+        assert!((0..T).all(|t| sp.live_count(t) == 0), "an orphan survived");
+    }
+
+    #[test]
+    fn usable_slots_skip_occupied_and_retired_slots() {
+        let mut sp = Space::new();
+        assert_eq!(sp.usable_slots(0), 4);
+        assert_eq!(sp.usable_slots(99), 0);
+        let c = send_to(9, &[Op::Send], 8, None);
+        let idx = sp.grant(0, &c, &c).unwrap();
+        assert_eq!(sp.usable_slots(0), 3);
+        // Retire the slot: its last generation is spent at the next free.
+        sp.release(0, idx).unwrap();
+        sp.set_gen_for_test(0, 0, GEN_MAX);
+        let last = sp.grant(0, &c, &c).unwrap();
+        assert_eq!(last.parts(), (0, 0, GEN_MAX));
+        sp.release(0, last).unwrap();
+        assert_eq!(
+            sp.usable_slots(0),
+            3,
+            "a retired slot is never usable again"
+        );
+        assert_eq!(sp.clear_table(0), 0);
+        assert_eq!(
+            sp.usable_slots(0),
+            3,
+            "and clearing the table does not revive it"
+        );
+    }
 
     fn send_to(n: u64, ops: &[Op], max_len: u16, expires: Option<Tick>) -> Capability {
         Capability {

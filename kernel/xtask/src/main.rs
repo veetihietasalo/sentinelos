@@ -15,6 +15,7 @@
 //! make run         # build ISO, launch QEMU with serial output on stdout
 //! make test        # build ISO, boot headless in QEMU (TCG), assert banner in serial.log
 //! make test-kvm    # build ISO, boot under KVM (-cpu host), assert the x2APIC enable path
+//! make check-component-imports # component modules name only bus::Ctx & co.
 //! make screenshot  # build ISO, boot in headless QEMU, capture PNG via QMP
 //! ```
 //!
@@ -39,16 +40,21 @@ fn main() -> ExitCode {
         Some("test") => do_test(),
         Some("test-kvm") => do_test_kvm(),
         Some("check-no-vector") => do_check_no_vector(),
+        Some("check-component-imports") => do_check_component_imports(),
         Some("screenshot") => do_screenshot(),
         Some("boot-timing") => {
             // Default 5 runs: enough for a median plus a visible spread without
             // making the CI job slow.
-            let runs = args.next().and_then(|a| a.parse::<usize>().ok()).unwrap_or(5);
+            let runs = args
+                .next()
+                .and_then(|a| a.parse::<usize>().ok())
+                .unwrap_or(5);
             do_boot_timing(runs)
         }
         other => {
             eprintln!(
-                "Usage: cargo xtask <build|run|test|test-kvm|check-no-vector|screenshot|boot-timing [runs]>\n\
+                "Usage: cargo xtask <build|run|test|test-kvm|check-no-vector|\
+                 check-component-imports|screenshot|boot-timing [runs]>\n\
                  Unknown subcommand: {:?}",
                 other
             );
@@ -844,6 +850,344 @@ fn do_check_no_vector() -> ExitCode {
     }
 }
 
+// ── check-component-imports ────────────────────────────────────────────────────
+
+/// Component modules, relative to the kernel root: code that runs **as a
+/// component** — in ring 0, inside the kernel crate, so the compiler alone
+/// would let it name any crate-internal item (threat T-NAT-1 in
+/// `docs/security/threat-model.md`). Every `.rs` file under [`COMPONENT_DIRS`]
+/// is one too. A missing file fails the check, so a rename cannot silently
+/// drop a module from it.
+const COMPONENT_FILES: &[&str] = &[
+    "crates/kernel/src/host/probe.rs",
+    "crates/kernel/src/host/native.rs",
+];
+
+/// Directories (relative to the kernel root) whose every `.rs` file, at any
+/// depth, is a component module. Absent today: native components beyond the
+/// PR-2 probes go here.
+const COMPONENT_DIRS: &[&str] = &["crates/kernel/src/components"];
+
+/// All a component module may name from `crate::bus`: the context it is
+/// handed and the two types its operations take and return.
+const COMPONENT_BUS_ALLOWED: &[&str] = &["Ctx", "BusError", "Delegation"];
+
+/// Identifiers a component module may never name: the host type and the
+/// kernel-wide host.
+const COMPONENT_FORBIDDEN_IDENTS: &[&str] = &["Host", "HOST"];
+
+/// A token of Rust source, as far as [`find_component_violations`] needs one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Tok {
+    /// An identifier or keyword (a raw identifier `r#x` yields `r` then `x`).
+    Ident(String),
+    /// `::`.
+    PathSep,
+    /// One of `{ } , ; *`.
+    Punct(char),
+}
+
+/// Bytes in the UTF-8 sequence that `lead` starts.
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
+}
+
+/// Skip a (byte) string body starting just after its opening quote; returns
+/// the index just past the closing quote.
+fn skip_string(b: &[u8], mut i: usize, line: &mut usize) -> usize {
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                if b.get(i + 1) == Some(&b'\n') {
+                    *line += 1;
+                }
+                i += 2;
+            }
+            b'"' => return i + 1,
+            b'\n' => {
+                *line += 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+/// Whether `#`s then a quote start at `i` (a raw string after `r` / `br`).
+fn is_raw_string_start(b: &[u8], mut i: usize) -> bool {
+    while b.get(i) == Some(&b'#') {
+        i += 1;
+    }
+    b.get(i) == Some(&b'"')
+}
+
+/// Skip a raw string from its `#`s / opening quote (at `i`); returns the index
+/// just past its terminator.
+fn skip_raw_string(b: &[u8], mut i: usize, line: &mut usize) -> usize {
+    let mut hashes = 0;
+    while b.get(i) == Some(&b'#') {
+        hashes += 1;
+        i += 1;
+    }
+    i += 1; // the opening quote
+    while i < b.len() {
+        if b[i] == b'"' && (1..=hashes).all(|k| b.get(i + k) == Some(&b'#')) {
+            return i + 1 + hashes;
+        }
+        if b[i] == b'\n' {
+            *line += 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// At a `'` (index `i`): skip a char literal whole, or just the quote of a
+/// lifetime (its name is then an ordinary identifier).
+fn skip_char_or_lifetime(b: &[u8], i: usize) -> usize {
+    match b.get(i + 1) {
+        Some(b'\\') => {
+            let mut j = i + 2;
+            while j < b.len() && b[j] != b'\'' && b[j] != b'\n' {
+                j += 1;
+            }
+            j + 1
+        }
+        Some(&lead) => {
+            let end = i + 1 + utf8_len(lead);
+            if b.get(end) == Some(&b'\'') {
+                end + 1
+            } else {
+                i + 1
+            }
+        }
+        None => i + 1,
+    }
+}
+
+/// Tokenise Rust source into `(line, token)` pairs. Comments (line, block,
+/// nested), string / byte-string / raw-string literals, char and byte literals
+/// are skipped, so text inside them never trips the guard.
+fn tokenize_rust(src: &str) -> Vec<(usize, Tok)> {
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let (mut i, mut line) = (0usize, 1usize);
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'\n' => {
+                line += 1;
+                i += 1;
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut depth = 0usize;
+                while i < b.len() {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth = depth.saturating_sub(1);
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        if b[i] == b'\n' {
+                            line += 1;
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => i = skip_string(b, i + 1, &mut line),
+            b'\'' => i = skip_char_or_lifetime(b, i),
+            b':' if b.get(i + 1) == Some(&b':') => {
+                out.push((line, Tok::PathSep));
+                i += 2;
+            }
+            b'{' | b'}' | b',' | b';' | b'*' => {
+                out.push((line, Tok::Punct(char::from(c))));
+                i += 1;
+            }
+            _ if c == b'_' || c.is_ascii_alphabetic() => {
+                let start = i;
+                while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
+                    i += 1;
+                }
+                let word = &src[start..i];
+                match (word, b.get(i)) {
+                    ("r" | "br", Some(b'"' | b'#')) if is_raw_string_start(b, i) => {
+                        i = skip_raw_string(b, i, &mut line);
+                    }
+                    ("b", Some(b'"')) => i = skip_string(b, i + 1, &mut line),
+                    ("b", Some(b'\'')) => i = skip_char_or_lifetime(b, i),
+                    _ => out.push((line, Tok::Ident(word.to_string()))),
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// What follows `module::` at `toks[at]`: an allowed name, a disallowed one, a
+/// glob, or a `{ … }` group whose every item must be allowed.
+fn check_path_tail(
+    toks: &[(usize, Tok)],
+    at: usize,
+    line: usize,
+    module: &str,
+    ok: &dyn Fn(&str) -> bool,
+    out: &mut Vec<(usize, String)>,
+) {
+    match toks.get(at).map(|t| &t.1) {
+        Some(Tok::Ident(n)) if !ok(n) => out.push((line, format!("names `{module}::{n}`"))),
+        Some(Tok::Punct('*')) => out.push((line, format!("globs `{module}::*`"))),
+        Some(Tok::Punct('{')) => {
+            let (mut depth, mut head) = (0usize, true);
+            for (l, t) in &toks[at..] {
+                match t {
+                    Tok::Punct('{') => {
+                        depth += 1;
+                        head = true;
+                    }
+                    Tok::Punct('}') => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Tok::Punct(',') if depth == 1 => head = true,
+                    Tok::Punct('*') if depth == 1 && head => {
+                        out.push((*l, format!("globs `{module}::*`")));
+                    }
+                    Tok::Ident(n) if depth == 1 && head => {
+                        head = false;
+                        if !ok(n) {
+                            out.push((*l, format!("names `{module}::{n}`")));
+                        }
+                    }
+                    _ if depth == 1 => head = false,
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Pure core of [`do_check_component_imports`]: every way `src` (one component
+/// module) names more of the kernel than a component may, as `(line, what)`.
+///
+/// - From `crate::bus`, only [`COMPONENT_BUS_ALLOWED`]: any other `bus::name`,
+///   a `bus::{…}` group naming anything else (`self` included), a `bus::*`
+///   glob, or `bus` named on its own (importing the module) is flagged.
+/// - [`COMPONENT_FORBIDDEN_IDENTS`], anywhere.
+/// - `cap::table`: directly, in a `cap::{…}` group, or through a `cap::*` glob.
+///
+/// Conservative by design: an unrelated local named `bus` is flagged too.
+fn find_component_violations(src: &str) -> Vec<(usize, String)> {
+    let toks = tokenize_rust(src);
+    let mut out = Vec::new();
+    let bus_ok = |n: &str| COMPONENT_BUS_ALLOWED.contains(&n);
+    let cap_ok = |n: &str| n != "table";
+    for (k, (line, tok)) in toks.iter().enumerate() {
+        let Tok::Ident(name) = tok else {
+            continue;
+        };
+        let followed_by_path = matches!(toks.get(k + 1), Some((_, Tok::PathSep)));
+        match name.as_str() {
+            n if COMPONENT_FORBIDDEN_IDENTS.contains(&n) => {
+                out.push((*line, format!("names `{n}`")));
+            }
+            "bus" if followed_by_path => {
+                check_path_tail(&toks, k + 2, *line, "bus", &bus_ok, &mut out)
+            }
+            "bus" => out.push((*line, "names the `bus` module itself".to_string())),
+            "cap" if followed_by_path => {
+                check_path_tail(&toks, k + 2, *line, "cap", &cap_ok, &mut out)
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Every `.rs` file under `dir`, at any depth (nothing if `dir` is absent).
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|x| x == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Guard threat T-NAT-1's compile-time half: a native component runs in ring 0
+/// inside the kernel crate, so `pub(crate)` alone does not keep it from naming
+/// the host. Scan every component module ([`COMPONENT_FILES`],
+/// [`COMPONENT_DIRS`]) and fail if one names anything of `crate::bus` beyond
+/// [`COMPONENT_BUS_ALLOWED`], the host ([`COMPONENT_FORBIDDEN_IDENTS`]), or
+/// `crate::cap::table`. A source scan, not a proof: it stops a *confused*
+/// component, as the threat model says; the memory boundary stops the rest.
+fn do_check_component_imports() -> ExitCode {
+    let root = kernel_root();
+    let mut files: Vec<PathBuf> = COMPONENT_FILES.iter().map(|f| root.join(f)).collect();
+    for dir in COMPONENT_DIRS {
+        collect_rs_files(&root.join(dir), &mut files);
+    }
+    let mut bad = 0usize;
+    for path in &files {
+        let src = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "check-component-imports FAILED: cannot read {}: {e}",
+                    path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        for (line, what) in find_component_violations(&src) {
+            eprintln!("  {}:{line}: {what}", path.display());
+            bad += 1;
+        }
+    }
+    if bad == 0 {
+        println!(
+            "check-component-imports PASSED: {} component module(s) name only {:?} \
+             from crate::bus, and never Host, HOST or crate::cap::table.",
+            files.len(),
+            COMPONENT_BUS_ALLOWED
+        );
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "check-component-imports FAILED: {bad} violation(s) above. Component code \
+             runs in ring 0 inside the kernel crate; it may reach the kernel only \
+             through the bus::Ctx it is handed (threat T-NAT-1, \
+             docs/security/threat-model.md)."
+        );
+        ExitCode::FAILURE
+    }
+}
+
 /// Boot the kernel headless in QEMU, poll the serial log, and assert the boot
 /// markers. `kvm = false` is the portable TCG test (CI default); `kvm = true`
 /// adds real acceleration + `-cpu host` and additionally requires the x2APIC
@@ -1015,7 +1359,10 @@ fn boot_test(kvm: bool) -> ExitCode {
         .lines()
         .find(|l| l.contains("[smp] cpu") && SMP_AP_FAILED_MARKERS.iter().any(|m| l.contains(m)))
     {
-        eprintln!("TEST FAILED: an application processor failed to start: '{}'", bad);
+        eprintln!(
+            "TEST FAILED: an application processor failed to start: '{}'",
+            bad
+        );
         return ExitCode::FAILURE;
     }
 
@@ -1342,8 +1689,8 @@ fn boot_test(kvm: bool) -> ExitCode {
              ('{}'), vector tier active ('{}' with '{}' and '{}'), the cooperative \
              scheduler verdict ('{}'), the preemptive scheduler proof ('{}', \
              preempted={}, gemm-iters={}, spin-iters={}), the monotonic clock proven \
-             ('{}'), the component host proven ('{}'), and end-marker '{}' confirmed \
-             in serial output.",
+             ('{}'), the component host proven ('{}'), the capability boundary \
+             proven ('{}'), and end-marker '{}' confirmed in serial output.",
             smp_line,
             tracked,
             aps_ok,
@@ -1359,6 +1706,7 @@ fn boot_test(kvm: bool) -> ExitCode {
             spin_iters,
             clock_line,
             comp_line,
+            cap_line.trim_end(),
             END_MARKER
         );
     }
@@ -1583,6 +1931,66 @@ fn do_screenshot() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{find_vector_violations, VECTOR_CODE_ALLOWLIST};
+
+    #[test]
+    fn component_guard_allows_the_ctx_and_its_types_only() {
+        use super::find_component_violations as v;
+        assert!(v("use crate::bus::{BusError, Ctx, Delegation};\n\
+                   fn f(c: &crate::bus::Ctx<'_, R>) -> Result<(), crate::bus::BusError> {}")
+        .is_empty());
+        assert!(v("use crate::bus::Ctx as Context;").is_empty());
+        for bad in [
+            "crate::bus::dispatch(&cell, inst, 1);",
+            "use crate::bus::{Ctx, with_host};",
+            "use crate::bus;",
+            "use crate::{bus, cap};",
+            "use crate::bus::*;",
+            "use crate::bus::{Ctx, *};",
+            "let g = super::super::bus::HOST.lock();",
+            "use crate::bus::{self, Ctx};",
+            "use crate::bus::{proof::prove_caps};",
+            "crate::bus::irq_masked(|| ());",
+            "fn f(h: &mut Host<NativeRuntime>) {}",
+            "use crate::cap::table::CapSpace;",
+            "use crate::cap::{table, CapIndex};",
+            "use crate::cap::{CapIndex, table::MAX_CAPS};",
+            "use crate::cap::*;",
+            "let h = r#Host;",
+        ] {
+            assert!(!v(bad).is_empty(), "not flagged: {bad}");
+        }
+    }
+
+    #[test]
+    fn component_guard_ignores_comments_strings_and_literals() {
+        let src = "// crate::bus::dispatch and Host\n\
+                   /* bus::HOST /* nested Host */ still a comment */\n\
+                   /// docs may name `crate::bus::with_host`\n\
+                   const S: &str = \"crate::bus::HOST \\\" Host\";\n\
+                   const B: &[u8] = b\"Host\";\n\
+                   const R: &str = r#\"bus::dispatch \"Host\" \"#;\n\
+                   fn f<'a>(x: &'a str) -> char { let _ = x; '{' }\n\
+                   const C: u8 = b'}';\n\
+                   const D: char = 'é';\n\
+                   use crate::cap::{CapIndex, Op};\n\
+                   fn g(e: &E) -> u32 { e.cap.0 }\n";
+        assert_eq!(super::find_component_violations(src), vec![]);
+    }
+
+    #[test]
+    fn component_guard_reports_the_line() {
+        let v = super::find_component_violations("use crate::bus::Ctx;\n\nlet h = HOST;\n");
+        assert_eq!(v, vec![(3, "names `HOST`".to_string())]);
+    }
+
+    #[test]
+    fn the_component_modules_in_this_tree_pass_the_guard() {
+        let root = super::kernel_root();
+        for f in super::COMPONENT_FILES {
+            let src = std::fs::read_to_string(root.join(f)).expect("component module exists");
+            assert_eq!(super::find_component_violations(&src), vec![], "{f}");
+        }
+    }
 
     // Synthetic `objdump -d` snippets: a function header line followed by AT&T
     // instruction lines. These are the exact shapes `find_vector_violations` parses.

@@ -136,6 +136,16 @@ jobs:
             --target x86_64-unknown-linux-gnu --target-dir target/xtask
           make check-no-vector
 
+      # ── 8d. Component source guard (threat T-NAT-1) ───────────────────────
+      # Native components run in ring 0 inside the kernel crate, so `pub(crate)`
+      # alone does not stop one naming the host. Scan the component modules
+      # (host/probe.rs, host/native.rs, any future components/): from crate::bus
+      # they may name only Ctx, BusError and Delegation, and never Host, HOST
+      # or crate::cap::table. The scanner's unit tests ran in the step above.
+      - name: xtask check-component-imports
+        working-directory: kernel
+        run: make check-component-imports
+
       # ── 9. Boot test (deterministic QEMU serial-output check) ─────────────
       # `make test` (host-detecting wrapper over xtask — works on this Linux
       # runner and on macOS) builds the ISO, boots QEMU headless, captures serial

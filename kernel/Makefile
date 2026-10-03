@@ -18,6 +18,9 @@
 #   make check-no-vector # disassemble the kernel; assert vector instructions live
 #                    #   ONLY in the audited hal::simd GEMM/xsave symbols, so no
 #                    #   interrupt handler can clobber an in-flight GEMM.
+#   make check-component-imports # scan the component modules: they may name
+#                    #   only bus::{Ctx, BusError, Delegation} — never the host
+#                    #   or the capability tables (threat T-NAT-1).
 #   make screenshot  # build ISO + capture a framebuffer PNG via QMP
 #
 # Requires: qemu-system-x86_64, xorriso, and kernel/limine (see README).
@@ -25,7 +28,7 @@
 HOST := $(shell rustc -vV | sed -n 's/^host: //p')
 XTASK := cargo run --manifest-path xtask/Cargo.toml --target $(HOST) --target-dir target/xtask --
 
-.PHONY: build run test test-kvm check-no-vector screenshot boot-timing
+.PHONY: build run test test-kvm check-no-vector check-component-imports screenshot boot-timing
 build:
 	$(XTASK) build
 run:
@@ -36,6 +39,8 @@ test-kvm:
 	$(XTASK) test-kvm
 check-no-vector:
 	$(XTASK) check-no-vector
+check-component-imports:
+	$(XTASK) check-component-imports
 screenshot:
 	$(XTASK) screenshot
 

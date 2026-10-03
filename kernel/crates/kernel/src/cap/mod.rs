@@ -454,6 +454,9 @@ pub enum DenyReason {
     MissingRequired,
     /// The acting instance is not live.
     NoSuchSender,
+    /// The destination table has no usable slot: every slot is occupied, or
+    /// retired after its generations ran out (threat T-CAP-2's residual).
+    TableFull,
 }
 
 impl DenyReason {
@@ -474,6 +477,7 @@ impl DenyReason {
             DenyReason::PolicyRefused => "policy-refused",
             DenyReason::MissingRequired => "missing-required",
             DenyReason::NoSuchSender => "no-such-sender",
+            DenyReason::TableFull => "table-full",
         }
     }
 }
@@ -709,6 +713,7 @@ mod tests {
     fn reasons_have_stable_labels() {
         assert_eq!(DenyReason::Foreign.label(), "foreign");
         assert_eq!(DenyReason::MissingRequired.label(), "missing-required");
+        assert_eq!(DenyReason::TableFull.label(), "table-full");
     }
 }
 

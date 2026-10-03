@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::cap::deny::{Action, DenyRecord};
-use crate::cap::table::MAX_CAPS;
-use crate::cap::{Attenuation, CapIndex, DenyReason, Op, OpSet, Target};
+use crate::cap::table::{GEN_MAX, MAX_CAPS};
+use crate::cap::{Attenuation, CapIndex, Capability, DenyReason, Op, OpSet, Target};
 use crate::host::codec::{Envelope, Kind, Sender};
 use crate::host::native::{NativeRuntime, BOOT_POLICY, REGISTRY};
 use crate::host::probe::{self, Args, ALICE_ID, BOB_ID, CAROL_ID};
@@ -47,8 +47,12 @@ fn world() -> World {
     }
 }
 
+/// Take the next envelope as `dispatch` would, and let its (absent) handler
+/// return at once.
 fn pop(h: &mut Host<NativeRuntime>, inst: InstanceId) -> Option<Envelope> {
-    h.pop_for_dispatch(inst).unwrap().map(|(_, e)| e)
+    let next = h.pop_for_dispatch(inst).unwrap().map(|(_, e)| e);
+    h.finish_run(inst);
+    next
 }
 
 fn last_deny(h: &Host<NativeRuntime>) -> DenyRecord {
@@ -382,6 +386,300 @@ fn pending_replies_are_capped_per_responder() {
     };
     h.reply_from(w.bob, CapIndex(reply_tag), b"a", 1).unwrap();
     assert!(h.request_from(w.alice, w.a_bob, b"q", 100, 1).is_ok());
+}
+
+#[test]
+fn expired_reply_rights_never_lock_a_silent_responder_out() {
+    let w = world();
+    let mut g = w.cell.lock();
+    let h = &mut *g;
+    for _ in 0..MAX_PENDING_REPLIES {
+        h.request_from(w.alice, w.a_bob, b"q", 1, 0).unwrap(); // bob stays silent
+    }
+    assert_eq!(
+        h.request_from(w.alice, w.a_bob, b"q", 1, 0),
+        Err(BusError::Busy)
+    );
+    assert!(
+        h.request_from(w.alice, w.a_bob, b"q", 100, 1).is_ok(),
+        "expired rights reclaimed"
+    );
+}
+
+#[test]
+fn an_expired_capability_offered_as_a_reply_right_is_refused_and_kept() {
+    let w = world();
+    let mut g = w.cell.lock();
+    let h = &mut *g;
+    let cs = slot(h, w.carol);
+    h.delegate_from(
+        w.alice,
+        w.a_bob,
+        w.a_carol,
+        &delegation(&[Op::Send], 8, Some(5)),
+        0,
+    )
+    .unwrap();
+    let Kind::Grant { granted } = pop(h, w.carol).unwrap().kind else {
+        panic!()
+    };
+    // Expired, and not a reply right: refused as expired, and left alone.
+    assert_eq!(
+        h.reply_from(w.carol, granted, b"x", 10),
+        Err(BusError::Denied)
+    );
+    assert_eq!(last_deny(h).reason, DenyReason::Expired);
+    assert!(
+        h.caps().get(cs, granted).is_ok(),
+        "only a reply right is reclaimed on use"
+    );
+    // An expired reply right, by contrast, is reclaimed by the late answer.
+    h.request_from(w.alice, w.a_bob, b"q", 2, 0).unwrap();
+    let Kind::Request { reply_tag } = pop(h, w.bob).unwrap().kind else {
+        panic!()
+    };
+    let bs = slot(h, w.bob);
+    assert_eq!(
+        h.reply_from(w.bob, CapIndex(reply_tag), b"late", 2),
+        Err(BusError::Denied)
+    );
+    assert!(h.caps().get(bs, CapIndex(reply_tag)).is_err());
+}
+
+#[test]
+fn a_delegation_dead_on_arrival_is_refused() {
+    let w = world();
+    let mut g = w.cell.lock();
+    let h = &mut *g;
+    let cs = slot(h, w.carol);
+    assert_eq!(
+        h.delegate_from(
+            w.alice,
+            w.a_bob,
+            w.a_carol,
+            &delegation(&[Op::Send], 8, Some(0)),
+            7
+        ),
+        Err(BusError::Denied)
+    );
+    let r = last_deny(h);
+    assert_eq!(
+        (r.holder, r.action, r.reason),
+        (
+            who(w.alice, ALICE_ID),
+            Action::Delegate,
+            DenyReason::Malformed
+        )
+    );
+    assert_eq!(h.caps().live_count(cs), 0, "nothing installed");
+    assert_eq!(h.inbox_len(w.carol), Some(0), "nobody notified");
+}
+
+#[test]
+fn only_an_authorised_delegation_reclaims_a_full_recipient_table() {
+    let w = world();
+    let mut g = w.cell.lock();
+    let h = &mut *g;
+    let cs = slot(h, w.carol);
+    // Fill carol's table with copies that expire at tick 5.
+    for _ in 0..MAX_CAPS {
+        h.delegate_from(
+            w.alice,
+            w.a_bob,
+            w.a_carol,
+            &delegation(&[Op::Send], 8, Some(5)),
+            0,
+        )
+        .unwrap();
+        assert!(pop(h, w.carol).is_some());
+    }
+    assert_eq!(h.caps().live_count(cs), MAX_CAPS);
+    // Later, a refused delegation (a malformed child) changes nothing.
+    assert_eq!(
+        h.delegate_from(
+            w.alice,
+            w.a_bob,
+            w.a_carol,
+            &delegation(&[Op::Send, Op::Reply], 8, None),
+            10
+        ),
+        Err(BusError::Denied)
+    );
+    assert_eq!(last_deny(h).reason, DenyReason::Malformed);
+    assert_eq!(
+        h.caps().live_count(cs),
+        MAX_CAPS,
+        "a refusal reclaims nothing"
+    );
+    // An authorised one finds the table full, reclaims the expired copies,
+    // and is installed on the retry.
+    h.delegate_from(
+        w.alice,
+        w.a_bob,
+        w.a_carol,
+        &delegation(&[Op::Send], 8, None),
+        10,
+    )
+    .unwrap();
+    assert_eq!(h.caps().live_count(cs), 1);
+}
+
+#[test]
+fn a_delegation_into_a_full_inbox_spends_no_generation() {
+    let w = world();
+    let mut g = w.cell.lock();
+    let h = &mut *g;
+    let cs = slot(h, w.carol);
+    // Fill carol's inbox with notices she has not read.
+    for _ in 0..MAX_INBOX {
+        h.delegate_from(
+            w.alice,
+            w.a_bob,
+            w.a_carol,
+            &delegation(&[Op::Send], 8, None),
+            0,
+        )
+        .unwrap();
+    }
+    let gens = |h: &Host<NativeRuntime>| {
+        let mut out = [0u32; MAX_CAPS];
+        for (s, g) in out.iter_mut().enumerate() {
+            *g = h.caps.gen_for_test(cs, s);
+        }
+        out
+    };
+    let before = gens(h);
+    let live = h.caps().live_count(cs);
+    for _ in 0..3 {
+        assert_eq!(
+            h.delegate_from(
+                w.alice,
+                w.a_bob,
+                w.a_carol,
+                &delegation(&[Op::Send], 8, None),
+                0
+            ),
+            Err(BusError::Busy)
+        );
+    }
+    assert_eq!(
+        gens(h),
+        before,
+        "a Busy delegation installs and frees nothing"
+    );
+    assert_eq!(h.caps().live_count(cs), live);
+    assert_eq!(h.inbox_len(w.carol), Some(MAX_INBOX));
+    // Authority is still checked first: an amplifying request is refused,
+    // not answered Busy.
+    assert_eq!(
+        h.delegate_from(
+            w.alice,
+            w.a_bob,
+            w.a_carol,
+            &delegation(&[Op::Send, Op::Reply], 8, None),
+            0
+        ),
+        Err(BusError::Denied)
+    );
+    assert_eq!(gens(h), before);
+}
+
+#[test]
+fn one_instance_never_runs_twice_at_once() {
+    let w = world();
+    {
+        let mut g = w.cell.lock();
+        let h = &mut *g;
+        h.send_from(w.alice, w.a_bob, b"one", 0).unwrap();
+        h.send_from(w.alice, w.a_bob, b"two", 0).unwrap();
+        // A delivery in progress (on "another core")...
+        assert!(h.pop_for_dispatch(w.bob).unwrap().is_some());
+        // ...blocks a second delivery and a kernel call; nothing is taken.
+        assert!(matches!(h.pop_for_dispatch(w.bob), Err(CallError::Busy)));
+        assert!(matches!(h.prepare_kernel_call(w.bob), Err(CallError::Busy)));
+        assert_eq!(h.inbox_len(w.bob), Some(1));
+    }
+    let mut out = [0u8; 8];
+    assert_eq!(
+        call(&w.cell, w.bob, "act", Args::granted(0).as_slice(), &mut out),
+        Err(CallError::Busy)
+    );
+    assert_eq!(dispatch(&w.cell, w.bob, MAX_INBOX), Err(CallError::Busy));
+    // Once it returns, both work again — and leave the flag clear.
+    w.cell.lock().finish_run(w.bob);
+    assert_eq!(dispatch(&w.cell, w.bob, MAX_INBOX), Ok(1));
+    assert!(call(&w.cell, w.bob, "act", Args::granted(0).as_slice(), &mut out).is_ok());
+    let mut g = w.cell.lock();
+    assert!(g.prepare_kernel_call(w.bob).is_ok(), "the flag was cleared");
+    // A kernel call in progress blocks a delivery the same way.
+    g.send_from(w.alice, w.a_bob, b"three", 0).unwrap();
+    assert!(matches!(g.pop_for_dispatch(w.bob), Err(CallError::Busy)));
+    g.finish_run(w.bob);
+    assert!(g.pop_for_dispatch(w.bob).unwrap().is_some());
+    // Finishing for an instance that is gone is harmless.
+    g.finish_run(InstanceId(4242));
+}
+
+/// Retire every slot of `table` but `keep` (each spent its last generation).
+fn retire_all_but(h: &mut Host<NativeRuntime>, table: usize, keep: usize) {
+    let c = Capability {
+        target: Target::Instance(InstanceId(1)),
+        ops: OpSet::of(&[Op::Send]),
+        attenuation: Attenuation::Message { max_len: 8 },
+        expires: None,
+    };
+    for s in keep..MAX_CAPS {
+        h.caps.set_gen_for_test(table, s, GEN_MAX);
+    }
+    let mut held = [CapIndex::KERNEL; MAX_CAPS];
+    for idx in held.iter_mut() {
+        *idx = h.caps.grant(table, &c, &c).unwrap();
+    }
+    for idx in held {
+        h.caps.release(table, idx).unwrap();
+    }
+    assert_eq!(h.caps.usable_slots(table), keep);
+}
+
+#[test]
+fn grants_that_do_not_fit_are_refused_before_anything_changes() {
+    let cell = fresh();
+    let _bob = instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    let _carol = instantiate(&cell, &probe::CAROL_MANIFEST).unwrap();
+    // alice will take host slot 2: no usable slot left in its table.
+    retire_all_but(&mut cell.lock(), 2, 0);
+    let before = cell.lock().instance_count();
+    assert_eq!(
+        instantiate(&cell, &probe::ALICE_MANIFEST),
+        Err(InstantiateError::MissingRequiredCap)
+    );
+    {
+        let h = cell.lock();
+        assert_eq!(h.instance_count(), before);
+        let r = last_deny(&h);
+        assert_eq!(r.holder, who(InstanceId::KERNEL, ALICE_ID));
+        assert_eq!(
+            (r.action, r.reason),
+            (Action::Grant, DenyReason::MissingRequired)
+        );
+    }
+}
+
+#[test]
+fn an_optional_grant_without_room_is_logged_as_table_full() {
+    let cell = fresh();
+    let _bob = instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    let _carol = instantiate(&cell, &probe::CAROL_MANIFEST).unwrap();
+    // Room for alice's required grant, none for her optional one.
+    retire_all_but(&mut cell.lock(), 2, 1);
+    let alice = instantiate(&cell, &probe::ALICE_MANIFEST).unwrap();
+    let h = cell.lock();
+    assert_eq!(h.cap_count(alice), 1);
+    assert!(h.granted(alice, 0).is_some());
+    assert_eq!(h.granted(alice, 1), None);
+    let r = last_deny(&h);
+    assert_eq!(r.holder, who(alice, ALICE_ID));
+    assert_eq!((r.action, r.reason), (Action::Grant, DenyReason::TableFull));
 }
 
 #[test]

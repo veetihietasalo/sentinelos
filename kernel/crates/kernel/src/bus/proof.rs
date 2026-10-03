@@ -40,6 +40,7 @@ use crate::cap::table::{GEN_MAX, MAX_CAPS};
 use crate::cap::{CapIndex, DenyReason, Op, OpSet, Tick};
 use crate::host::codec::{Kind, Sender};
 use crate::host::probe::{self, code, Args, ALICE_ID, BOB_ID, CAROL_ID, QUIET};
+use crate::host::seen;
 use crate::host::{InstanceId, InstantiateError, MAX_INBOX, MAX_INSTANCES};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hal::serial::{write_dec, write_str};
@@ -173,7 +174,7 @@ fn wait_until(deadline: Tick) -> bool {
 /// The index of the capability a kernel-stamped `Grant` notice handed `at`,
 /// if the newest envelope it saw is one from `from` over `via`.
 fn grant_notice(at: InstanceId, from: Sender, via: CapIndex) -> Option<CapIndex> {
-    let s = probe::seen_last_for(at)?;
+    let s = seen::seen_last_for(at)?;
     match s.kind {
         Kind::Grant { granted } if s.from == from && s.cap == via => Some(granted),
         _ => None,
@@ -249,7 +250,7 @@ struct World {
 pub fn prove_caps() {
     let base_count = with_host(|h| h.instance_count());
     let base = totals();
-    probe::seen_reset();
+    seen::seen_reset();
     let mut watch = DenyWatch::new();
     let mut v = Verdict::default();
 
@@ -336,7 +337,7 @@ fn run(w: &World, watch: &mut DenyWatch, v: &mut Verdict, carol_refusal: bool) {
     // ── attested-from: each recipient sees who acted, as the host knows it ──
     let sent = done(act(w.alice.instance, &Args::send(w.a_bob, b"hello bob")));
     deliver(w.bob.instance);
-    let event = probe::seen_last_for(w.bob.instance)
+    let event = seen::seen_last_for(w.bob.instance)
         .is_some_and(|s| s.from == w.alice && s.kind == Kind::Event && s.cap == w.a_bob);
 
     let tag = match act(w.alice.instance, &Args::request(w.a_bob, 100, b"ping")) {
@@ -344,7 +345,7 @@ fn run(w: &World, watch: &mut DenyWatch, v: &mut Verdict, carol_refusal: bool) {
         _ => None,
     };
     deliver(w.bob.instance);
-    let at_bob = probe::seen_last_for(w.bob.instance);
+    let at_bob = seen::seen_last_for(w.bob.instance);
     let request = at_bob.is_some_and(|s| s.from == w.alice && s.answered == Some(true));
     let reply_right = match at_bob.map(|s| s.kind) {
         Some(Kind::Request { reply_tag }) => Some(CapIndex(reply_tag)),
@@ -352,7 +353,7 @@ fn run(w: &World, watch: &mut DenyWatch, v: &mut Verdict, carol_refusal: bool) {
     };
     deliver(w.alice.instance);
     let reply = tag.is_some_and(|t| {
-        probe::seen_last_for(w.alice.instance)
+        seen::seen_last_for(w.alice.instance)
             .is_some_and(|s| s.from == w.bob && s.kind == (Kind::Reply { reply_tag: t }))
     });
     // One shot: the same right a second time is stale.
@@ -418,7 +419,7 @@ fn run(w: &World, watch: &mut DenyWatch, v: &mut Verdict, carol_refusal: bool) {
     if let Some(c_bob) = c_bob {
         let control = done(act(w.carol.instance, &Args::send(c_bob, b"via alice")));
         deliver(w.bob.instance);
-        let control_seen = probe::seen_last_for(w.bob.instance)
+        let control_seen = seen::seen_last_for(w.bob.instance)
             .is_some_and(|s| s.from == w.carol && s.cap == c_bob);
         let redelegated = done(act(
             w.carol.instance,
@@ -510,7 +511,7 @@ fn run(w: &World, watch: &mut DenyWatch, v: &mut Verdict, carol_refusal: bool) {
         &Args::request(w.a_bob, REPLY_TTL, QUIET),
     ));
     deliver(w.bob.instance);
-    let pending = probe::seen_last_for(w.bob.instance).and_then(|s| match s.kind {
+    let pending = seen::seen_last_for(w.bob.instance).and_then(|s| match s.kind {
         Kind::Request { reply_tag } if s.from == w.alice && s.answered.is_none() => {
             Some(CapIndex(reply_tag))
         }
@@ -571,6 +572,7 @@ fn measure_actor(w: &World) -> u64 {
 
 static PONG_RUN: AtomicBool = AtomicBool::new(false);
 static PONG_ITERS: AtomicU64 = AtomicU64::new(0);
+static PONG_EXITED: AtomicBool = AtomicBool::new(false);
 
 /// The other half of a context-switch round trip: what instance = task would
 /// add to every delivery (switch to the instance's task and back).
@@ -579,6 +581,8 @@ fn pong() {
         PONG_ITERS.fetch_add(1, Ordering::Relaxed);
         crate::sched::yield_now();
     }
+    // Last action: nothing shared is touched after this.
+    PONG_EXITED.store(true, Ordering::Release);
 }
 
 /// Count kmain ↔ `cap-pong` yield round trips in a [`MEASURE_TICKS`] window
@@ -586,14 +590,23 @@ fn pong() {
 /// count): run this proof before any always-runnable BSP task is started.
 ///
 /// Never waits for the ready queue to drain: every loop is bounded by the
-/// mono clock or an iteration cap. And no exited task outlives it: the last
-/// loop yields until the scheduler no longer knows `cap-pong` — exited **and
-/// reaped**, by this very task's yields (the pattern the cooperative and
-/// preemptive proofs use), so no other BSP task is ever left to reap it.
+/// mono clock or an iteration cap. The last loop waits only until `cap-pong`
+/// has **left its loop** (`PONG_EXITED`, its last action), so nothing of the
+/// measurement is still running when the proof moves on. Freeing the exited
+/// task is the scheduler's business and happens later — at this task's next
+/// yield on PR-2's scheduler, in the BSP idle loop's `idle_reap` once
+/// SentinelFS lands; the proof depends on neither.
 fn measure_task_switch() -> u64 {
     PONG_ITERS.store(0, Ordering::Relaxed);
+    PONG_EXITED.store(false, Ordering::Relaxed);
     PONG_RUN.store(true, Ordering::Release);
     let pong_id = crate::sched::spawn("cap-pong", pong);
+    if crate::sched::task_name(pong_id).is_none() {
+        // The spawn failed (it said so on the console): nothing to measure,
+        // and nothing to wait for.
+        PONG_RUN.store(false, Ordering::Release);
+        return 0;
+    }
     let start = crate::clock::mono_ticks();
     let mut spins: u64 = 0;
     while crate::clock::mono_ticks().wrapping_sub(start) < MEASURE_TICKS && spins < MEASURE_CAP {
@@ -603,7 +616,7 @@ fn measure_task_switch() -> u64 {
     let n = PONG_ITERS.load(Ordering::Relaxed);
     PONG_RUN.store(false, Ordering::Release);
     let mut guard: u32 = 0;
-    while crate::sched::task_name(pong_id).is_some() && guard < 10_000 {
+    while !PONG_EXITED.load(Ordering::Acquire) && guard < 10_000 {
         crate::sched::yield_now();
         guard += 1;
     }

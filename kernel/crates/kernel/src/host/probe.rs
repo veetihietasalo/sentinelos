@@ -16,15 +16,21 @@
 //! component's **own code** perform a bus operation through its own
 //! `bus::Ctx`, with whatever index the proof hands it — including indices it
 //! does not hold. The kernel drives; the component acts as itself; the kernel
-//! judges. Every envelope a probe's handler is handed is recorded in
-//! [`seen`] so the proof can check `from` as the recipient saw it.
+//! judges. Every envelope a probe's handler is handed goes to the proof's
+//! recorder, `super::seen`, so the proof can check `from` as the recipient
+//! saw it.
+//!
+//! This is a **component module**: of the kernel's bus it names only `Ctx`,
+//! `BusError` and `Delegation`, never the host or the capability tables —
+//! `cargo xtask check-component-imports` enforces it (threat T-NAT-1). Its
+//! one other kernel call is that recorder.
 
-use super::codec::{Envelope, Kind, Sender, MAX_PAYLOAD};
+use super::codec::{Envelope, Kind, MAX_PAYLOAD};
 use super::native::{id_literal, ExportError, NativeComponent, NativeExport, NativeRuntime};
-use super::{ComponentId, InstanceId, Manifest};
+use super::seen::record;
+use super::{ComponentId, Manifest};
 use crate::bus::{BusError, Ctx, Delegation};
 use crate::cap::{Attenuation, CapIndex, CapNeed, CapRequest, Op, OpSet, PolicyRule, Tick};
-use hal::sync::SpinMutex;
 
 /// alice's descriptor — her `code` bytes for hashing.
 pub const ALICE_DESCRIPTOR: &[u8] =
@@ -359,94 +365,7 @@ fn act(ctx: &Ctx<'_, NativeRuntime>, args: &[u8], reply: &mut [u8]) -> Result<us
     }
 }
 
-// ── What the probes saw ─────────────────────────────────────────────────────
-
-/// One envelope a probe's handler was handed — exactly what the recipient
-/// observed, `from` included.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Seen {
-    /// The recipient.
-    pub at: InstanceId,
-    /// The kernel-stamped sender, as delivered.
-    pub from: Sender,
-    /// The kind (with its tag or granted index).
-    pub kind: Kind,
-    /// The sender's index that authorised it, as delivered.
-    pub cap: CapIndex,
-    /// Payload length.
-    pub len: u16,
-    /// bob's answer to a request: `Some(true)` answered, `Some(false)` his
-    /// answer was refused, `None` not answered (or not a request).
-    pub answered: Option<bool>,
-}
-
-/// Envelopes the log keeps; later ones are only counted.
-pub const SEEN_LEN: usize = 32;
-
-struct SeenLog {
-    buf: [Option<Seen>; SEEN_LEN],
-    len: usize,
-    overflow: u64,
-}
-
-/// A leaf lock (nothing is acquired while it is held), taken with interrupts
-/// masked, never while the host lock is held.
-static SEEN: SpinMutex<SeenLog> = SpinMutex::new(SeenLog {
-    buf: [None; SEEN_LEN],
-    len: 0,
-    overflow: 0,
-});
-
-fn record(at: InstanceId, env: &Envelope, answered: Option<bool>) {
-    let s = Seen {
-        at,
-        from: env.from,
-        kind: env.kind,
-        cap: env.cap,
-        len: env.payload.len() as u16,
-        answered,
-    };
-    crate::bus::irq_masked(|| {
-        let mut log = SEEN.lock();
-        if log.len < SEEN_LEN {
-            let i = log.len;
-            log.buf[i] = Some(s);
-            log.len += 1;
-        } else {
-            log.overflow = log.overflow.saturating_add(1);
-        }
-    });
-}
-
-/// Forget everything seen so far.
-pub fn seen_reset() {
-    crate::bus::irq_masked(|| {
-        let mut log = SEEN.lock();
-        log.len = 0;
-        log.overflow = 0;
-    });
-}
-
-/// The newest envelope `at` was handed, if any is still recorded.
-pub fn seen_last_for(at: InstanceId) -> Option<Seen> {
-    crate::bus::irq_masked(|| {
-        let log = SEEN.lock();
-        log.buf[..log.len]
-            .iter()
-            .rev()
-            .flatten()
-            .find(|s| s.at == at)
-            .copied()
-    })
-}
-
-/// Envelopes handed to any probe since the last reset (recorded + overflow).
-pub fn seen_total() -> u64 {
-    crate::bus::irq_masked(|| {
-        let log = SEEN.lock();
-        log.len as u64 + log.overflow
-    })
-}
+// ── The handlers ─────────────────────────────────────────────────────────────
 
 fn observe(ctx: &Ctx<'_, NativeRuntime>, env: &Envelope) {
     record(ctx.me(), env, None);

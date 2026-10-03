@@ -71,9 +71,10 @@ jobs:
       # codec, inbox ring, native runtime, the host itself), and since PR-2
       # `cap::` (capability tables, lattice, denial log) and `bus::` (attested
       # send/request/reply/delegate/revoke on local host cells) are small pure
-      # `no_std` suites — 65 tests, ~66 s of test run under Miri locally (the
-      # cap property test drops to 200 steps under `cfg(miri)`). Same scoping
-      # rule as above.
+      # `no_std` suites — 74 tests, ~72 s of test run under Miri locally (the
+      # cap property test drops to 200 steps under `cfg(miri)`, and the
+      # production-size 256-deep revocation chain — 19 s under Miri, safe code
+      # only — runs natively only). Same scoping rule as above.
       - name: "cargo +nightly miri test -p kernel hash:: host:: cap:: bus::"
         working-directory: kernel
         env:

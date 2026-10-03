@@ -41,6 +41,7 @@ pub mod codec;
 pub mod inbox;
 pub mod native;
 pub mod probe;
+pub mod seen;
 
 use crate::cap::deny::{Action, DenyLog, DenyRecord, DenyTotals, DENY_LOG_LEN};
 use crate::cap::table::{CapSpace, MAX_CAPS};
@@ -139,10 +140,10 @@ pub fn frame_into(code: &[u8], params: &[u8], sink: &mut impl FrameSink) {
 /// host checks the claim; it never trusts it. The requests bound nothing by
 /// themselves — the policy does (`grant = request ∧ policy`).
 ///
-/// The capability requests are not part of the id (threat T-MAN-1: today
+/// The capability requests are not part of the id yet (threat T-MAN-1: today
 /// every manifest is compiled into the image and only the kernel
-/// instantiates; they must be bound into the content address before any
-/// manifest is loaded from outside it).
+/// instantiates). Decided as component amendment A12, landing in PR-2b before
+/// PR-3: the v2 framing binds them into the id, and they name services.
 #[derive(Clone, Copy, Debug)]
 pub struct Manifest {
     /// The component's code (for a native component, its descriptor).
@@ -213,8 +214,10 @@ impl InstantiateError {
 pub enum CallError {
     /// No live instance by that id.
     NoSuchInstance,
-    /// The target's inbox ring is full; the request was not enqueued.
-    InboxFull,
+    /// The instance is already running a message handler or an export (on
+    /// another core); nothing ran. One instance's code never runs twice at
+    /// once.
+    Busy,
     /// The request payload exceeds `codec::MAX_PAYLOAD`.
     PayloadTooLong,
     /// The component has no export by that name.
@@ -234,7 +237,7 @@ impl CallError {
     pub fn label(self) -> &'static str {
         match self {
             CallError::NoSuchInstance => "no-such-instance",
-            CallError::InboxFull => "inbox-full",
+            CallError::Busy => "busy",
             CallError::PayloadTooLong => "payload-too-long",
             CallError::NoSuchExport => "no-such-export",
             CallError::Export(e) => e.label(),
@@ -307,6 +310,11 @@ pub(crate) struct Instance {
     pub(crate) next_kernel_tag: u32,
     /// The index granted for each manifest request, in manifest order.
     pub(crate) grants: [Option<CapIndex>; MAX_MANIFEST_CAPS],
+    /// Its code is running now (a delivered envelope's handler or a kernel
+    /// call into an export), on some core. Set and cleared under the host
+    /// lock by `crate::bus`; while set, neither `dispatch` nor `call` starts
+    /// its code again, so a handler never runs concurrently with itself.
+    pub(crate) running: bool,
 }
 
 /// The host: a runtime, a fixed table of instances, their capability tables,
@@ -453,8 +461,10 @@ impl<R: ComponentRuntime> Host<R> {
     }
 
     /// Verify, then instantiate — [`Self::instantiate_verified`] after
-    /// [`Manifest::verify`]. (The kernel-wide path, `crate::bus::instantiate`,
-    /// hashes before taking the host lock.)
+    /// [`Manifest::verify`]. Tests only: it hashes inside whatever lock the
+    /// caller holds, which must never be the kernel-wide host's (the kernel
+    /// path, `crate::bus::instantiate`, hashes before taking the lock).
+    #[cfg(test)]
     pub fn instantiate(
         &mut self,
         manifest: &Manifest,
@@ -467,13 +477,16 @@ impl<R: ComponentRuntime> Host<R> {
     /// Instantiate a verified manifest and grant its capabilities.
     ///
     /// Order matters, and nothing changes until every check has passed:
-    /// 1. every capability request is resolved against the live instances and
-    ///    the policy; a `Required` one that cannot be granted refuses here
-    ///    (logged, amendment A8);
-    /// 2. an instance slot and the runtime are claimed;
-    /// 3. the grants are installed (`request ∧ policy`) in the instance's own
+    /// 1. a free instance slot is found (not yet claimed);
+    /// 2. every capability request is resolved against the live instances,
+    ///    the policy **and the room in that slot's table** — retired slots
+    ///    never come back (threat T-CAP-2) — in manifest order; a `Required`
+    ///    one that cannot be granted refuses here (logged, amendment A8);
+    /// 3. the slot and the runtime are claimed;
+    /// 4. the grants are installed (`request ∧ policy`) in the instance's own
     ///    table and their indices recorded in manifest order; refused
-    ///    `Optional` requests are logged against the new instance.
+    ///    `Optional` requests are logged against the new instance, with the
+    ///    reason (`TableFull` when there was no room).
     pub fn instantiate_verified(
         &mut self,
         verified: Verified<'_>,
@@ -483,31 +496,44 @@ impl<R: ComponentRuntime> Host<R> {
         if m.caps.len() > MAX_MANIFEST_CAPS {
             return Err(InstantiateError::TooManyCaps);
         }
+        let slot = self
+            .instances
+            .iter()
+            .position(Option::is_none)
+            .ok_or(InstantiateError::TooManyInstances)?;
+        // Refusals before the instance exists are the kernel's, under the
+        // component's name.
+        let unborn = Sender {
+            instance: InstanceId::KERNEL,
+            component: m.id,
+        };
+        let mut room = self.caps.usable_slots(slot);
         let mut plan: [Result<(Capability, Capability), DenyReason>; MAX_MANIFEST_CAPS] =
             [Err(DenyReason::NotHeld); MAX_MANIFEST_CAPS];
         for (i, req) in m.caps.iter().enumerate() {
-            plan[i] = self.plan_grant(&m.id, req, now);
-            if plan[i].is_err() && req.need == CapNeed::Required {
+            let mut planned = self.plan_grant(&m.id, req, now);
+            if planned.is_ok() {
+                // Grants install in manifest order, one usable slot each.
+                if room == 0 {
+                    planned = Err(DenyReason::TableFull);
+                } else {
+                    room -= 1;
+                }
+            }
+            if planned.is_err() && req.need == CapNeed::Required {
                 self.deny.record(
                     now,
                     UNBOUND_BUCKET,
-                    Sender {
-                        instance: InstanceId::KERNEL,
-                        component: m.id,
-                    },
+                    unborn,
                     CapIndex::KERNEL,
                     Action::Grant,
                     DenyReason::MissingRequired,
                 );
                 return Err(InstantiateError::MissingRequiredCap);
             }
+            plan[i] = planned;
         }
 
-        let slot = self
-            .instances
-            .iter()
-            .position(Option::is_none)
-            .ok_or(InstantiateError::TooManyInstances)?;
         let handle = self.runtime.instantiate(m.code, m.params)?;
         let id = InstanceId(self.next_instance);
         self.next_instance += 1;
@@ -528,7 +554,9 @@ impl<R: ComponentRuntime> Host<R> {
                         .grant(slot, &requested, &bound)
                         .map_err(|e| match e {
                             crate::cap::CapError::Deny(r) => r,
-                            _ => DenyReason::Malformed,
+                            crate::cap::CapError::TableFull | crate::cap::CapError::NoSuchTable => {
+                                DenyReason::TableFull
+                            }
                         })
                 }
                 Err(r) => Err(r),
@@ -537,10 +565,20 @@ impl<R: ComponentRuntime> Host<R> {
                 Ok(idx) => grants[i] = Some(idx),
                 Err(reason) => {
                     if req.need == CapNeed::Required {
-                        // Unreachable (planned above against an empty
-                        // table), but never run degraded: undo everything.
+                        // Unreachable: every required grant was planned
+                        // above against this table's usable slots (retired
+                        // ones excluded). Never run degraded regardless:
+                        // undo everything, and log it as a refused start.
                         self.caps.clear_table(slot);
                         self.runtime.release(handle);
+                        self.deny.record(
+                            now,
+                            UNBOUND_BUCKET,
+                            unborn,
+                            CapIndex::KERNEL,
+                            Action::Grant,
+                            DenyReason::MissingRequired,
+                        );
                         return Err(InstantiateError::MissingRequiredCap);
                     }
                     // Instantiation is the kernel's act: rate-limited in the
@@ -566,6 +604,7 @@ impl<R: ComponentRuntime> Host<R> {
             next_reply_tag: 1,
             next_kernel_tag: 1,
             grants,
+            running: false,
         });
         Ok(id)
     }
@@ -870,7 +909,7 @@ mod tests {
             InstantiateError::MissingRequiredCap.label(),
             "missing-required-cap"
         );
-        assert_eq!(CallError::InboxFull.label(), "inbox-full");
+        assert_eq!(CallError::Busy.label(), "busy");
         assert_eq!(CallError::Wire(DecodeError::Short).label(), "short");
     }
 }

@@ -5,18 +5,20 @@
 //!
 //! # The kernel-wide host
 //!
-//! [`HOST`] is the one `Host` the kernel runs components on (spec §13: the
+//! `HOST` is the one `Host` the kernel runs components on (spec §13: the
 //! PR-1 host becomes kernel-wide in PR-2). Every instance's inbox arena, every
 //! capability table and the denial log are part of that fixed value, sized at
 //! build time: **nothing on the bus allocates, ever** (threat T-DOS-4).
 //!
 //! # Component code acts only as itself: [`Ctx`]
 //!
-//! Component code runs in exactly two places, both here: [`dispatch`] (one
-//! delivered envelope → the instance's message handler) and [`call`] (a
+//! Component code runs in exactly two places, both here: `dispatch` (one
+//! delivered envelope → the instance's message handler) and `call` (a
 //! kernel-originated call into one of its exports). Each hands the code a
 //! [`Ctx`] minted for **that** instance; `Ctx` cannot be constructed anywhere
-//! else, and none of its operations takes a sender or a target:
+//! else, and none of its operations takes a sender or a target. Everything
+//! else here is `pub(crate)`, and `cargo xtask check-component-imports` keeps
+//! component modules from naming it (threat T-NAT-1):
 //!
 //! - [`Ctx::send`] = spec §7's `bus::send(cap, payload)`. The host looks `cap`
 //!   up in the *sender's own* table, checks `Send` and the attenuation,
@@ -40,7 +42,7 @@
 //!
 //! # Locking — one leaf lock
 //!
-//! `HOST` is the only bus lock. It is taken by [`locked`] with interrupts
+//! `HOST` is the only bus lock. It is taken by `locked` with interrupts
 //! **masked** on the local core, held only for bounded, allocation-free table
 //! and ring operations, **never across a context switch**, never around an
 //! allocation or a console write, and **nothing else is acquired while it is
@@ -49,12 +51,20 @@
 //! Component code always runs with no host lock held — dispatch copies the
 //! envelope out, drops the lock, then runs the handler; a handler that sends
 //! takes the lock again briefly. Check, target resolution, reply-capability
-//! mint and enqueue happen in one critical section (no check-then-use race).
+//! mint and enqueue happen in one critical section (no check-then-use race),
+//! and the mono clock is read **inside** it: a tick read before waiting for the
+//! lock would be stale by the wait, and a stale tick fails open for expiry.
+//!
+//! One instance's code never runs twice at once: `dispatch` and `call` set
+//! the instance's `running` flag under the lock before running its code and
+//! clear it after; while it is set, both refuse with `CallError::Busy`. Two
+//! cores therefore never run the same handler concurrently (`dispatch` +
+//! `dispatch`, `call` + `dispatch`, or `call` + `call`).
 //!
 //! Against the kernel's lock/interrupt rule (`kernel/docs/hal-tcb.md` §5e:
 //! locks reachable from IRQ context are taken only with `IF = 0`; locks never
 //! taken from IRQ context may be held with `IF = 1` provided no same-core
-//! waiter spins): `HOST` — and the probe components' `SEEN` log, the only
+//! waiter spins): `HOST` — and the boot proof's `SEEN` recorder (`host::seen`), the only
 //! other lock this PR adds — are **never taken from IRQ context** (no
 //! interrupt handler touches the bus). They are held with `IF = 0` all the
 //! same, by choice: the holder can then never be preempted, so a same-core
@@ -64,7 +74,7 @@
 //! # Delivery model (spec §18.4, decided at PR-2)
 //!
 //! **Run-to-completion dispatch**, not one task per instance: an inbox is
-//! drained by whoever calls [`dispatch`] (the boot proof today), each envelope
+//! drained by whoever calls `dispatch` (the boot proof today), each envelope
 //! running the instance's handler to completion with no lock held. Instance =
 //! task would cost each instance a 16 KiB guard-paged stack, an `XsaveArea`
 //! and one of the scheduler's 64 task slots, and needs a block-on-inbox
@@ -95,7 +105,7 @@ pub const MAX_REPLY_TIMEOUT_TICKS: Tick = 1000;
 
 /// The kernel-wide host: the native runtime over [`native::REGISTRY`],
 /// granting under [`native::BOOT_POLICY`]. See the module docs for its lock.
-pub static HOST: SpinMutex<Host<NativeRuntime>> = SpinMutex::new(Host::new(
+pub(crate) static HOST: SpinMutex<Host<NativeRuntime>> = SpinMutex::new(Host::new(
     NativeRuntime::new(native::REGISTRY),
     native::BOOT_POLICY,
 ));
@@ -117,15 +127,15 @@ pub(crate) fn irq_masked<T>(f: impl FnOnce() -> T) -> T {
 /// Run `f` on the host in `cell` under its lock, interrupts masked. The guard
 /// is dropped before interrupts are restored. Never call component code, the
 /// scheduler, the console or the allocator from `f`.
-pub fn locked<R: ComponentRuntime, T>(
+pub(crate) fn locked<R: ComponentRuntime, T>(
     cell: &SpinMutex<Host<R>>,
     f: impl FnOnce(&mut Host<R>) -> T,
 ) -> T {
     irq_masked(|| f(&mut cell.lock()))
 }
 
-/// [`locked`] on the kernel-wide [`HOST`].
-pub fn with_host<T>(f: impl FnOnce(&mut Host<NativeRuntime>) -> T) -> T {
+/// `locked` on the kernel-wide `HOST`.
+pub(crate) fn with_host<T>(f: impl FnOnce(&mut Host<NativeRuntime>) -> T) -> T {
     locked(&HOST, f)
 }
 
@@ -162,13 +172,15 @@ pub struct Delegation {
     /// Attenuation, `⊑` the parent's.
     pub attenuation: Attenuation,
     /// Lifetime in ticks from now; `None` inherits the parent's expiry.
+    /// `Some(0)` would be dead on arrival and is refused (`Malformed`).
     pub ttl: Option<Tick>,
 }
 
 /// A running instance's handle on the kernel: the only way component code
 /// reaches the bus, and it acts as that instance and nothing else. Minted by
-/// [`dispatch`] and [`call`] for the instance they run; it cannot be built
-/// outside this module and carries no target.
+/// `dispatch` and `call` for the instance they run; it cannot be built
+/// outside this module and carries no target. Every operation reads the mono
+/// clock inside the host lock (module docs).
 pub struct Ctx<'h, R: ComponentRuntime> {
     cell: &'h SpinMutex<Host<R>>,
     me: InstanceId,
@@ -182,8 +194,7 @@ impl<'h, R: ComponentRuntime> Ctx<'h, R> {
 
     /// Post an `Event` over capability `cap` (spec §7 `bus::send(cap, payload)`).
     pub fn send(&self, cap: CapIndex, payload: &[u8]) -> Result<(), BusError> {
-        let now = now();
-        locked(self.cell, |h| h.send_from(self.me, cap, payload, now))
+        locked(self.cell, |h| h.send_from(self.me, cap, payload, now()))
     }
 
     /// Post a `Request` over `cap`; the answer, if any, arrives in this
@@ -191,36 +202,31 @@ impl<'h, R: ComponentRuntime> Ctx<'h, R> {
     /// responder's right to answer expires after `timeout` ticks (clamped to
     /// `1..=MAX_REPLY_TIMEOUT_TICKS`).
     pub fn request(&self, cap: CapIndex, payload: &[u8], timeout: Tick) -> Result<u32, BusError> {
-        let now = now();
         locked(self.cell, |h| {
-            h.request_from(self.me, cap, payload, timeout, now)
+            h.request_from(self.me, cap, payload, timeout, now())
         })
     }
 
     /// Answer the request whose `reply_tag` was `reply` — once.
     pub fn reply(&self, reply: CapIndex, payload: &[u8]) -> Result<(), BusError> {
-        let now = now();
-        locked(self.cell, |h| h.reply_from(self.me, reply, payload, now))
+        locked(self.cell, |h| h.reply_from(self.me, reply, payload, now()))
     }
 
     /// Give the instance `via` reaches an attenuated copy of `cap`.
     pub fn delegate(&self, cap: CapIndex, via: CapIndex, d: &Delegation) -> Result<(), BusError> {
-        let now = now();
-        locked(self.cell, |h| h.delegate_from(self.me, cap, via, d, now))
+        locked(self.cell, |h| h.delegate_from(self.me, cap, via, d, now()))
     }
 
     /// Revoke everything delegated from `cap`, at any depth; keep `cap`.
     /// Returns how many capabilities were freed.
     pub fn revoke(&self, cap: CapIndex) -> Result<usize, BusError> {
-        let now = now();
-        locked(self.cell, |h| h.revoke_from(self.me, cap, now))
+        locked(self.cell, |h| h.revoke_from(self.me, cap, now()))
     }
 
     /// Drop `cap` and everything delegated from it (for a reply capability:
     /// decline to answer).
     pub fn release(&self, cap: CapIndex) -> Result<(), BusError> {
-        let now = now();
-        locked(self.cell, |h| h.release_from(self.me, cap, now))
+        locked(self.cell, |h| h.release_from(self.me, cap, now()))
     }
 
     /// The index granted for this instance's manifest request `i`, if any.
@@ -399,8 +405,12 @@ impl<R: ComponentRuntime> Host<R> {
             ));
         };
         // Authorised. Now capacity — room for the envelope and the reply
-        // right, checked before anything changes.
-        if !self.caps.has_room(t) {
+        // right, checked before anything changes. Expired capabilities still
+        // occupy their slots, and expired reply rights still count against
+        // MAX_PENDING_REPLIES, until reclaimed: reclaim the responder's
+        // whenever either limit is reached, or requests a responder left
+        // unanswered (silence is denial) would lock it out for good.
+        if !self.caps.has_room(t) || self.caps.pending_replies(t) >= MAX_PENDING_REPLIES {
             self.caps.reap_expired_in(t, now);
         }
         if self.inbox_full(t)
@@ -446,9 +456,14 @@ impl<R: ComponentRuntime> Host<R> {
         let c = match self.caps.check(actor.0, reply, &access, now) {
             Ok(c) => c,
             Err(reason) => {
-                if reason == DenyReason::Expired {
-                    // The requester's timeout passed: the right is dead for
-                    // good; reclaim its slot now.
+                // The requester's timeout passed: a reply right is dead for
+                // good, so reclaim its slot now. Only a reply right — any
+                // other capability presented here is refused and left alone.
+                let reply_right = self
+                    .caps
+                    .get(actor.0, reply)
+                    .is_ok_and(|e| matches!(e.cap.target, Target::Reply { .. }));
+                if reason == DenyReason::Expired && reply_right {
                     let _ = self.caps.release(actor.0, reply);
                 }
                 return Err(self.refuse(now, actor.0, actor.1, reply, Action::Reply, reason));
@@ -526,11 +541,19 @@ impl<R: ComponentRuntime> Host<R> {
         };
         let expires = match d.ttl {
             None => parent.expires,
+            // Dead on arrival: refuse it rather than install it and notify.
+            Some(0) => {
+                return Err(self.refuse(
+                    now,
+                    actor.0,
+                    actor.1,
+                    cap,
+                    Action::Delegate,
+                    DenyReason::Malformed,
+                ));
+            }
             Some(t) => Some(now.saturating_add(t)),
         };
-        if !self.caps.has_room(r) {
-            self.caps.reap_expired_in(r, now);
-        }
         // The child is over the parent's target; anything else would fail `⊑`.
         let child = Capability {
             target: parent.target,
@@ -538,14 +561,42 @@ impl<R: ComponentRuntime> Host<R> {
             attenuation: d.attenuation,
             expires,
         };
-        // Authority first (inside `delegate`: live, `Delegate`, well formed,
-        // `⊑`), then capacity; a full inbox rolls the install back.
-        let granted = match self.caps.delegate(actor.0, cap, r, &child, now) {
+        // Authority first — everything `delegate` checks (live, `Delegate`,
+        // well formed, `⊑`), changing nothing. Then capacity, still changing
+        // nothing: the notice must fit the recipient's inbox, so a `Busy`
+        // never spends a generation of the recipient's table. Only then
+        // install; an authorised delegation that finds the recipient's table
+        // full reclaims that table's expired capabilities and is tried once
+        // more. A refused call changes nothing.
+        let deny = |e: CapError| match e {
+            CapError::Deny(reason) => Some(reason),
+            CapError::TableFull | CapError::NoSuchTable => None,
+        };
+        if let Err(e) = self.caps.check_delegate(actor.0, cap, r, &child, now) {
+            return Err(match deny(e) {
+                Some(reason) => self.refuse(now, actor.0, actor.1, cap, Action::Delegate, reason),
+                None => BusError::Busy,
+            });
+        }
+        if self.inbox_full(r) {
+            return Err(BusError::Busy);
+        }
+        let mut attempt = self.caps.delegate(actor.0, cap, r, &child, now);
+        if matches!(attempt, Err(CapError::TableFull)) {
+            self.caps.reap_expired_in(r, now);
+            attempt = self.caps.delegate(actor.0, cap, r, &child, now);
+        }
+        let granted = match attempt {
             Ok(i) => i,
-            Err(CapError::Deny(reason)) => {
-                return Err(self.refuse(now, actor.0, actor.1, cap, Action::Delegate, reason));
+            Err(e) => {
+                return Err(match deny(e) {
+                    // Unreachable: checked above, under this same lock.
+                    Some(reason) => {
+                        self.refuse(now, actor.0, actor.1, cap, Action::Delegate, reason)
+                    }
+                    None => BusError::Busy,
+                });
             }
-            Err(CapError::TableFull | CapError::NoSuchTable) => return Err(BusError::Busy),
         };
         let notice = Envelope {
             from: actor.1,
@@ -555,6 +606,7 @@ impl<R: ComponentRuntime> Host<R> {
             payload: Payload::EMPTY,
         };
         if let Err(e) = self.enqueue(r, &notice) {
+            // Unreachable: room was checked above, under this same lock.
             let _ = self.caps.release(r, granted);
             return Err(e);
         }
@@ -596,7 +648,9 @@ impl<R: ComponentRuntime> Host<R> {
     }
 
     /// Take the oldest envelope from `inst`'s inbox, with the runtime entry
-    /// to deliver it to. `Ok(None)` when the inbox is empty.
+    /// to deliver it to, and mark the instance running (cleared by
+    /// [`Self::finish_run`]). `Ok(None)` when the inbox is empty;
+    /// `Err(CallError::Busy)`, taking nothing, while its code already runs.
     pub(crate) fn pop_for_dispatch(
         &mut self,
         inst: InstanceId,
@@ -605,6 +659,9 @@ impl<R: ComponentRuntime> Host<R> {
         let i = self.instances[slot]
             .as_mut()
             .ok_or(CallError::NoSuchInstance)?;
+        if i.running {
+            return Err(CallError::Busy);
+        }
         let handle = i.handle;
         let Some(wire) = i.inbox.pop() else {
             return Ok(None);
@@ -614,11 +671,26 @@ impl<R: ComponentRuntime> Host<R> {
             .runtime
             .entry(handle)
             .ok_or(CallError::NoSuchInstance)?;
+        i.running = true;
         Ok(Some((entry, env)))
     }
 
+    /// The code `inst` was running (a handler or an export) has returned. A
+    /// no-op if the instance has gone meanwhile; its id is never reused.
+    pub(crate) fn finish_run(&mut self, inst: InstanceId) {
+        if let Some(i) = self
+            .slot_of(inst)
+            .and_then(|s| self.instances.get_mut(s))
+            .and_then(Option::as_mut)
+        {
+            i.running = false;
+        }
+    }
+
     /// Resolve a kernel call into `inst`: its runtime entry, its component,
-    /// and a fresh kernel tag.
+    /// and a fresh kernel tag; mark the instance running (cleared by
+    /// [`Self::finish_run`]). `Err(CallError::Busy)` while its code already
+    /// runs.
     pub(crate) fn prepare_kernel_call(
         &mut self,
         inst: InstanceId,
@@ -627,6 +699,9 @@ impl<R: ComponentRuntime> Host<R> {
         let i = self.instances[slot]
             .as_mut()
             .ok_or(CallError::NoSuchInstance)?;
+        if i.running {
+            return Err(CallError::Busy);
+        }
         let tag = i.next_kernel_tag;
         i.next_kernel_tag = tag.wrapping_add(1);
         let (handle, component) = (i.handle, i.component);
@@ -634,6 +709,7 @@ impl<R: ComponentRuntime> Host<R> {
             .runtime
             .entry(handle)
             .ok_or(CallError::NoSuchInstance)?;
+        i.running = true;
         Ok((entry, component, tag))
     }
 }
@@ -642,17 +718,16 @@ impl<R: ComponentRuntime> Host<R> {
 
 /// Verify `manifest` (hash, **no lock held**), then instantiate it on the host
 /// in `cell` and grant its capabilities.
-pub fn instantiate<R: ComponentRuntime>(
+pub(crate) fn instantiate<R: ComponentRuntime>(
     cell: &SpinMutex<Host<R>>,
     manifest: &Manifest,
 ) -> Result<InstanceId, InstantiateError> {
     let verified = manifest.verify()?;
-    let now = now();
-    locked(cell, |h| h.instantiate_verified(verified, now))
+    locked(cell, |h| h.instantiate_verified(verified, now()))
 }
 
 /// End instance `inst` on the host in `cell` (see `Host::terminate`).
-pub fn terminate<R: ComponentRuntime>(
+pub(crate) fn terminate<R: ComponentRuntime>(
     cell: &SpinMutex<Host<R>>,
     inst: InstanceId,
 ) -> Result<usize, CallError> {
@@ -661,19 +736,26 @@ pub fn terminate<R: ComponentRuntime>(
 
 /// Deliver up to `max` envelopes from `inst`'s inbox, oldest first, each to
 /// the instance's message handler, run to completion **with no lock held**.
-/// Returns how many were delivered.
-pub fn dispatch<R: ComponentRuntime>(
+/// Returns how many were delivered. `Err(CallError::Busy)` if the instance's
+/// code is already running elsewhere before anything was delivered; after
+/// that, the count so far.
+pub(crate) fn dispatch<R: ComponentRuntime>(
     cell: &SpinMutex<Host<R>>,
     inst: InstanceId,
     max: usize,
 ) -> Result<usize, CallError> {
     let mut delivered = 0;
     while delivered < max {
-        let Some((entry, env)) = locked(cell, |h| h.pop_for_dispatch(inst))? else {
-            break;
+        let (entry, env) = match locked(cell, |h| h.pop_for_dispatch(inst)) {
+            Ok(Some(next)) => next,
+            Ok(None) => break,
+            Err(CallError::Busy) if delivered > 0 => break,
+            Err(e) => return Err(e),
         };
         let ctx = Ctx { cell, me: inst };
-        R::deliver(entry, &ctx, &env)?;
+        let ran = R::deliver(entry, &ctx, &env);
+        locked(cell, |h| h.finish_run(inst));
+        ran?;
         delivered += 1;
     }
     Ok(delivered)
@@ -689,7 +771,7 @@ pub fn dispatch<R: ComponentRuntime>(
 /// through the envelope codec (what the component is handed), the export runs
 /// with **no lock held** and a [`Ctx`] for `inst`, and the reply is stamped
 /// `from = {inst, its component}` and round-tripped through the codec again.
-pub fn call_envelope<R: ComponentRuntime>(
+pub(crate) fn call_envelope<R: ComponentRuntime>(
     cell: &SpinMutex<Host<R>>,
     inst: InstanceId,
     export: &str,
@@ -697,6 +779,20 @@ pub fn call_envelope<R: ComponentRuntime>(
 ) -> Result<Envelope, CallError> {
     let payload = Payload::new(args).map_err(|_| CallError::PayloadTooLong)?;
     let (entry, component, tag) = locked(cell, |h| h.prepare_kernel_call(inst))?;
+    let out = run_export(cell, inst, (entry, component, tag), export, payload);
+    locked(cell, |h| h.finish_run(inst));
+    out
+}
+
+/// The body of [`call_envelope`] once the instance is marked running: build,
+/// round-trip and run the request, then stamp and round-trip the reply.
+fn run_export<R: ComponentRuntime>(
+    cell: &SpinMutex<Host<R>>,
+    inst: InstanceId,
+    (entry, component, tag): (R::Entry, ComponentId, u32),
+    export: &str,
+    payload: Payload,
+) -> Result<Envelope, CallError> {
     let request = Envelope {
         from: Sender::KERNEL,
         to: inst,
@@ -737,8 +833,8 @@ pub fn call_envelope<R: ComponentRuntime>(
     Ok(back)
 }
 
-/// [`call_envelope`], copying the reply payload into `reply_out`.
-pub fn call<R: ComponentRuntime>(
+/// `call_envelope`, copying the reply payload into `reply_out`.
+pub(crate) fn call<R: ComponentRuntime>(
     cell: &SpinMutex<Host<R>>,
     inst: InstanceId,
     export: &str,

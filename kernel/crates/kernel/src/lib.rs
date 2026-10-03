@@ -259,9 +259,12 @@ pub fn kmain() -> ! {
     // denied by default, and forged indices (never issued, another instance's,
     // revoked, expired) are refused and logged, rate-limited. Expiry and reply
     // timeouts tick off `clock::mono_ticks`, so this runs after `prove_mono`.
-    // Its §18.4 measurement runs one short BSP task and waits (bounded) for
-    // this thread's own yields to reap it, so it must stay ahead of any proof
-    // that leaves an always-runnable task on the BSP (SentinelFS's mount proof).
+    // Keep it ahead of SentinelFS's `sfs::prove_mount`, for two reasons. Its
+    // §18.4 measurement round-trips kmain against one short BSP task, which
+    // an always-runnable BSP task (`sfs-commit`) would dilute. And spawning
+    // that task allocates with kmain at IF = 0, which is allowed only while
+    // no other BSP task can be suspended inside the allocator — true before
+    // `sfs-commit` exists, not after (hal-tcb §5e as amended by FS-1a).
     bus::proof::prove_caps();
 
     hal::println!("┌─────────────────────────────────────┐");
