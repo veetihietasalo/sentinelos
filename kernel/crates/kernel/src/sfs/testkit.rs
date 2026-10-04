@@ -218,3 +218,10 @@ pub fn apply(fs: &mut Fs, model: &mut Model, op: &Op) {
         }
     }
 }
+
+/// Every allocation of the kernel's host test binary goes through the
+/// counting allocator (`test-alloc`, outside this crate's `forbid`): the
+/// heap-cap test reads its per-thread peak. Counting is per thread, so
+/// parallel tests never disturb one another.
+#[global_allocator]
+static COUNTING: test_alloc::Counting = test_alloc::Counting;

@@ -1,0 +1,12 @@
+[package]
+name = "test-alloc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Host-only counting global allocator for SentinelFS heap-cap tests (not a kernel crate)."
+
+# A dev-dependency of `kernel` only. It holds the one `unsafe impl GlobalAlloc`
+# the heap-cap test needs, outside the kernel crate's `forbid(unsafe_code)`
+# boundary (SentinelFS spec A23/A31). On the bare-metal target it is an empty
+# library, so it can stay a workspace member without being built for real use.
+[dependencies]

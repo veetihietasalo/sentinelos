@@ -10,6 +10,12 @@ edition = "2021"
 hal = { path = "../hal" }
 ui = { path = "../ui" }
 
+# Host tests only: the counting global allocator behind the SentinelFS heap-cap
+# test (spec A23/A31). Its one `unsafe impl GlobalAlloc` stays outside this
+# crate's `forbid(unsafe_code)`; it never reaches the kernel image.
+[dev-dependencies]
+test-alloc = { path = "../test-alloc" }
+
 # `cfg(kani)` gates the in-tree proof harnesses (e.g. `ml`'s tier-selection
 # proof). Declare it so `-D warnings` does not flag the cfg as unexpected on a
 # normal (non-Kani) build, matching the `hal` crate's configuration.
