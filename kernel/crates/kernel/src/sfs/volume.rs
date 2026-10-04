@@ -827,6 +827,14 @@ impl Volume {
         self.tree.root()
     }
 
+    /// Refuse every further change (a scrub found damage, §12: evidence is
+    /// preserved, the mount stays readable). Not undone until remount.
+    pub fn mark_read_only(&mut self) {
+        if self.state == State::Ready {
+            self.state = State::ReadOnly;
+        }
+    }
+
     fn fail(&mut self, e: CommitError) -> CommitError {
         self.state = State::ReadOnly;
         e

@@ -27,6 +27,7 @@
 #![deny(missing_docs)]
 
 pub mod key;
+pub mod proof;
 pub mod scrub;
 pub mod service;
 pub mod superblock;
