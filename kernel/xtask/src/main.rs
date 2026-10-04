@@ -1845,12 +1845,19 @@ fn boot_test(kvm: bool) -> ExitCode {
         let boot = i + 1;
         println!("=== boot {boot} of {} (serial log: {rel}) ===", BOOT_TEST_LOGS.len());
         let started = Instant::now();
-        let (log, found) = run_boot(kvm, &iso, &disk, &kr(rel));
+        // The QMP keystroke phase (~20 s under TCG) runs on boot 1 only.
+        let interactive = boot == 1;
+        let (log, found) = run_boot(kvm, &iso, &disk, &kr(rel), interactive);
         println!(
-            "boot {boot}: {} ms from QEMU launch to the end marker (200 ms polling)",
-            started.elapsed().as_millis()
+            "boot {boot}: {} ms from QEMU launch to {} (200 ms polling)",
+            started.elapsed().as_millis(),
+            if interactive {
+                "the end of the QMP keystroke phase"
+            } else {
+                "the end marker"
+            }
         );
-        if check_boot_log(kvm, &log, found) != ExitCode::SUCCESS {
+        if check_boot_log(kvm, &log, found, interactive) != ExitCode::SUCCESS {
             eprintln!(
                 "TEST FAILED on boot {boot} of {} (serial log: kernel/{rel}).",
                 BOOT_TEST_LOGS.len()
@@ -1875,7 +1882,13 @@ fn boot_test(kvm: bool) -> ExitCode {
 /// COM1 goes to `serial_log`, polled every 200 ms until [`END_MARKER`] appears
 /// or [`BOOT_TIMEOUT_SECS`] pass, then QEMU is killed. Returns the final log and
 /// whether the marker appeared.
-fn run_boot(kvm: bool, iso: &Path, disk: &Path, serial_log: &Path) -> (String, bool) {
+fn run_boot(
+    kvm: bool,
+    iso: &Path,
+    disk: &Path,
+    serial_log: &Path,
+    interactive: bool,
+) -> (String, bool) {
     let pcap = kr("target/net.pcap");
 
     // Remove stale log + pcap from a previous run.
@@ -1924,7 +1937,8 @@ fn run_boot(kvm: bool, iso: &Path, disk: &Path, serial_log: &Path) -> (String, b
     // SMP 3b-ii keystroke evidence: once the kernel is idle, unlock the lock
     // screen and type `about` over QMP; the kernel logs the first keystroke's
     // delivery path and the shell logs the command (asserted in check_boot_log).
-    if found {
+    // `interactive` is set for the first boot only.
+    if found && interactive {
         if let Err(e) = qmp_type_about(&qmp_sock, serial_log) {
             eprintln!("keystroke injection: {e}");
         }
@@ -2023,7 +2037,7 @@ fn qmp_type_about(sock: &Path, serial_log: &Path) -> Result<(), String> {
 
 /// Every per-boot assertion over one boot's serial `log` (`found`: whether the
 /// end marker appeared in time). [`boot_test`] runs it on both boots.
-fn check_boot_log(kvm: bool, log: &str, found: bool) -> ExitCode {
+fn check_boot_log(kvm: bool, log: &str, found: bool, interactive: bool) -> ExitCode {
     if !found {
         eprintln!(
             "TEST FAILED: end-marker '{}' not found within {} s.",
@@ -2283,11 +2297,18 @@ fn check_boot_log(kvm: bool, log: &str, found: bool) -> ExitCode {
     // SMP phase 3b-ii: device IRQs routed through the IOAPIC, the 8259 and
     // LINT0 masked (read back), the PIT live on GSI 2 — and keystrokes injected
     // over QMP after the end marker arrive through the IOAPIC and run `about`.
-    for (line, what) in [
-        (IOAPIC_LINE, "IOAPIC routing summary"),
-        (IOAPIC_KBD_LINE, "IOAPIC keyboard-delivery evidence (injected keystroke)"),
-        (SHELL_ABOUT_LINE, "shell `about` run from injected keystrokes"),
-    ] {
+    let keystroke_lines: &[(&str, &str)] = if interactive {
+        &[
+            (IOAPIC_KBD_LINE, "IOAPIC keyboard-delivery evidence (injected keystroke)"),
+            (SHELL_ABOUT_LINE, "shell `about` run from injected keystrokes"),
+        ]
+    } else {
+        &[]
+    };
+    for &(line, what) in [(IOAPIC_LINE, "IOAPIC routing summary")]
+        .iter()
+        .chain(keystroke_lines)
+    {
         if !log.lines().any(|l| l.trim_end() == line) {
             let near = log
                 .lines()
@@ -2297,7 +2318,13 @@ fn check_boot_log(kvm: bool, log: &str, found: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    println!("IOAPIC routing proven: '{IOAPIC_LINE}'; '{IOAPIC_KBD_LINE}'; '{SHELL_ABOUT_LINE}'");
+    if interactive {
+        println!(
+            "IOAPIC routing proven: '{IOAPIC_LINE}'; '{IOAPIC_KBD_LINE}'; '{SHELL_ABOUT_LINE}'"
+        );
+    } else {
+        println!("IOAPIC routing proven: '{IOAPIC_LINE}' (keystroke phase: boot 1 only)");
+    }
 
     // A vector int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is a
     // real SIMD kernel — proving the hand-written `asm!` kernels execute and compute
