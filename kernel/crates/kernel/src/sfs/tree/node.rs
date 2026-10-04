@@ -534,39 +534,44 @@ mod proofs {
     }
 
     /// Split: an overflowing node of up to 4 entries is cut into two
-    /// non-empty, sorted halves that fit the limit, keep every entry in order
-    /// (key-set preservation), and are separated by the right half's first key.
+    /// non-empty, sorted halves that fit the limit and do not underflow,
+    /// separated by the right half's first key.
     #[kani::proof]
     #[kani::unwind(6)]
-    fn node4_split_is_sorted_balanced_and_preserving() {
+    fn node4_split_is_sorted_and_balanced() {
         let n: usize = kani::any();
         kani::assume(n >= 2 && n <= 4);
         let mut a = any_node(n);
         kani::assume(a.overflows(LIMIT));
-        let orig = a.clone();
         let mut b = Node::new(W(0));
         let sep = a.split(&mut b);
         assert!(sep.is_ok());
         let sep = sep.unwrap_or(KEY_ZERO);
-        // Occupancy: both non-empty, both fit, neither underflows.
         assert!(!a.is_empty() && !b.is_empty());
         assert!(a.len() + b.len() == n);
         assert!(!a.overflows(LIMIT) && !b.overflows(LIMIT));
         assert!(!a.underflows(LIMIT) && !b.underflows(LIMIT));
-        // Sorted, separated.
         assert!(a.is_sorted() && b.is_sorted());
         assert!(b.key(0) == Some(sep));
-        for i in 0..a.len() {
-            assert!(a.key(i).is_some_and(|x| x < sep));
-        }
-        // Preservation: left ++ right == original, entry for entry.
-        for i in 0..n {
-            let got = if i < a.len() {
-                (a.key(i), a.val(i))
-            } else {
-                (b.key(i - a.len()), b.val(i - a.len()))
-            };
-            assert!(got == (orig.key(i), orig.val(i)));
+        assert!(a.key(a.len() - 1).is_some_and(|k| k < sep));
+    }
+
+    /// Split preserves the key set: appending the right half back onto the
+    /// left (append is proven order-preserving below) gives the original
+    /// node, entry for entry.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn node4_split_preserves_entries() {
+        let n: usize = kani::any();
+        kani::assume(n >= 2 && n <= 4);
+        let mut a = any_node(n);
+        let orig = a.clone();
+        let mut b = Node::new(W(0));
+        assert!(a.split(&mut b).is_ok());
+        assert!(a.append(&b).is_ok());
+        assert!(a.len() == n);
+        for i in 0..4 {
+            assert!(a.key(i) == orig.key(i) && a.val(i) == orig.val(i));
         }
     }
 
@@ -599,8 +604,9 @@ mod proofs {
     /// either merged into one node that fits, or re-cut into two non-empty,
     /// non-underflowing, fitting, sorted halves separated by the right one's
     /// first key — and no entry is lost or invented (counts; the entries
-    /// themselves by [`node4_append_preserves_entries_in_order`] and the
-    /// split harness, since rebalance is append-then-split).
+    /// themselves by [`node4_append_preserves_entries_in_order`] and
+    /// [`node4_split_preserves_entries`], since rebalance is
+    /// append-then-split).
     #[kani::proof]
     #[kani::unwind(6)]
     fn node4_merge_is_sorted_balanced_and_preserving() {
