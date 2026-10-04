@@ -41,7 +41,12 @@ sound, and its formal-verification status.
   §9): one `global_asm!` register switch, a fabricated first-run frame, and the
   eager per-task `xsave`/`xrstor` bracket around it, plus the guard-paged
   kernel-thread stacks it runs on (`mm::alloc_kernel_stack`, §5g), backing
-  `kernel::sched`'s cooperative round-robin scheduler
+  `kernel::sched`'s cooperative round-robin scheduler;
+  SMP phase 3b-ii — IOAPIC device-IRQ routing: the Limine RSDP and a bounded
+  copy-out reader of firmware tables (`hal::acpi`, §2l; parsing is in the safe
+  kernel), IOAPIC register access + redirection entries and the
+  delivery-path-exact device EOI (`hal::ioapic`, §2m), the LAPIC ISR read and
+  LINT0 mask (AP8/AP9), the 8259 mask-all (P6) and the i8042 re-arm drain (K6)
 - **Crate lints:** `#![deny(unsafe_op_in_unsafe_fn)]`,
   `#![warn(clippy::undocumented_unsafe_blocks)]` — every `unsafe` block is
   forced to carry a `// SAFETY:` comment.
@@ -236,6 +241,7 @@ with interrupts disabled; `end_of_interrupt` runs inside an interrupt handler
 | P2 | `pic.rs` · `outb()` / `outb_wait()` | `out dx, al` (port write) | Only way to program the 8259A (ICW1–4, masks, EOI) | `unsafe fn` whose `# Safety` requires a write-safe PIC port; all callers pass a master/slave command/data port with a documented ICW/OCW/mask value. `outb_wait` adds a throwaway write to the conventional I/O-delay port `0x80`. Device-only effect, `nomem`/`nostack`. | Reasoned + QEMU |
 | P3 | `pic.rs` · `init()` | ICW1–ICW4 `outb` sequence + final mask writes | Remap both PICs to `0x20`–`0x2F` in 8086 cascade mode and mask all lines | Standard, well-defined 8259A init sequence; each `outb` targets a constant PIC port with a defined value; only reconfigures where the PICs vector and which lines are masked. Runs once, boot core, interrupts off → no concurrent PIC access. | Reasoned + QEMU (timer IRQ delivered to vector 32) |
 | P4 | `pic.rs` · `mask_irq()` / `unmask_irq()` | `inb` then `outb` of the IMR | Open/close a single IRQ line (e.g. IRQ0 for the PIT) | Read-modify-write of one mask bit (`line < 8`) on the master/slave IMR; device-only effect (enables/disables one line). `inb`/`outb` contracts hold. | Reasoned + QEMU |
+| P6 | `pic.rs` · `mask_all()` / `masks()` | `outb(0xFF)` to both IMRs; `inb` of both IMRs | Retire the 8259 once device IRQs go through the IOAPIC (SMP 3b-ii; ACPI `PCAT_COMPAT`), and read the masks back as boot evidence | The writes are exactly `init`'s (P3) final mask writes; the reads are P1's pure IMR reads. Device-only; cannot corrupt memory. Called by `kernel::ioapic` with IF = 0 on the BSP. | Reasoned + QEMU (`[ioapic] … pic=masked …` — read back, both IMRs `0xFF`) |
 | P5 | `pic.rs` · `end_of_interrupt()` | `outb(PIC_EOI)` to master (and slave if a slave line) | Tell the PIC the serviced interrupt is done so it delivers further IRQs | Writes the non-specific EOI (OCW2 `0x20`) to the master command port, plus the slave for vectors `0x28`–`0x2F`; vectors outside `0x20`–`0x2F` are ignored. EOI is device-only; cannot corrupt memory. | Reasoned + QEMU (sustained 100 Hz ticks) |
 
 ## 2f. `hal::pit` — 8254 PIT channel-0 timer (sub-project #2)
@@ -252,6 +258,13 @@ are safe API.
 |---|----------|-----------|------------|--------------------|--------------|
 | T1 | `pit.rs` · `outb()` | `out dx, al` (port write) | Only way to program PIT channel 0 | `unsafe fn` whose `# Safety` requires a write-safe PIT port; all callers pass `0x40`/`0x43` with a defined mode/reload value. Device-only effect, `nomem`/`nostack`. | Reasoned + QEMU |
 | T2 | `pit.rs` · `init()` | mode-byte + lo/hi reload `outb` sequence | Configure channel 0 to ~100 Hz rate-generator mode | Documented 8254 channel-0 programming sequence (`0x34` then divisor low/high); only sets the PIT's mode and reload count — device-only, cannot alias Rust memory. Runs once, boot core, interrupts off. | Reasoned + QEMU (clock advances 1 s/s on the boot screen) |
+
+> **SMP 3b-ii:** the device handlers (`pit::on_tick`, `keyboard::on_irq`,
+> `mouse::on_irq`, `e1000::on_irq`) no longer call `pic::end_of_interrupt`
+> directly; they call `ioapic::device_eoi(vector)` (§2m, IO4), which issues P5
+> only when the LAPIC does **not** have the vector in service — i.e. only for a
+> legacy virtual-wire delivery. With the IOAPIC route live (8259 masked, LINT0
+> masked) P5 is unreachable; it remains for the rollback / no-IOAPIC fallback.
 
 > The PIT's IRQ0 handler (`hal::pit::on_tick`) does a `fetch_add` on the
 > `AtomicU64 TICKS` and a `pic::end_of_interrupt` — both safe. The privileged EOI
@@ -281,6 +294,7 @@ with interrupts disabled; `on_irq` runs inside the IRQ1 interrupt gate
 | K2 | `keyboard.rs` · `outb()` | `out dx, al` (port write) | Only way to send i8042 commands (`0x64`) and write the config byte (`0x60`) | `unsafe fn` whose `# Safety` requires a write-safe PS/2 port; all callers pass `0x60`/`0x64` with documented i8042 command/config values. Device-only effect (which interrupts the controller raises / which ports are clocked), `nomem`/`nostack`. | Reasoned + QEMU |
 | K3 | `keyboard.rs` · `wait_input_empty()` / `wait_output_full()` | `inb(0x64)` status poll | Gate command/data writes and the config read on the controller's buffer state | Reads the read-only status register in a **bounded** loop (so a wedged controller cannot hang boot); no side effect relevant to memory safety. `inb`'s contract holds. | Reasoned + QEMU |
 | K4 | `keyboard.rs` · `init()` | read-modify-write of the i8042 config byte (`0x20` read → set IRQ1 bit, clear clock-disable → `0x60` write), then drain a stale byte | Enable IRQ1 generation; firmware may leave it disabled, in which case the keyboard never raises an interrupt | Standard i8042 config-byte programming; each `inb`/`outb` targets a constant PS/2 port with a defined value; only toggles controller interrupt/clock bits — device-only, cannot alias Rust memory. Runs once, boot core, interrupts off. | Reasoned + QEMU (after this, IRQ1 fires on keypress) |
+| K6 | `keyboard.rs` · `drain_stale_output()` | `inb(0x64)` then, if output-full, `inb(0x60)` | Re-arm IRQ1/IRQ12 after the 8259 → IOAPIC switch: an edge raised in the switch window is lost and the i8042 raises none until its buffer is drained | Exactly `init`'s stale-byte drain (K4): two pure device reads of the i8042 status/data ports. Discards at most one boot-time byte. Called once by `kernel::ioapic::init`, IF = 0. | Reasoned + QEMU (keystrokes injected after boot arrive: `[ioapic] kbd: … ok`, `[shell] ran: about`) |
 | K5 | `keyboard.rs` · `on_irq()` | `inb(0x60)` scancode read | Drain the scancode byte (mandatory — i8042 stops raising IRQ1 until read) | Reached only from the IRQ1 interrupt gate; a single pure device read of the data port, then a `fetch`-free atomic push to the ring and a `pic::end_of_interrupt`. Cannot corrupt memory. | Reasoned + QEMU (sustained keystrokes delivered) |
 
 > The keyboard's raw-scancode ring (`RING`/`HEAD`/`TAIL`) is built from plain
@@ -386,11 +400,65 @@ PIT's 100 Hz on vector `0xF1`, whose handler EOIs the LAPIC and runs
 | AP3 | `apic.rs` · `enable_ap()` | `cpu::read_msr(IA32_APIC_BASE)` + up to 2× `cpu::write_msr` (EN (if clear) → EN\|EXTD) where x2APIC is advertised, else the shared MMIO mapping (AP4); then `reg_write` of `SVR` / `LVT LINT0 = masked` / `LVT LINT1 = NMI` | Put each AP's LAPIC into x2APIC mode (an x2APIC ID, spurious vector, NMI routing; ready as an IPI / LAPIC-timer target) without making it a second PIC sink | Same guard and MSR discipline as AP1, executed on the calling AP's own (MSR-mapped, per-core) LAPIC; only bits are OR-ed into `IA32_APIC_BASE`; LINT0 **masked**, not `ExtINT`, so the PIC's INTR still reaches exactly one core — the existing PIT/keyboard/mouse/NIC handlers and their PIC EOIs stay single-delivery. Routing only; cannot alias or corrupt Rust memory. `None` (no-op) where x2APIC is not advertised. | Reasoned + QEMU: the MSR arm runs where x2APIC is present (the `kvm-smp.yml` job's `-smp 4` boot prints `lapic=x2apic` per AP), the MMIO arm on every TCG boot (`lapic=xapic` per AP); the software-enable is what lets the pinned-task proof's IPI reach the AP on both |
 | AP2 | `apic.rs` · `id()` | `cpu::read_msr(IA32_APIC_BASE)` then, iff `EXTD` set, `cpu::read_msr(0x802)` (x2APIC ID) | Report the BSP's x2APIC ID in the bring-up line | **Self-guarding:** reads `IA32_APIC_BASE` (always implemented — cannot `#GP`), and only reads `0x802` when `EXTD` is set (x2APIC mode active), else returns `None`. So the safe wrapper never faults regardless of call order (reading `0x802` in xAPIC mode would `#GP`). Both are pure read-only register accesses with no side effect — cannot corrupt memory. | Reasoned (same env caveat as AP1 — the `0x802` read runs only on the x2APIC-present path, not under TCG). |
 
-> **Migrating device IRQs to the IOAPIC, AP bring-up (INIT-SIPI-SIPI), and
-> per-CPU state are later, designed phases** — see
-> `docs/specs/2026-07-14-smp-x2apic-design.md`. This slice deliberately changes
-> *only* the BSP's LAPIC mode + virtual-wire LVTs, preserving the single-core IRQ
-> path so it can be verified in isolation by the existing boot test.
+**SMP 3b-ii (IOAPIC routing)** adds two LAPIC operations, both over the live
+access path (AP4 / C9 / C10), no new raw instruction:
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| AP8 | `apic.rs` · `in_service()` | `reg_read(ISR word)` — MSR `0x810..=0x817` or MMIO `0x100..=0x170` | Decide, per device interrupt, whether the LAPIC delivered it (and so is owed the EOI) — `ioapic::device_eoi` (IO4) | A read-only register: no side effect, cannot alias Rust memory. The offset comes from the pure `isr_slot` (host-tested; Kani `isr_slot_is_exact`: every vector maps to one of the eight 16-byte-aligned ISR words and a bit `< 32`, bijectively), so the access is always one of the eight architectural ISR registers. `false` without an access path (then the 8259 is the only possible deliverer). | Reasoned + Kani (decode) + QEMU (every PIT tick, keystroke, mouse byte and NIC IRQ after the switch EOIs the LAPIC; the PIT keeps ticking for the whole boot — a missed EOI would block every vector of its priority class) |
+| AP9 | `apic.rs` · `mask_lint0()` / `lint0_extint()` / `lint0_masked()` | `reg_write(LVT LINT0, masked)` / `reg_write(LVT LINT0, ExtINT)` / `reg_read(LVT LINT0)` on the calling core | Take the 8259 out of the virtual wire once the IOAPIC carries device IRQs; restore it on rollback; read it back as evidence | The masked value is exactly AP3's (every AP already runs with it); ExtINT is exactly AP1's. Routing only — cannot alias Rust memory. Called by `kernel::ioapic` on the BSP with IF = 0. | Reasoned + QEMU (`[ioapic] … lint0=masked …`, read back; keyboard evidence line re-reads it at the first keystroke) |
+
+> AP bring-up and per-CPU state shipped in phase 2 (§2k); device-IRQ routing
+> through the IOAPIC shipped in 3b-ii (§2m). LINT0 = ExtINT now exists only
+> between `enable_bsp` and `kernel::ioapic::init`, and on the rollback path.
+
+## 2l. `hal::acpi` — RSDP + bounded firmware-table reader (SMP 3b-ii)
+
+`hal` does **no** ACPI parsing: the RSDP → RSDT/XSDT → MADT walk and every byte
+decode are `kernel::acpi` (safe, `&[u8] -> Result` decoders, 4 Kani harnesses, a
+200 000-mutant fuzz test over QEMU's real MADT). `hal` supplies the RSDP's
+physical address and a reader that **copies** firmware bytes into a
+kernel-owned buffer — the kernel never holds a reference into firmware memory.
+`read_phys` refuses empty or > 16 KiB requests and any range that overlaps
+memory the kernel owns or may own (`mm::overlaps_kernel_owned`: `USABLE`,
+`BOOTLOADER_RECLAIMABLE`, `EXECUTABLE_AND_MODULES`, `FRAMEBUFFER`; fails closed
+without a memory map), then maps the span through `mm::map_firmware_ro` — the
+§5f bump window with `PageFlags::kernel_ro()` (present, read-only, NX, no
+PCD/PWT, so the MTRRs decide the memory type and a table the HHDM also maps WB
+is not aliased UC). Limine base revision 3 no longer promises the HHDM covers
+ACPI/reserved memory, which is why the span is mapped rather than HHDM-offset.
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| AC1 | `acpi.rs` · `rsdp_phys()`; `mm/bootinfo.rs` · `overlaps_kernel_owned()` | read the `#[used]` `RsdpRequest` / `MemoryMapRequest` responses (crate-safe `get_response()`; listed for the same reason as B1) | Where the ACPI tables start; which physical ranges the kernel owns | The B1 pattern: a response is `Some` only if Limine filled it before `_start`; only scalars are copied out. Revision 3 reports the RSDP physically; a value ≥ the HHDM offset (revision-0 style) is converted back. | Reasoned + QEMU (the walk finds QEMU's RSDT and MADT on every boot) |
+| AC2 | `acpi.rs` · `read_phys()` | `ptr::read_volatile(*const u8)` over the span `map_firmware_ro` just mapped | Copy RSDP/RSDT/XSDT/MADT bytes into the kernel's fixed buffers | Every byte `src + i`, `i < len`, lies in pages mapped present+read-only by the call itself (offset-preserving, never unmapped). The range overlaps no kernel-owned RAM, so no Rust reference or writer exists for it — a volatile `u8` load there is a firmware/device read, not a racing access to Rust memory; `u8` has no alignment/validity requirement. Bounded by `MAX_READ` (16 KiB) and the caller's buffer, never by a firmware length. | Reasoned + QEMU + host tests of every consumer path (`kernel::acpi::tests::discover`) |
+
+> `mm::map_firmware_ro` and the refactored `map_mmio` share one body
+> (`map_window`); no new raw page-table op — the same M6–M9 `map_page` path
+> with different leaf flags.
+
+## 2m. `hal::ioapic` — IOAPIC redirection + device EOI (SMP 3b-ii)
+
+Mechanism only; policy (which ISA IRQ → which GSI, vector and CPU) is
+`kernel::ioapic`, from the MADT the kernel parsed. `IoApic` is a sealed handle
+(private fields, only `IoApic::map` constructs it), so a kernel-held handle
+always names a validated, mapped, version-checked window. One global
+`SpinMutex` pairs every `IOREGSEL` select with its `IOWIN` access across all
+IOAPICs and cores; it is never taken in interrupt context (IO4 touches only the
+LAPIC), so it needs no interrupt masking. Redirection-entry packing is pure and
+Kani-proved: `to_raw`/`from_raw` round-trip exactly, `to_raw` never sets a
+read-only (delivery status, remote IRR), reserved or logical-destination bit
+(`redirection_entry_round_trips_and_sets_only_writable_bits`,
+`redirection_entry_from_raw_is_total`), and an unmasked fixed/lowest-priority
+entry hal accepts never targets an exception vector
+(`programmable_entries_never_target_exception_vectors`).
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| IO1 | `ioapic.rs` · `IoApic::map()` | `mm::map_mmio(phys, 0x20)` of a **firmware-supplied** address (no raw op; composes §5f) | Reach the IOAPIC's registers | The address is untrusted (MADT type 1), so it is checked **before** mapping: 16-byte aligned (both registers 4-byte aligned inside one window), non-wrapping, and overlapping no kernel-owned RAM (`mm::overlaps_kernel_owned`) — a lying table can never turn IO2/IO3's stores into stores to kernel memory. Mapped uncached (PCD+PWT) as a device window, never unmapped. The version register must then read back plausibly (not all-ones, ≥ 2 pins) or the handle is refused. | Reasoned + QEMU (`pins=24` read back from QEMU's IOAPIC at `0xFEC0_0000`) |
+| IO2 | `ioapic.rs` · `read_reg()` / `write_reg()` | `write_volatile(IOREGSEL, reg)` then `read_volatile`/`write_volatile(IOWIN)` — aligned `u32`s at `base + 0x00` / `base + 0x10` | The IOAPIC's only register interface is indirect | `base` is IO1's validated mapping; both offsets are inside the 0x20-byte window and 4-byte aligned; volatile because they are device registers; the global lock keeps select and window paired (a racing select from another core would otherwise redirect the window access to another register). Device-register access cannot alias Rust memory. | Reasoned + QEMU (the version register reads back `pins=24`; every routed source delivers after IO3 writes through this path) |
+| IO3 | `ioapic.rs` · `write_entry()` / `mask_pin()` | IO2 writes of redirection-table registers `0x10 + 2·pin` (low) and `+1` (high) | Program a pin: vector, delivery mode, physical destination, polarity, trigger, mask | `pin` ≤ the version register's max redirection entry (else refused), so the index names a real entry. The entry must be `is_programmable` — an unmasked fixed/lowest-priority entry with a vector < `0x20` is refused, because a device-delivered exception vector would enter an ISR stub whose error-code expectation does not match (stack misinterpretation). Write order: low dword **masked**, then high (destination), then the final low — the pin never delivers a half-written entry. Packing is the Kani-proved `to_raw`. Effect: interrupt routing only; what a delivered vector does is decided by the IDT, and the kernel registers every routed vector's handler before routing it. | Reasoned + Kani (packing) + QEMU (`routed=pit,kbd,mouse,nic`, PIT live through GSI 2, keyboard IRQs via GSI 1) |
+| IO4 | `ioapic.rs` · `device_eoi()` | none new — AP8 (ISR read) then AP6 (LAPIC EOI) **or** P5 (8259 EOI) | Every device handler must EOI exactly the controller that delivered it | A LAPIC-delivered interrupt (IOAPIC message) sets the vector's ISR bit; a virtual-wire ExtINT delivery never does. Reading the ISR at handler time therefore identifies the deliverer from hardware state, with no software flag that could disagree during the switch-over or after a rollback. For a level-triggered pin (the NIC, GSI 11) the LAPIC EOI's broadcast clears the IOAPIC's remote IRR (EOI-broadcast suppression is never enabled: SVR bit 12 stays 0). | Reasoned + QEMU (sustained PIT/keyboard/NIC delivery after the switch) |
 
 ## 2j. `hal::simd` — AVX/AVX-512 vector state + int8 GEMM (AI/ML compute)
 
@@ -741,13 +809,13 @@ disabled; `send_frame`/`poll_frame`/`on_irq` take the lock briefly.
 | N4 | `e1000.rs` · `Mmio::write()` | `ptr::write_volatile(*mut u32)` of a register | Program the device (CTRL/RCTL/TCTL, ring bases, IMS, tails) | As N3: `base + reg` is a 4-byte-aligned address in the mapped writable BAR window; the store only affects the NIC (config / ring tail / interrupt mask) and cannot alias Rust memory. | Reasoned + QEMU (TX/RX confirmed in pcap) |
 | N5 | `e1000.rs` · `read_*_desc`/`write_*_desc` | `ptr::read_volatile`/`write_volatile` of a 16-byte `RxDesc`/`TxDesc` in the ring frame | Maintain the DMA descriptor rings the NIC reads/writes | The ring is a `DmaFrame` (4 KiB, HHDM-mapped, exclusively owned); index `i < 32` and `32 × 16 = 512 ≤ 4096`, so the descriptor is fully in-frame and 16-byte-aligned. Writes are unaliased w.r.t. the NIC: we only advance the ring tail (handing a descriptor to the device) **after** writing it, and read a descriptor's status only to observe the NIC's completion writeback. | Reasoned + QEMU (DD bits observed; pcap frames) |
 | N6 | `e1000.rs` · `copy_into_buf`/`copy_out_of_buf` | `ptr::write_volatile`/`read_volatile` of bytes in a packet `DmaFrame` | Stage an outgoing frame / extract a received one | `buf` is a 4 KiB `DmaFrame`; the copy is bounded to `min(len, 2048) ≤ 4096`, byte-aligned, in-frame. The TX buffer is filled before the descriptor tail is advanced (unaliased); the RX buffer is read only after its descriptor reports DD (frame complete, not being written). | Reasoned + QEMU (ARP/ICMP payloads correct in pcap) |
-| N7 | `e1000.rs` · `unsafe impl Sync for NicLock` + `with()` `&mut *UnsafeCell` | Share the driver `static` and form `&mut Nic` while the lock is held | The driver state must live in a `static` and be mutated behind a lock | Access is serialised by the `locked` atomic (only one critical section at a time); single-core at bring-up ⇒ never concurrent; the inner reference never escapes the closure. Same pattern as `mm::sync` (M13/M14). The `Nic`'s raw addresses (MMIO base, DMA frames) are valid for the program's life. | Reasoned + QEMU |
+| N7 | `e1000.rs` · `unsafe impl Sync for NicLock` + `with()` `&mut *UnsafeCell` | Share the driver `static` and form `&mut Nic` while the lock is held | The driver state must live in a `static` and be mutated behind a lock | Access is serialised by the `locked` atomic (only one critical section at a time); the inner reference never escapes the closure. **`with()` masks interrupts on the calling core for the critical section** (restoring the prior IF): `on_irq` takes the same lock from the NIC handler, and the Net app reaches `with()` from the idle loop with IF = 1 (`net::status` → `link_up`/`mac`), so an IRQ landing inside that section would spin forever on its own core (found by inspection while routing the line through the IOAPIC, SMP 3b-ii; no boot test exercised it). Same pattern as `mm::sync` (M13/M14). The `Nic`'s raw addresses (MMIO base, DMA frames) are valid for the program's life. | Reasoned + QEMU |
 
 > **Protocol stack is out of the TCB.** Ethernet/ARP/IPv4/ICMP framing,
 > checksums, and the reply logic live entirely in `kernel::net`
 > (`#![forbid(unsafe_code)]`): pure byte arithmetic over slices, with co-located
 > unit tests. The TCB's job is only to move bytes to/from the wire (N3–N7) and
-> ack the RX interrupt (`on_irq` reads ICR + EOIs via `pic`, P5). The kernel's
+> ack the RX interrupt (`on_irq` reads ICR + EOIs via `ioapic::device_eoi`, IO4). The kernel's
 > registered NIC-vector handler is a one-line safe `fn(&InterruptFrame)`.
 
 ## 7. `hal::ata` — legacy ATA (IDE) PIO disk driver (storage persistence)
@@ -939,7 +1007,9 @@ Context` — see the design doc's "sealed capability" argument, mirrored in
 | QEMU **fault tests** (the #2a evidence) | G1–G5, I1–I5, X1 — `int3` → `EXCEPTION: BREAKPOINT`, deliberate #PF → `EXCEPTION: PAGE FAULT` + no reset loop, forced #DF on the IST stack → `EXCEPTION: DOUBLE FAULT` | via `cargo xtask test-faults` (test-engineer, build sequence step 4) — **this is the primary correctness check for the ISR/asm + descriptor-table loads** |
 | Miri | pure logic helpers only (cannot model port I/O / `hlt`/`cli`/`sti` / descriptor loads / ISR stubs / CR3 / `invlpg` / raw page-table writes / inline `asm!` such as `cpuid`/`rdmsr`/`wrmsr`) | **live** — `.github/workflows/verify.yml` runs `cargo +nightly miri test -p hal` (and, scoped to `kernel::ml`, `cargo +nightly miri test -p kernel ml::`; scoped to `kernel::sched`, `cargo +nightly miri test -p kernel sched::` — the pure `pick_next` queue-policy tests) on every kernel change (33 hal tests, 0 UB, as of this writing — re-run `cargo +nightly miri test -p hal --target x86_64-unknown-linux-gnu` to get the current count); covers new test-exercised paths automatically as they are added. Includes CX6's runtime alignment arithmetic (`context::tests::as_mut_ptr_window_is_64_byte_aligned_and_in_bounds`, `new_init_is_all_zero`, `zeroize_clears_a_dirtied_area`) and `kernel::sched`'s 8 queue-policy tests (round-robin rotation, exit-vs-requeue, Invariant #4 no-lost/no-duplicated-ids, `preempt_disable`/`preempt_enable` round-trip) — both 0 UB. **Honesty note:** under Miri, `std::is_x86_feature_detected!` always reports `false` (Miri has no CPUID model), so **every** `hal::simd` hardware differential test (`kernels_match_scalar_*`, `kernels_extremes_do_not_diverge`, `kernels_i32_accumulator_wraps_like_scalar`) silently early-returns without exercising any GEMM kernel or its pointer arithmetic — Miri's real `hal::simd` coverage is the **pure logic**: the always-on `vnni_cell_bias` bias-correction model tests and `wrappers_reject_bad_dims_and_unready`'s dimension/readiness rejection paths, not the vector kernels (`avx2_madd8`/`avx512_madd16`/`vnni_dp16`) or their `unsafe` pointer arithmetic, which stay Miri-opaque like the rest of the inline `asm!` in this registry. Similarly, `hal::context`'s `sentinel_gpr_switch`/`sentinel_task_entry_trampoline`/`for_new_task`'s frame write/`switch`'s `xsave`/`xrstor` bracket are Miri-opaque (register/stack swap + privileged vector instructions) — only CX6's alignment arithmetic is Miri-exercised, per the design doc's "What Miri/Kani can cover" section |
 | Kani (bounded model checking) | bit-level helpers (e.g. IF/LSR masks, newline translation, gate/TSS descriptor bit-packing, RFLAGS/error-code decoders, **framebuffer `pack_rgb` channel packing + `byte_offset`/`fill_rect` bounds/clip arithmetic**, **`mm` address-index decomposition `VirtAddr::table_indices`, frame-align math, `PageFlags` bit-packing, and `align_up`/free-block split arithmetic**, **the AI/ML tier-dispatch total-function proof (`kernel::ml::proofs::capability_from_flags_is_total`) and the VNNI bias-correction ring identity (`hal::simd::proofs::vnni_bias_correction_is_exact`)**) | **harnesses written in-tree**, `#[cfg(kani)]`: `cpuid::FamilyModelStepping::from_eax` (total + bounded over all 2³² inputs), `ata::validate` (the read/write safety gate — proves no unsafe request is accepted), `apic::{ecx_has_x2apic, ebx_logical_cpu_count}` (total + bit-exact / clamped-to-`1..=255` over all inputs), `simd::proofs::{vnni_bias_correction_one_lane_is_exact, vnni_bias_correction_step_is_exact}`, and `kernel::ml::proofs::{capability_from_flags_is_total, checked_shape_two_factor_is_total, checked_shape_matches_checked_mul_bounded}`. Run with `cargo kani -p hal` / `cargo kani -p kernel`. **Status as of 2026-07-25: discharged live.** The hal harnesses run in the **gating** `kani-hal` job (6/6, ~52 s); the kernel harnesses run in `kani-kernel`, which stays `continue-on-error` only until a green run promotes it (6/6, ~63 s locally). The earlier claim that the Kani toolchain could not fetch its bundle in the dev sandbox was **wrong** — it installs and runs fine, and local iteration is how the two intractable harnesses below were found and fixed. The always-on host tests (and Miri) remain a parallel guard, not the sole one. Sched coverage now exists: `sched::proofs::{invariant4_no_lost_or_duplicated_ids_bounded, preempt_count_nesting_never_underflows, tick_action_suppression_dominates}` cover the design doc's bounded-model-checking targets (Invariant #4 over symbolic yield/exit interleavings, `PREEMPT_COUNT` never underflowing, and the cooperative-proof preemption suppression). Invariant #4 is proven over **8 symbolic scheduler passes across a 6-id universe** (2026-07-26) — enough to saturate the reachable space, since round-robin rotation has period 6 and at most 5 tasks can exit before the queue drains. It was previously pinned at depth 2 by a CBMC memory ceiling; that ceiling was `VecDeque`'s heap model, not the policy, and was removed by making `pick_next` generic over a minimal `ReadyQueue` trait so the proof drives the real function over an allocation-free queue. More harnesses per the list at left to follow |
+| Kani — SMP 3b-ii additions (2026-10-04) | hal: `ioapic::proofs::{redirection_entry_round_trips_and_sets_only_writable_bits, redirection_entry_from_raw_is_total, programmable_entries_never_target_exception_vectors}`, `apic::proofs::isr_slot_is_exact`; kernel: `acpi::proofs::{madt_body_decode_is_total_and_bounded, one_entry_decode_is_total_and_exact, rsdp_decode_is_total, root_entry_is_total}` | **discharged locally**, each harness alone (wall time incl. cached build): hal 5 s / 3 s / 1 s / 3 s; kernel 333 s / 15 s / 14 s / 6 s. The MADT-body harness (every 56-byte buffer, every declared length ≤ 56, unwind 8) dominates; full suites: hal 11/11 in 64 s, kernel 39/39 in 13 min 41 s (was ~5 min) — inside the `kani-kernel` step's 30-minute cap. Miri: `hal` (40 tests) and `kernel acpi:: ioapic::` (21 tests) clean; the latter is a new step in `verify.yml` |
 | Fuzzing | `Serial::write_bytes` newline translation over arbitrary inputs | **pending** |
+| Fuzzing (deterministic mutation, host test) | `kernel::acpi::parse_madt` over 200 000 mutants of QEMU's real MADT (byte flips, length rewrites, truncation, half re-checksummed so mutants reach the structure walk; 42 158 (21 %) parse, the test requires > 20 000) | **live** in `cargo test` (300 mutants under Miri). Not coverage-guided: a `cargo-fuzz` lane is still the memory-boundary gate's precondition (STATE.md) |
 
 > **#2a note:** the GDT/TSS/IDT loads and the raw ISR stubs are not Miri- or
 > Kani-executable (no model for `lgdt`/`lidt`/`ltr`/`iretq` or the stub asm). Their
@@ -1023,8 +1093,8 @@ Context` — see the design doc's "sealed capability" argument, mirrored in
     reschedule vector (`0xF0`); the target does the switch itself, at its ISR
     tail, exactly like a timer tick. Tasks never migrate. Every core has its
     own LAPIC-timer tick (phase 3), so tasks on any core are timer-preempted;
-    the PIT (BSP only, via the PIC) is the wall clock `hal::pit::ticks` and the
-    LAPIC timer's calibration reference, nothing else.
+    the PIT (BSP only, via the IOAPIC since SMP 3b-ii) is the wall clock
+    `hal::pit::ticks` and the LAPIC timer's calibration reference, nothing else.
 15. **The PIT wall clock advances only when the BSP services IRQ0; nothing that
     waits across cores may time itself on it.** (Retired as a hazard in SMP
     phase 3b-i, 2026-09-18.) The safe kernel's `kernel::clock::mono_ticks` is
@@ -1039,3 +1109,25 @@ Context` — see the design doc's "sealed capability" argument, mirrored in
     yet, so only the BSP's own tick can carry either clock there. The PIT
     remains the wall clock for uptime display and the LAPIC calibration
     reference (invariant 14).
+16. **Device-IRQ routing (SMP 3b-ii).** Once `kernel::ioapic::init` succeeds,
+    every device IRQ the kernel uses reaches the CPU by exactly one path: an
+    IOAPIC redirection entry, fixed delivery, physical destination = the BSP's
+    APIC ID, vector unchanged from the 8259 era (`0x20 + ISA IRQ`; overrides
+    decide the GSI, so the PIT is `GSI 2 → 0x20` under QEMU). The 8259 is fully
+    masked and the BSP's LINT0 masked (both read back as evidence), so there is
+    no second deliverer; the switch happens with IF = 0 on the BSP before any AP
+    runs, masking every pin first and opening only the routed ones. Every
+    handler EOIs through `ioapic::device_eoi`, which picks the controller from
+    the LAPIC's in-service register (IO4). Routing is **BSP-only by decision**:
+    the PIT is the wall clock (invariants 14–15, `clock::prove_mono`'s
+    `pit-frozen=yes`), and the keyboard/mouse rings and NIC frames are consumed
+    by the BSP idle loop and are not audited for a producer on another core.
+    Any lock a device handler takes must be taken with interrupts masked
+    everywhere else (N7). The NIC's line is the PCI interrupt-line register
+    value treated as an ISA IRQ through the MADT overrides — correct where the
+    firmware's PIRQ steering also drives the IOAPIC pin of that number (QEMU's
+    ICH9); the general source is the ACPI `_PRT` (AML), which this kernel does
+    not interpret. On any failure before or during the switch (no MADT, an
+    unmappable or implausible IOAPIC, an unroutable ISA IRQ, the PIT not seen
+    ticking through the IOAPIC within a bounded spin) the 8259 virtual wire is
+    left or restored intact.

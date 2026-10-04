@@ -2,7 +2,7 @@
 
 One page for a fresh session (or a fresh container) to pick the kernel work back
 up without re-deriving state from git. Update it at the end of any session that
-changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + SentinelFS FS-1a landed; PR-2b next).
+changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + SentinelFS FS-1a landed; SMP 3b-ii IOAPIC routing in review; PR-2b next).
 
 ## Landed (main)
 
@@ -35,6 +35,17 @@ changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + 
   still opens interrupts: the AP it waits for is not ticking yet). Boot proof
   `[clock] mono: … pit-frozen=yes bsp-stalled-advance=yes rate-ok=yes ok` asserted.
   Zero `hal` delta.
+- **IOAPIC routing (SMP 3b-ii).** `kernel::acpi` walks RSDP → RSDT/XSDT → MADT with
+  `&[u8] -> Result` decoders into a fixed-size `MadtInfo` (IOAPICs, overrides, NMI
+  structures; Kani + a mutation-fuzz host test over QEMU's real MADT);
+  `kernel::ioapic` routes the PIT (ISA 0 → GSI 2), keyboard, mouse and the e1000's
+  line through the IOAPIC to the **BSP** (wall clock + BSP-consumed rings), 8259 and
+  LINT0 masked and read back; EOI goes to whichever controller the LAPIC's ISR says
+  delivered. New `hal`: `hal::acpi`, `hal::ioapic` (hal-tcb §2l/§2m, invariant 4.16).
+  `make test` asserts the `[ioapic] madt: … ok` line exactly and types `about` over
+  QMP to prove keystrokes arrive via the IOAPIC (≈20 s of software repaint under
+  TCG; 120 s budget). Fixed on the way, by inspection: a latent IRQ-context
+  self-deadlock in `hal::e1000`'s lock.
 - **Component model PR-1 (native).** `kernel::hash` (SHA-256, framed
   `ComponentId`), `kernel::host`: `ComponentRuntime` trait + `native::NativeRuntime`,
   envelope codec (60-byte header, ≤256 B payload), per-instance `InboxRing<Wire, 8>`,
@@ -69,7 +80,7 @@ changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + 
   idle path (`sched::idle_reap`), never in `reschedule`. Zero `hal` code delta (hal-tcb §5e
   and §7 text corrected).
 - **Verification.** Miri (hal + kernel ml/hash/host/cap/bus/blk/sfs) and Kani (hal + kernel,
-  35 kernel harnesses, ~5 min) are **gating** CI; every workflow job carries a timeout,
+  39 kernel harnesses, ~14 min locally since the SMP 3b-ii MADT-body harness) are **gating** CI; every workflow job carries a timeout,
   machine-checked. Source guards `check-no-vector`, `check-ata-callers` and
   `check-component-imports` run in Kernel CI. Boot timing harness (`make boot-timing`) is
   informational.
@@ -120,9 +131,9 @@ the KDF params at [352,384) and a `keys` pointer at [392,440) to a kind-6 keyrin
    `kernel/docs/external-tcb.md` + hal-tcb §1 amendment. Spike baseline in spec §19:
    `wasmi` 2.0 builds for the target, 10 crates, ~135 k lines, 303 `unsafe` sites in `wasmi`
    alone.
-2. **IOAPIC** (SMP 3b-ii) — ACPI MADT walk as a pure `&[u8] -> Result` parser (Kani + fuzz),
-   explicit device-IRQ routing, PIC masked. Blocks nothing above; after PR-3. Then: load
-   balancing / stealing is a product decision, not a default.
+2. ~~**IOAPIC** (SMP 3b-ii)~~ — done (see Landed). Open from it: `_PRT`/AML or MSI for
+   PCI devices (the NIC line leans on QEMU's PIRQ steering), and load balancing /
+   stealing, which is a product decision, not a default.
 3. **Component-model PR-4** state objects (signing-key id in records), **PR-5** Sentinel as
    components.
 4. **AMX tier / inference workload 2** — `docs/specs/2026-07-16-inference-workload2-design.md`.

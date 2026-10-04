@@ -95,6 +95,16 @@ jobs:
           MIRIFLAGS: -Zmiri-disable-isolation
         run: "cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu -- blk:: sfs::"
 
+      # SMP 3b-ii (docs/specs/2026-07-14-smp-x2apic-design.md, 2026-10-04 note):
+      # the ACPI decoders (`acpi::` — QEMU's real MADT/RSDT, every truncation,
+      # the mutation fuzz at 300 mutants under Miri) and the routing policy
+      # (`ioapic::` — override resolution, GSI lookup, entry construction).
+      - name: "cargo +nightly miri test -p kernel acpi:: ioapic::"
+        working-directory: kernel
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: "cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu -- acpi:: ioapic::"
+
   # GATING — promoted from experimental on 2026-07-24, per the original promotion
   # plan: three consecutive real CI runs discharged every hal harness (apic/cpuid/
   # ata decode, plus simd's VNNI bias-correction proofs). A failure or timeout
