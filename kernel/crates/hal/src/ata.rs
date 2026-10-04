@@ -330,6 +330,8 @@ fn poll_until(
         if polls >= backstop || now().saturating_sub(start) > budget {
             return Err(AtaError::Timeout);
         }
+        // A pause hint only; Kani cannot model the `pause` intrinsic.
+        #[cfg(not(kani))]
         core::hint::spin_loop();
     }
 }
