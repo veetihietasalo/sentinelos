@@ -633,24 +633,17 @@ mod proofs {
         let _ = decode_inner(&buf, &mut inner);
     }
 
-    /// Leaf-packing totality: every in-memory leaf of up to two items whose
-    /// weight fits the shrunken block encodes `Ok`, and decodes back to the
-    /// same keys with the same bytes for every item.
-    #[kani::proof]
-    #[kani::unwind(119)]
-    fn leaf_packing_is_total_and_round_trips() {
-        // Distinct bytes, so a copy from the wrong place cannot match. Item
-        // count, keys and lengths are symbolic; the source offset is fixed at
-        // 0 (it says where the encoder reads, not anything in the format).
+    /// Leaf-packing totality for `n` items: every in-memory leaf of `n`
+    /// items whose weight fits the shrunken block encodes `Ok`, and decodes
+    /// back to the same keys with the same bytes for every item. Distinct
+    /// source bytes, so a copy from the wrong place cannot match; keys and
+    /// lengths are symbolic, the source offset is 0 (it is where the encoder
+    /// reads, not anything in the format).
+    fn packing_round_trips(n: usize) {
         let src: [u8; 4] = [0xA1, 0xB2, 0xC3, 0xD4];
-        let n: usize = kani::any();
-        kani::assume(n >= 1 && n <= 2);
         let mut node: Node<Span, 2> = Node::new(Span::EMPTY);
         let mut prev: Option<Key> = None;
-        for j in 0..2 {
-            if j >= n {
-                break;
-            }
+        for _ in 0..n {
             let obj: u8 = kani::any();
             let key = Key {
                 obj: u64::from(obj),
@@ -662,28 +655,21 @@ mod proofs {
             }
             let len: u8 = kani::any();
             kani::assume(usize::from(len) <= src.len());
-            let pushed = node.push(
-                key,
-                Span {
-                    src: 0,
-                    off: 0,
-                    len: u16::from(len),
-                },
-            );
-            assert!(pushed.is_ok());
+            let span = Span {
+                src: 0,
+                off: 0,
+                len: u16::from(len),
+            };
+            assert!(node.push(key, span).is_ok());
             prev = Some(key);
         }
         kani::assume(node.weight() <= u64::from(payload_limit(SMALL)));
         let mut blk = [0u8; SMALL];
-        let enc = encode_leaf(&node, &[&src[..]], &mut blk);
-        assert!(enc.is_ok());
+        assert!(encode_leaf(&node, &[&src[..]], &mut blk).is_ok());
         let mut back: Node<Span, 2> = Node::new(Span::EMPTY);
         assert!(decode_leaf(&blk, 1, &mut back).is_ok());
         assert!(back.len() == n);
-        for i in 0..2 {
-            if i >= n {
-                break;
-            }
+        for i in 0..n {
             assert!(back.key(i) == node.key(i));
             let (a, b) = (node.val(i), back.val(i));
             assert!(a.is_some() && b.is_some());
@@ -698,5 +684,19 @@ mod proofs {
                 }
             }
         }
+    }
+
+    /// Leaf packing, one item.
+    #[kani::proof]
+    #[kani::unwind(119)]
+    fn leaf_packing_one_item_round_trips() {
+        packing_round_trips(1);
+    }
+
+    /// Leaf packing, two items (the packing order and the gap).
+    #[kani::proof]
+    #[kani::unwind(119)]
+    fn leaf_packing_two_items_round_trip() {
+        packing_round_trips(2);
     }
 }
