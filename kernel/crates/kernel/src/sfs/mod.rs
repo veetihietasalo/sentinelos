@@ -27,10 +27,14 @@
 #![deny(missing_docs)]
 
 pub mod key;
+pub mod scrub;
 pub mod service;
 pub mod superblock;
+pub mod tree;
 pub mod volume;
 
+#[cfg(test)]
+mod testkit;
 #[cfg(test)]
 mod tests;
 

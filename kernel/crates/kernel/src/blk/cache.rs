@@ -337,6 +337,32 @@ impl Cache {
         Ok(())
     }
 
+    /// Drop a **dirty** entry outright: the transaction that created it no
+    /// longer references the block (a tree node merged away before it was
+    /// ever committed), so its bytes must not be written. Frees one unit of
+    /// the dirty budget.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Stale`] unless `id` names a dirty entry.
+    pub fn discard_dirty(&mut self, id: SlotId) -> Result<(), CacheError> {
+        let idx = self.check(id).ok_or(CacheError::Stale)?;
+        let slot = self.slots.get_mut(idx).ok_or(CacheError::Stale)?;
+        if slot.state != State::Dirty {
+            return Err(CacheError::Stale);
+        }
+        slot.state = State::Empty;
+        slot.tag = slot.tag.wrapping_add(1);
+        self.dirty -= 1;
+        Ok(())
+    }
+
+    /// Entries not dirty (clean or empty): what eviction may choose from.
+    #[must_use]
+    pub const fn not_dirty(&self) -> usize {
+        CACHE_BLOCKS - self.dirty
+    }
+
     /// The block a resident entry belongs to.
     #[must_use]
     pub fn block_of(&self, id: SlotId) -> Option<BlockNo> {
@@ -488,6 +514,27 @@ mod tests {
         assert!(c.read(id).is_none());
         assert!(c.read(d).unwrap().iter().all(|&x| x == 0));
         assert_eq!(c.block_of(d), Some(BlockNo(8)));
+    }
+
+    #[test]
+    fn discarding_a_dirty_entry_frees_its_budget_and_stales_its_id() {
+        let mut c = Cache::new();
+        let d = c.new_dirty(BlockNo(9)).unwrap();
+        assert_eq!(c.dirty_count(), 1);
+        c.discard_dirty(d).unwrap();
+        assert_eq!(c.dirty_count(), 0);
+        assert!(c.read(d).is_none());
+        assert!(!c.is_resident(BlockNo(9)));
+        assert_eq!(c.discard_dirty(d), Err(CacheError::Stale));
+        let (b, h) = sealed(3);
+        let id = c
+            .insert_verified(BlockNo(4), HashRule::Metadata, &h, &b[0])
+            .unwrap();
+        assert_eq!(
+            c.discard_dirty(id),
+            Err(CacheError::Stale),
+            "clean entries are not discarded"
+        );
     }
 
     #[test]

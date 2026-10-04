@@ -977,7 +977,7 @@ fn replaying_the_same_operations_yields_the_same_superblock_hashes_and_image() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn heap_footprint_is_fixed_capped_and_independent_of_device_size() {
-    const CAP: usize = 300 * 1024;
+    const CAP: usize = 400 * 1024;
     let footprint = |blocks: u64| {
         let mut d = MemDevice::untracked(blocks);
         let mut ws = Workspace::new();

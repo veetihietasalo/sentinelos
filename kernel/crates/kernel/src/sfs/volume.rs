@@ -31,13 +31,15 @@
 //! generation 1 — never `Corrupt` (the superblock lives in its first sector;
 //! see [`superblock`]).
 
+use super::key::Key;
 use super::superblock::{self, Candidate, Selection, SlotError, Superblock};
+use super::tree::{Tree, TreeError, TreeWs};
 use crate::blk::allocator::{
     self as alloc_mod, AllocClass, AllocError, Allocator, DirtyRef, RESERVE,
 };
 use crate::blk::cache::{Cache, CacheError, SlotId, DIRTY_MAX};
 use crate::blk::geometry::{Extent, Geometry, GeometryError, MAX_GROUPS};
-use crate::blk::layout::{Hash, HashRule, Pointer, Uuid, HEADER_LEN, UUID_LEN};
+use crate::blk::layout::{Hash, HashRule, Pointer, TreeId, Uuid, HEADER_LEN, UUID_LEN};
 use crate::blk::{bitmap, zeroed_blocks, BlkError, Block, BlockDevice, BlockNo, Blocks};
 use alloc::boxed::Box;
 use alloc::vec;
@@ -438,6 +440,7 @@ enum State {
 struct Staged {
     gen: u64,
     free: Pointer,
+    root: Pointer,
     committed_at: u64,
     hash: Hash,
     slot: u8,
@@ -457,6 +460,9 @@ pub struct Volume {
     sb_buf: Blocks,
     /// Misses the current seal has reported (reset once a seal succeeds).
     seal_misses: usize,
+    /// The metadata tree (FS-1b) and its fixed scratch.
+    tree: Tree,
+    tws: Box<TreeWs>,
 }
 
 /// Read `p` into the cache through `staging`, verifying its metadata hash
@@ -580,6 +586,8 @@ impl Volume {
             next: None,
             sb_buf: zeroed_blocks(1),
             seal_misses: 0,
+            tree: Tree::new(TreeId::Root, sb.uuid, sb.root),
+            tws: Box::new(TreeWs::new()),
         }))
     }
 
@@ -623,6 +631,8 @@ impl Volume {
             + self.alloc.heap_bytes()
             + core::mem::size_of_val(&*self.plan)
             + core::mem::size_of_val(&*self.sb_buf)
+            + self.tree.heap_bytes()
+            + self.tws.heap_bytes()
     }
 
     /// The allocator (read-only view).
@@ -732,17 +742,103 @@ impl Volume {
         }
     }
 
+    fn tree_writable(&self) -> Result<(), TreeError> {
+        match self.state {
+            State::Ready => Ok(()),
+            State::Committing | State::ReadOnly => Err(TreeError::Sealed),
+        }
+    }
+
+    /// A tree error that means the metadata cannot be trusted (or an
+    /// operation broke half-way) leaves the volume read-only (§12).
+    fn tree_outcome<T>(&mut self, r: Result<T, TreeError>) -> Result<T, TreeError> {
+        if matches!(r, Err(TreeError::Corrupt | TreeError::Internal)) {
+            self.state = State::ReadOnly;
+        }
+        r
+    }
+
+    /// Insert `data` at `key` in the metadata tree, or replace the item there
+    /// (spec §7.2; bounded, in memory: the kernel runs it under the `Sfs`
+    /// lock). All-or-nothing: every refusal but `Corrupt`/`Internal` changes
+    /// nothing — resolve a [`TreeError::Miss`] with
+    /// [`resolve_miss`](Self::resolve_miss), answer
+    /// [`TreeError::NeedCommit`] with a commit, and retry.
+    ///
+    /// # Errors
+    ///
+    /// [`TreeError`]; `Corrupt` / `Internal` leave the volume read-only.
+    pub fn put(&mut self, key: Key, data: &[u8]) -> Result<(), TreeError> {
+        self.tree_writable()?;
+        let r = self
+            .tree
+            .put(&mut self.cache, &mut self.alloc, &mut self.tws, key, data);
+        self.tree_outcome(r)
+    }
+
+    /// Remove the item at `key`; returns whether it was there. As
+    /// [`put`](Self::put), and may use the metadata reserve (§5.8).
+    ///
+    /// # Errors
+    ///
+    /// As [`put`](Self::put).
+    pub fn remove(&mut self, key: &Key) -> Result<bool, TreeError> {
+        self.tree_writable()?;
+        let r = self
+            .tree
+            .remove(&mut self.cache, &mut self.alloc, &mut self.tws, key);
+        self.tree_outcome(r)
+    }
+
+    /// Copy the item at `key` into `out` (which must hold it; [`super::tree::ITEM_MAX`]
+    /// always does); returns its length or `None`. Reads see this
+    /// transaction's changes first.
+    ///
+    /// # Errors
+    ///
+    /// [`TreeError::Miss`] (resolve, retry); `Corrupt` leaves the volume
+    /// read-only.
+    pub fn get(&mut self, key: &Key, out: &mut [u8]) -> Result<Option<usize>, TreeError> {
+        let r = self.tree.get(&mut self.cache, &mut self.tws, key, out);
+        self.tree_outcome(r)
+    }
+
+    /// The lowest key above `after` (above nothing for `None`); `None` past
+    /// the last. Iterate by feeding each result back.
+    ///
+    /// # Errors
+    ///
+    /// As [`get`](Self::get).
+    pub fn next_key(&mut self, after: Option<&Key>) -> Result<Option<Key>, TreeError> {
+        let r = self.tree.next_key(&mut self.cache, &mut self.tws, after);
+        self.tree_outcome(r)
+    }
+
+    /// Dirty cache entries in the transaction (tree nodes plus allocator
+    /// metadata): the §8 footprint the host tests bound per operation.
+    #[must_use]
+    pub fn dirty_blocks(&self) -> usize {
+        self.cache.dirty_count()
+    }
+
+    /// The metadata tree's working root.
+    #[must_use]
+    pub const fn tree_root(&self) -> Pointer {
+        self.tree.root()
+    }
+
     fn fail(&mut self, e: CommitError) -> CommitError {
         self.state = State::ReadOnly;
         e
     }
 
-    /// Encode the next superblock (the committed one with `gen`, `free` and
-    /// `committed_at` replaced) into `sb_buf`; returns its hash.
-    fn stage_superblock(&mut self, gen: u64, free: Pointer, now: u64) -> Hash {
+    /// Encode the next superblock (the committed one with `gen`, `free`,
+    /// `root` and `committed_at` replaced) into `sb_buf`; returns its hash.
+    fn stage_superblock(&mut self, gen: u64, free: Pointer, root: Pointer, now: u64) -> Hash {
         let mut sb = self.sb;
         sb.gen = gen;
         sb.free = free;
+        sb.root = root;
         sb.committed_at = now;
         match self.sb_buf.first_mut() {
             Some(buf) => superblock::encode(&sb, buf),
@@ -786,28 +882,41 @@ impl Volume {
             Err(e) => return Err(self.fail(CommitError::Alloc(e))),
         };
         self.seal_misses = 0;
+        // The tree's seal cannot miss: every node it hashes is dirty.
+        let Ok(root) = self.tree.seal(&mut self.cache, gen) else {
+            return Err(self.fail(CommitError::Internal));
+        };
         let n = match self.alloc.sealed_entries(&mut self.plan) {
             Ok(n) => n,
             Err(e) => return Err(self.fail(CommitError::Alloc(e))),
         };
+        let m = match self
+            .plan
+            .get_mut(n..)
+            .map(|rest| self.tree.sealed_entries(rest))
+        {
+            Some(Ok(m)) => m,
+            _ => return Err(self.fail(CommitError::Internal)),
+        };
         // Every dirty block must have been sealed by its owner.
-        if n != self.cache.dirty_count() {
+        if n + m != self.cache.dirty_count() {
             return Err(self.fail(CommitError::Internal));
         }
-        self.nplan = n;
+        self.nplan = n + m;
         let free = index.unwrap_or(self.sb.free);
-        let hash = self.stage_superblock(gen, free, now);
+        let hash = self.stage_superblock(gen, free, root, now);
         let slot = 1 - self.slot;
         self.next = Some(Staged {
             gen,
             free,
+            root,
             committed_at: now,
             hash,
             slot,
         });
         self.state = State::Committing;
         Ok(CommitPlan {
-            dirty: n,
+            dirty: self.nplan,
             slot,
             gen,
         })
@@ -859,10 +968,12 @@ impl Volume {
             }
         }
         self.alloc.commit_done();
+        self.tree.commit_done();
         let blocks = self.nplan as u64 + 1;
         self.nplan = 0;
         self.sb.gen = staged.gen;
         self.sb.free = staged.free;
+        self.sb.root = staged.root;
         self.sb.committed_at = staged.committed_at;
         self.sb_hash = staged.hash;
         self.slot = staged.slot;
