@@ -625,7 +625,12 @@ mod proofs {
 
     /// An adjacent pair where one side underflows: both fit, keys ordered
     /// across them. `fits`: whether the pair's total weight fits one node.
-    fn any_underflowing_pair(fits: bool) -> (Node<W, 4>, Node<W, 4>, usize, usize) {
+    /// `left`: `Some(true)` the left side underflows, `Some(false)` the right
+    /// one does (and the left does not), `None` either.
+    fn any_underflowing_pair(
+        fits: bool,
+        left: Option<bool>,
+    ) -> (Node<W, 4>, Node<W, 4>, usize, usize) {
         let nl: usize = kani::any();
         let nr: usize = kani::any();
         // Each bounded first, so the sum cannot overflow.
@@ -635,7 +640,11 @@ mod proofs {
         let r = any_node(nr);
         kani::assume(l.key(nl - 1) < r.key(0));
         kani::assume(!l.overflows(LIMIT) && !r.overflows(LIMIT));
-        kani::assume(l.underflows(LIMIT) || r.underflows(LIMIT));
+        match left {
+            None => kani::assume(l.underflows(LIMIT) || r.underflows(LIMIT)),
+            Some(true) => kani::assume(l.underflows(LIMIT)),
+            Some(false) => kani::assume(!l.underflows(LIMIT) && r.underflows(LIMIT)),
+        }
         kani::assume((l.weight() + r.weight() <= u64::from(LIMIT)) == fits);
         (l, r, nl, nr)
     }
@@ -647,7 +656,7 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(6)]
     fn node4_merge_is_sorted_balanced_and_preserving() {
-        let (mut l, mut r, nl, nr) = any_underflowing_pair(true);
+        let (mut l, mut r, nl, nr) = any_underflowing_pair(true, None);
         let (first, last) = (l.key(0), r.key(nr - 1));
         let out = Node::rebalance(&mut l, &mut r, LIMIT);
         assert!(out == Ok(Rebalance::Merged));
@@ -661,11 +670,10 @@ mod proofs {
     /// appended node (non-empty, sorted, fitting, non-underflowing, the right
     /// one's first key the separator; that harness covers every overflowing
     /// node of up to 4 entries of weight ≤ `MAX_W`, which the appended pair
-    /// is) — and keeps the count, both ends and the total weight.
-    #[kani::proof]
-    #[kani::unwind(6)]
-    fn node4_recut_is_sorted_balanced_and_preserving() {
-        let (mut l, mut r, nl, nr) = any_underflowing_pair(false);
+    /// is) — and keeps the count, both ends and the total weight. Split in
+    /// two harnesses by which side underflows (each under the 60 s cap).
+    fn recut(left: bool) {
+        let (mut l, mut r, nl, nr) = any_underflowing_pair(false, Some(left));
         let (first, last) = (l.key(0), r.key(nr - 1));
         let total = l.weight() + r.weight();
         let Ok(Rebalance::Split(sep)) = Node::rebalance(&mut l, &mut r, LIMIT) else {
@@ -675,5 +683,19 @@ mod proofs {
         assert!(r.key(0) == Some(sep));
         assert!(l.key(0) == first && r.key(r.len() - 1) == last);
         assert!(l.weight() + r.weight() == total);
+    }
+
+    /// Recut with the left node underflowing.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn node4_recut_left_underflow() {
+        recut(true);
+    }
+
+    /// Recut with the right node underflowing (the left does not).
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn node4_recut_right_underflow() {
+        recut(false);
     }
 }
