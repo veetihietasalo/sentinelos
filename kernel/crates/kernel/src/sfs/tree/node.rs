@@ -570,10 +570,37 @@ mod proofs {
         }
     }
 
+    /// Append preserves: `l ++ r` holds every entry of `l` then every entry
+    /// of `r`, in order, and stays sorted. With the split harness this
+    /// covers rebalance's key-set preservation: a rebalance is an append,
+    /// then (if the pair does not fit) a split.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn node4_append_preserves_entries_in_order() {
+        let nl: usize = kani::any();
+        let nr: usize = kani::any();
+        kani::assume(nl >= 1 && nl <= 2 && nr >= 1 && nr <= 2);
+        let mut l = any_node(nl);
+        let r = any_node(nr);
+        kani::assume(l.key(nl - 1) < r.key(0));
+        let ol = l.clone();
+        assert!(l.append(&r).is_ok());
+        assert!(l.len() == nl + nr && l.is_sorted());
+        for i in 0..4 {
+            if i < nl {
+                assert!(l.key(i) == ol.key(i) && l.val(i) == ol.val(i));
+            } else if i < nl + nr {
+                assert!(l.key(i) == r.key(i - nl) && l.val(i) == r.val(i - nl));
+            }
+        }
+    }
+
     /// Merge / rebalance: an adjacent pair where one side underflows ends
-    /// either merged into a node that fits, or re-cut into two non-empty,
-    /// non-underflowing, fitting halves with the right one's first key as
-    /// separator — entries preserved in order either way.
+    /// either merged into one node that fits, or re-cut into two non-empty,
+    /// non-underflowing, fitting, sorted halves separated by the right one's
+    /// first key — and no entry is lost or invented (counts; the entries
+    /// themselves by [`node4_append_preserves_entries_in_order`] and the
+    /// split harness, since rebalance is append-then-split).
     #[kani::proof]
     #[kani::unwind(6)]
     fn node4_merge_is_sorted_balanced_and_preserving() {
@@ -587,13 +614,13 @@ mod proofs {
         kani::assume(l.key(nl - 1) < r.key(0));
         kani::assume(!l.overflows(LIMIT) && !r.overflows(LIMIT));
         kani::assume(l.underflows(LIMIT) || r.underflows(LIMIT));
-        let (ol, or) = (l.clone(), r.clone());
-        let out = Node::rebalance(&mut l, &mut r, LIMIT);
-        assert!(out.is_ok());
-        match out {
+        let (first, last) = (l.key(0), r.key(nr - 1));
+        let total = l.weight() + r.weight();
+        match Node::rebalance(&mut l, &mut r, LIMIT) {
             Ok(Rebalance::Merged) => {
                 assert!(r.is_empty() && l.len() == nl + nr);
                 assert!(!l.overflows(LIMIT));
+                assert!(l.key(0) == first && l.key(nl + nr - 1) == last);
             }
             Ok(Rebalance::Split(sep)) => {
                 assert!(!l.is_empty() && !r.is_empty());
@@ -601,25 +628,12 @@ mod proofs {
                 assert!(!l.overflows(LIMIT) && !r.overflows(LIMIT));
                 assert!(!l.underflows(LIMIT) && !r.underflows(LIMIT));
                 assert!(r.key(0) == Some(sep));
-                for i in 0..l.len() {
-                    assert!(l.key(i).is_some_and(|x| x < sep));
-                }
+                assert!(l.key(l.len() - 1).is_some_and(|k| k < sep));
+                assert!(l.key(0) == first && r.key(r.len() - 1) == last);
             }
-            Err(_) => {}
+            Err(_) => panic!("a fitting pair never fails to rebalance at CAP 4"),
         }
+        assert!(l.weight() + r.weight() == total);
         assert!(l.is_sorted() && r.is_sorted());
-        for i in 0..nl + nr {
-            let want = if i < nl {
-                (ol.key(i), ol.val(i))
-            } else {
-                (or.key(i - nl), or.val(i - nl))
-            };
-            let got = if i < l.len() {
-                (l.key(i), l.val(i))
-            } else {
-                (r.key(i - l.len()), r.val(i - l.len()))
-            };
-            assert!(got == want);
-        }
     }
 }
