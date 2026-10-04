@@ -579,11 +579,36 @@ A tiny `AtomicBool` compare-exchange spinlock so `mm`'s statics (and, since it w
 promoted to `hal::sync`, the scheduler's queues and task table, the console guard,
 and the heap) are `Sync`. Since SMP phase 2 it **genuinely contends across cores**
 — the `Acquire` on acquisition / `Release` on drop pairing is what makes that
-sound. It never disables interrupts, so every kernel lock is taken with
-interrupts already masked on the *local* core (see `kernel::sched`'s locking
-discipline and §1's console guard). `try_lock` (safe; same `Acquire`) lets a
-caller bound its wait — the console guard uses it so a fault report can never
-deadlock behind a wedged holder.
+sound. It never disables interrupts itself, so a waiter on the *same* core as
+a holder that cannot run would spin forever. The rule the kernel's locks follow
+(corrected in the FS-1a review — this paragraph used to say every kernel lock
+is taken with interrupts already masked, which was never true of the heap):
+
+- **Locks reachable from IRQ context are only taken with `IF = 0`** on the
+  local core: the scheduler's per-core queues and task table (`kernel::sched`'s
+  locking discipline) and §1's console guard. An interrupt can then never land
+  on a core that holds one.
+- **Locks never taken from IRQ context may be held with `IF = 1`, provided no
+  same-core waiter spins** (the holder can be preempted, and a spinning waiter
+  on its core would never let it run again). `kernel::sfs`'s `Sfs` lock meets
+  this by disabling preemption while it is held, so no other task runs on that
+  core until it is released; `kernel::blk::ata`'s `CHANNEL` by having waiters
+  yield instead of spinning.
+- **The allocator locks** — the heap's (§5d) and the frame allocator's (§5b) —
+  are taken with `IF = 1` from any task, and a same-core waiter *does* spin.
+  That is safe only while the waiter is itself preemptible (`IF = 1`,
+  preemption enabled): the next tick switches the core to the holder. Hence
+  the rule: never allocate or free with interrupts or preemption disabled, or
+  under a lock of the first two kinds, while another task on this core may be
+  suspended inside the allocator. kmain's `IF = 0` boot sequence qualifies only
+  because it is never preempted: the other BSP tasks run solely during its
+  yields, none of which happens inside an allocation — the reason `kernel::sched` frees exited
+  tasks only from the idle task, with both enabled (FS-1a review fix; it used
+  to free them inside `reschedule`, with `IF = 0`).
+
+`try_lock` (safe; same `Acquire`) lets a caller bound its wait — the console
+guard uses it so a fault report can never deadlock behind a wedged holder, and
+`CHANNEL`'s waiters use it to yield.
 
 | # | Location | Unsafe op | Why needed | Soundness argument | Verification |
 |---|----------|-----------|------------|--------------------|--------------|
@@ -764,6 +789,18 @@ walk all live in `kernel::fs` under `#![forbid(unsafe_code)]`, **not** the TCB.
 > known-vectors). The TCB's job is only to move 512-byte sectors to/from the
 > media (A1–A4). `write_sectors` ends with a `FLUSH CACHE` so data reaches the
 > backing image before the guest can power off.
+>
+> **Command serialisation moved to the kernel (SentinelFS FS-1a).** A command
+> is a request→poll→transfer sequence that must not interleave with another on
+> the channel. That used to hold because `kernel::fs` was the only caller; since
+> FS-1a the `sfs-commit` task drives the same disk, so `kernel::blk::ata` holds a
+> kernel-side lock (`CHANNEL`) around every `hal::ata` call, and it is the only
+> kernel file allowed to name `hal::ata` (`cargo xtask check-ata-callers`, run in
+> CI). This protects **disk integrity, not memory safety**: interleaved commands
+> could only corrupt a transfer, never memory, so rows A1–A4 are unchanged —
+> still `nomem` port I/O whose soundness never depended on the caller being
+> single-threaded. (Doc-only change; `hal::ata`'s code is untouched.)
+
 ## 8. `hal::cpuid` — CPU identification (hardware report)
 
 Wraps the `cpuid` instruction so the shell's `cpuinfo` command can report what the

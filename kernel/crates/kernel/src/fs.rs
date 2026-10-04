@@ -4,7 +4,9 @@
 //!
 //! This module carries the crate's `#![forbid(unsafe_code)]` and keeps the tree
 //! itself entirely on the kernel heap (`alloc`); all disk access is delegated to
-//! the safe [`hal::ata`] block API (the `unsafe` port I/O lives in the TCB). It
+//! the safe [`hal::ata`] block API (the `unsafe` port I/O lives in the TCB),
+//! through [`crate::blk::ata`]'s wrappers, which hold the IDE channel for each
+//! command (the `sfs-commit` task shares the disk). It
 //! uses no `core::fmt` — it is a pure data structure plus a small path resolver
 //! and a byte-oriented (de)serialiser.
 //!
@@ -570,10 +572,10 @@ fn split_parent(components: &[String]) -> Result<(&[String], &str), FsError> {
 /// ```
 mod disk {
     use super::Node;
+    use crate::blk::ata::{self, SECTOR_SIZE};
     use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
-    use hal::ata::{self, SECTOR_SIZE};
 
     /// The 8-byte magic identifying a SentinelOS filesystem image (`"SNTLFS01"`).
     const MAGIC: &[u8; 8] = b"SNTLFS01";

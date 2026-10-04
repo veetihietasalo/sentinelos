@@ -33,11 +33,16 @@
 //!
 //! # Concurrency model
 //!
-//! Identical to the other port-I/O drivers (`serial`, `pci`, `keyboard`):
-//! single-core at bring-up, all access serialised by the single-threaded kernel
-//! path that calls it (`kernel::fs` load/save). The command/status handshake is
-//! a strict request→poll→transfer sequence that must not be interleaved with
-//! another command, which the single-threaded caller guarantees.
+//! The command/status handshake is a strict request→poll→transfer sequence
+//! that must not be interleaved with another command on the channel. This
+//! module does not serialise its callers; the kernel does. Since SentinelFS
+//! FS-1a two kernel paths drive the disk (`kernel::fs` and the `sfs-commit`
+//! task), and every call goes through `kernel::blk::ata`, which holds a
+//! kernel-side channel lock (`CHANNEL`) for exactly one command; no other
+//! kernel file may name this module (`cargo xtask check-ata-callers`, run in
+//! CI). That lock protects disk integrity, not memory safety: the port
+//! accesses below are sound however callers interleave — an interleaved
+//! command can corrupt a transfer, never memory (hal-tcb §7).
 
 use core::arch::asm;
 

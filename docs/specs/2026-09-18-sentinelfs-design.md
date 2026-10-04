@@ -1,8 +1,12 @@
 # SentinelFS — a copy-on-write, content-addressed, Merkle-verified filesystem
 
-Status: **proposed · review round 1 complete (2026-09-18)** — four-role verdicts and the
-amendment table in §15; A1–A16 applied inline in this revision, the rest owned by the PR named
-there · Track A (kernel core) + D (security subsystem) · Author: kernel-architect
+Status: **proposed · review round 1 complete (2026-09-18) · FS-1a implemented (2026-10-03),
+code-review round 1 addressed (2026-10-03)** — four-role verdicts and the amendment table in
+§15; A1–A16 applied inline in this revision, the rest owned by the PR named there. **Re-staged 2026-10-03 (Veeti):** the
+storage-capability lattice moves out of FS-1a into **FS-1c**, on top of component PR-2's
+`kernel::cap` (§9, §11, A13); FS-1a's as-built notes — corrected group arithmetic, the
+coexistence window, what `flush` means on today's ATA — are in §11 · Track A (kernel core) + D
+(security subsystem) · Author: kernel-architect
 Depends on: `hal::ata` (PIO block I/O incl. `FLUSH CACHE`, TCB, unchanged), `kernel::hash`
 (SHA-256, component PR-1), `kernel::clock` (commit pacing), the component-model design
 (`docs/specs/2026-09-18-component-model-design.md`: §6 content-addressed identity, §10 state
@@ -208,12 +212,18 @@ off len field
                         kind, gen, tree_id, fs_uuid and the payload (A1)
 32    8  gen            generation that wrote this block (informational)
 40    4  kind           1 superblock · 2 tree node · 3 bitmap · 5 group index
-44    4  tree_id        which tree (root / blobs / roots / free)
+                        (6 keyring: reserved for the identity spec, §7.1; refused in v2)
+44    4  tree_id        which tree: 0 none (superblock) · 1 root · 2 blobs · 3 roots ·
+                        4 free (bitmaps and the group index)
 48   16  fs_uuid        the filesystem this block belongs to (stray-block detection)
 ```
 
 Data blocks (kind 4) have **no** header: their hash lives in the extent item (one per
 block), so a 4 KiB file block is 4 KiB of user data and is verifiable alone.
+
+A `Pointer` is `{ block u32, pad u32 = 0, hash [32], gen u64 }` (48 bytes). `Pointer::NULL`
+is all-zero; block 0 is a superblock slot and never a pointer target, so the null encoding
+is unambiguous.
 
 ### 7.1 Superblock (slots: block 0 and block 1)
 
@@ -227,10 +237,12 @@ block), so a 4 KiB file block is 4 KiB of user data and is verifiable alone.
 320    8  next_obj             328   8  committed_at (mono ticks; informational, per boot)
 336   16  dirent_key            key for the dirent name hash (§7.2) — not secret, defeats
                                 offline-precomputed collision floods; derived per §10 later
-352   32  kdf_params + wrap slot  reserved for the identity spec (§10): KDF parameters and
-                                the wrapped tree key MUST live inside the signed superblock
+352   32  kdf_params            reserved for the identity spec (§10): alg u16 | ver u16 |
+                                m_kib u32 | t u32 | p u32 | salt [16] — inside the signed
+                                superblock so they cannot be downgraded offline
 384    8  reserve_blocks_per_group (§5.8)
-392   …   zero
+392   48  keys: Pointer          reserved: the keyring block (kind 6) holding every wrapped key
+440   …   zero
 ```
 
 Mount: read both slots; a slot is valid iff its hash matches, `magic`/`version` do, and
@@ -240,6 +252,35 @@ over it; mount read-only-empty and report), **`Unformatted`** only if both slots
 or carry a foreign magic. The kernel formats a disk only when it is `Unformatted`, and the
 shell gains an explicit `format` built-in for the other case. A torn superblock write fails
 its own hash and is ignored, which is the whole recovery story.
+
+FS-1a pins what the table leaves open (`kernel::sfs::superblock`, all checked at mount — a
+slot that breaks one is invalid, and still "carries the magic"):
+
+- `fs_uuid (dup)` is the header's 16-byte uuid followed by 16 zero bytes; header `kind` = 1,
+  `tree_id` = 0, header `gen` = superblock `gen` ≥ 1; `total_blocks` ≥ 128; `free` non-null and
+  every tree pointer null or inside `[2, total_blocks)` with a `gen` in `1..=gen`; reserve ≤ one
+  group; bytes `[392, 4096)` zero. Generation `g` is written to slot `g % 2` (format writes
+  generation 1 to slot 1), so on a healthy disk `slot = gen % 2` always. Two valid slots with
+  the **same** generation (which the writer never produces) resolve to slot `gen % 2`, the
+  one the writer would have used. `next_obj` and `committed_at` are **not** validated at
+  mount (`committed_at` is per boot and informational; `next_obj` is FS-2's to police).
+- **`kdf_params` and `keys` must be zero in v2** until the identity spec defines them: a
+  non-zero byte is refused, so a kernel that cannot unwrap a key never mounts an encrypted tree
+  as plaintext. Their layout is reserved now (named constants in `kernel::sfs::superblock`,
+  still validated as zero): the KDF parameters are exactly the 32 bytes at `[352, 384)`,
+  `alg u16 | ver u16 | m_kib u32 | t u32 | p u32 | salt [16]`. Wrapped keys do **not** fit
+  there (an AEAD-wrapped 256-bit key alone is ≥ 48 bytes) and do **not** go into the zero tail
+  either — key material past byte 512 would break the first-sector torn-write argument below.
+  They live in a copy-on-write **keyring** metadata block (new kind 6: the tree key, the
+  KeyAgent key, later recovery and per-user slots), named by the `keys: Pointer` reserved at
+  `[392, 440)` — null in v2, so v2's zero-tail check is unchanged. Superblock content stays
+  below byte 512.
+- Every field — the reserved `keys` pointer included — ends by offset 440, inside the
+  block's **first 512-byte sector**; sectors 1–7 are zero. Format zeroes both slots (and flushes) before it writes anything else, and a commit
+  only ever overwrites an older superblock, so a torn superblock write leaves either the old
+  first sector or the new one — it can make a slot stale, never `Corrupt`. The host crash
+  matrix checks exactly this (format: `Unformatted` or generation 1; commit: the previous or
+  the new generation).
 
 ### 7.2 Tree nodes (kind 2) — a CoW B+tree
 
@@ -283,13 +324,20 @@ data that is also a file. `put_blob` from a non-root caller does not distinguish
 miss in its result or (as far as the design can make it) its timing: the store path always
 runs the same steps and the refcount bump is per domain (FS-4, §12).
 
+FS-1a pins the encoding (A12, `kernel::sfs::key`): the domain is a `u16` — `0` = `Public`,
+`n ≥ 1` = `User(n)` — and `obj`/`off` take the domain and hash bytes **big-endian**, so the
+numeric key order is domain-major, then hash-lexicographic. The 17-byte key itself is packed
+little-endian at fixed offsets (§4, A10).
+
 ### 7.4 Allocation — per-group bitmaps, one index level
 
-The image is divided into **allocation groups** of 32 768 blocks (128 MiB). Each group has
-one bitmap block (kind 3): 4 KiB = 32 768 bits. The `free` Pointer names **one** index block
-(kind 5) of group Pointers: 85 groups ≈ 10 GiB. Larger devices are refused at mount with
-`TooLarge` — a second level is a format-version bump, not a v1 feature (the dev image is
-4 096 blocks, an eighth of one group). Bitmaps are CoW like everything else. Allocation
+The image is divided into **allocation groups** of 32 256 blocks (≈126 MiB). Each group has
+one bitmap block (kind 3): the 4032 bytes after its 64-byte header = 32 256 bits. The `free`
+Pointer names **one** index block (kind 5) of group Pointers: (4096 − 64) / 48 = **84 groups**
+≈ 10.3 GiB. (FS-1a corrected the first draft's 32 768 bits / 85 groups, which forgot the
+header every metadata block carries.) Larger devices are refused at mount with
+`TooLarge` — a second level is a format-version bump, not a v1 feature (the dev image's
+SentinelFS window is 3 840 blocks, an eighth of one group, §11). Bitmaps are CoW like everything else. Allocation
 policy is **deterministic given committed state**: first-fit within the group of the
 object's last extent, else the group with the most free blocks by the *committed* counts
 (ties to the lowest index) — never a function of what is cached. Extents prefer runs of ≥ 8
@@ -299,6 +347,29 @@ retained snapshot references them. Each group keeps `RESERVE = 64` blocks that o
 reclaim commits may use (principle 8). Snapshot deletion walks the snapshot's exclusive
 extents incrementally: at most `RECLAIM_PER_COMMIT = 256` blocks freed per commit, counted
 and asserted in the boot line (FS-4).
+
+FS-1a format rules (`kernel::blk::allocator`, checked at mount; a break is `Corrupt`): bit
+`i` of a group is bit `i % 8` — **least significant first** — of byte `i / 8` of the bitmap
+payload, set = in use; a group's bitmap lives **inside its own group** and the index **in
+group 0**; group 0's bitmap marks both superblock slots and the index; bits past the end of a partial last group are
+**set** (padding is never free); index entries past the last group, and the rest of the block,
+are zero; every free-space pointer's block is ≥ 2 and its `gen` is in `1..=` the superblock's,
+equal to the target header's. The reserve exactly: `Normal` allocations leave `reserve` free
+blocks in every group, plus two in group 0 for the commit's own index and group-0 bitmap
+copies; `Reclaim` allocations may use the reserve but never a group's last block (the next
+transaction's copy of that group's bitmap needs it); the allocator's own copy-on-write may
+borrow from the reserve because it is net-zero across a commit (the commit that writes the
+new copy frees the old). Frees are deferred: a freed block stays set until the seal of the
+commit that frees it, and nothing allocates between that seal and the commit's end.
+
+**Deferred frees are bounded.** One transaction may defer at most `PENDING_MAX = 512` frees,
+and its own copy-on-write and seal take a few of those slots (one per copied bitmap, plus the
+old index and group 0's bitmap), so about 509 caller frees fit; past that a free is refused
+with `NeedCommit`. A remove larger than that cannot be one transaction, so to keep "metadata
+operations are always atomic" for large removes **FS-2 needs a persistent orphan / reclaim
+list**: the remove commits the unlink and records the object as an orphan in one transaction,
+and reclaim frees its blocks across later commits (the same bounded-reclaim shape FS-4 uses
+for snapshot deletion).
 
 ### 7.5 Snapshots
 
@@ -349,8 +420,8 @@ old design rewrote up to 64 KiB (128 sectors) for a one-byte change and had no u
 ## 9. Integration with the component model
 
 - **Storage is a native service behind a capability.** `cap::Target::Storage` carries an
-  attenuation lattice with a decidable `⊑` (Kani, FS-1a: a delegate never amplifies; whatever
-  a child grants, its parent grants):
+  attenuation lattice with a decidable `⊑` (Kani, FS-1c — after component PR-2 lands
+  `kernel::cap`: a delegate never amplifies; whatever a child grants, its parent grants):
   `{ tree: Live | SnapshotRo(name), prefix: path *components* (never a byte prefix — `/app/foo`
   must not grant `/app/foobar`), blobs: None | Domain(d) | RefSet(hashes) (never List), ops ⊆
   {Read, Write, Snapshot, Rollback, Format}, quota { bytes, inodes, blob_bytes }, expires:
@@ -358,8 +429,8 @@ old design rewrote up to 64 KiB (128 sectors) for a one-byte change and had no u
   resurrects revoked capabilities, removed components and pruned findings. Denials are
   logged (component amendment A8). The shell and Files app are first-party and hold the root
   cap; no non-first-party component runs before the memory gate (component §16), so the
-  enforcement can land with FS-4 — the on-disk fields it needs (domains, `dirent_key`) cannot
-  wait and are in FS-1a.
+  enforcement can land with FS-4 and the type with FS-1c — the on-disk fields it needs
+  (domains, `dirent_key`) cannot wait and are in FS-1a.
 - **Components live in the `Public` blob domain** keyed by `ComponentId`; `Manifest.code`
   becomes "the blob with this hash", and instantiation is `get_blob` + the existing verify
   (which now cannot fail unless the disk lies — and then the FS said so first).
@@ -410,12 +481,72 @@ FS-1 splits in two, and attestation waits for the identity spec.
 
 | PR | Lands | Boot-proof line (asserted) |
 |---|---|---|
-| **FS-1a** block layer + superblocks | `kernel::blk` (`BlockDevice` with multi-block I/O + `flush`, `AtaDevice`, `MemDevice` with crash-index / torn-sector / unflushed-subset hooks, verified reads, the 64-block slab, group bitmaps + one-level index, reserve), superblock format/mount/`Corrupt`-vs-`Unformatted`, the `sfs-commit` task, storage-cap lattice type with `⊑`. Kani: superblock selection over decoded `(valid, gen)` candidates; 64-bit bitmap ops; extent arithmetic; header decode totality; `⊑` never amplifies. Host: adversarial mount corpus (deterministic, fuzz-shaped, lifts into the lane unchanged). | `[sfs] mount: gen=N slot=S sb=<8 hex> verified=yes groups=1 free=N/N reserve=64 ok` |
+| **FS-1a** block layer + superblocks | `kernel::blk` (`BlockDevice` with multi-block I/O + `flush`, `AtaDevice`, `MemDevice` with crash-index / torn-sector / unflushed-subset hooks, verified reads, the 64-block slab, group bitmaps + one-level index, reserve), superblock format/mount/`Corrupt`-vs-`Unformatted` with the A12 fields, the `sfs-commit` task. Kani: superblock selection over decoded `(valid, gen)` candidates; 64-bit bitmap ops; extent arithmetic; header decode totality. Host: adversarial mount corpus (deterministic, fuzz-shaped, lifts into the lane unchanged). | `[sfs] mount: gen=N slot=S sb=<8 hex> verified=yes groups=1 free=N/N reserve=64 ok` (shape exact, `slot = gen % 2`) then `[sfs] commit: gen=N+1 slot=1-S sb=<8 hex> blocks=B flushes=2 ok` |
 | **FS-1b** tree + transactions + durability | CoW B+tree (`Node<CAP>` algebra + 4 KiB encoding), items, transactions with the ≤ 13-block bound, scrub; `hal::ata` API split: `write_sectors` unflushed + public `flush()` (**row A2 text amended**, new §4 invariant naming the command-serialising lock, and the pre-existing `issue_command(CMD_FLUSH)`-without-`wait_not_busy` fixed). Kani: `Node<4>` split/merge (sorted, occupancy, key-set preservation, separators); leaf packing totality over a shrunken block. Host: crash-point property test (shadow map advanced at commit; write-index × torn-sector × unflushed-subset; seeded PRNG, delta-debugging shrinker, 20 seeds < 30 s); order-independence and replay-determinism tests (principle 4, 7); counting-allocator cap on a 1 GiB `MemDevice`. QEMU: **torn-commit** — xtask runs QEMU with `cache=writeback`, the kernel halts after the k-th block write of a commit under a boot flag, xtask SIGKILLs and reboots; the next boot must mount `gen-1` intact. | `[sfs] torn-commit: cut-after=K recovered-gen=N-1 data-intact=yes ok` and `[sfs] scrub: blocks=N hashed=N bad=0 ok` |
+| **FS-1c** storage-cap lattice | Split out of FS-1a (Veeti, 2026-10-03): the storage-cap lattice type + `⊑` + Kani "never amplifies", on top of component PR-2's `kernel::cap` (`cap::Target::Storage`, §9, A13). Lands after PR-2; enforcement and denial logging stay in FS-4. | — (a type and its proofs; the enforcement line is FS-4's) |
 | **FS-2** files + facade | `INODE`/`DIRENT` (re-chaining delete, Kani)/`INLINE`/`EXTENT`; `kernel::fs` facade with the §3 API changes; `stat`; old serialiser deleted; `Corrupt`/`NoSpace`/`Io`/`ReadOnly`. Fuzz lane lands here at the latest (own workspace like `xtask`, so `kernel/Cargo.lock` stays at 6 packages). | existing `[fs] persistence … ok` line (adapted), plus `[sfs] full-disk: filled=yes delete=ok ok` |
 | **FS-4** blobs + snapshots + caps | domains, `put_blob`/`get_blob` with per-domain refcounts and hit/miss-indistinguishable path, `BLOB_REF` extents, snapshots (`MAX_SNAPSHOTS`), rollback as a logged privileged op, bounded reclaim, storage-cap enforcement + denial logging; the host loads `hello` from the `Public` domain by `ComponentId`. | `[sfs] cas: put=2 stored=1 dedup=yes component-from-cas=verified snapshot=ok rollback=ok logged=yes reclaim<=256 ok` |
 | *(identity spec, then component PR-3 with a persistent key)* | | |
 | **FS-5** attestation | superblock hash signed by the KeyAgent into the IntegrityLog with `signing_key_id`, `prev_record_hash`, `anchor`; mount policy on mismatch (§12); `sentinel-core` filesystem vector. | `[sfs] attest: sb=<8 hex> logged=yes signed=yes verified=yes anchor=none ok` |
+
+**FS-1a as built (2026-10-03).**
+
+- *Coexistence with the old `kernel::fs`.* The toy FS owns the IDE disk from LBA 0 (its
+  `SNTLFS01` sector plus ≤ 128 payload sectors) until FS-2 deletes its serialiser, so
+  `AtaDevice` is a **block window** `{ base_lba, blocks }` and SentinelFS lives from LBA 2048
+  (1 MiB) to the end of the disk — 3 840 blocks, one group, on the 16 MiB dev image. Zero
+  `hal` delta, no xtask disk change; "blocks 0 and 1" (§7.1) are blocks 0 and 1 of the
+  window. FS-2 moves the window to LBA 0 when the old serialiser goes (a dev image: no
+  migration — the old sector reads as foreign, so the disk is `Unformatted` and formatted).
+  Both users of the channel take one kernel-side lock per `hal::ata` command, waiting by
+  yielding, because `hal::ata` relies on its callers never interleaving commands:
+  `kernel::blk::ata` wraps `identify`/`read_sectors`/`write_sectors` with it and is the only
+  kernel file allowed to name `hal::ata` (`cargo xtask check-ata-callers`, a CI step).
+- *Boot.* A fresh image is `Unformatted` → formatted → mounted at generation 1 in slot 1.
+  Every boot then mounts what is there (never formatting over the magic) and asks the
+  `sfs-commit` task for one empty commit, so the slot alternates on every boot. xtask asserts
+  the mount line's exact shape plus `slot = gen % 2`, and that the commit line is generation
+  `N + 1` in the other slot with `blocks=1 flushes=2` over the image's 3 840 blocks. The boot
+  tests own their disk: `make test` / `make test-kvm` (and `boot-timing`) recreate
+  `target/sentinelos-test-disk.img` at the start of every run (`SENTINELOS_KEEP_TEST_DISK=1`
+  keeps it for local multi-boot work; `make run`'s dev image is never touched) and boot
+  **twice**, asserting every boot line on both boots and the chain between them: boot 1
+  `format: … (was unformatted)`, `mount: gen=1 slot=1`, `commit: gen=2 slot=0`; boot 2
+  `mount: gen=2 slot=0 sb=<boot 1's commit sb>`, `commit: gen=3 slot=1`; and the old toy FS's
+  `first boot` line on boot 1 and `persistence PROVEN` on boot 2. CI caches no disk image: each
+  job's last step deletes both images before the cache's post-job save (a `!` exclusion cannot
+  reach a file inside the cached `kernel/target` directory).
+- *`flush` on today's ATA.* `hal::ata::write_sectors` already ends every command with
+  `FLUSH CACHE`, and `hal` has no separate flush, so every `AtaDevice` write is as durable as
+  `hal` makes it when it returns and `AtaDevice::flush` is a no-op that returns `Ok`. The §8
+  protocol still issues it where it belongs, so FS-1b's API split changes nothing above
+  `blk::ata`. The A2 weakness (FLUSH issued without waiting for BSY) is unchanged until then.
+- *The task.* `sfs-commit` is pinned to the BSP with a **64 KiB** stack
+  (`sched::spawn_on_with_stack`, added for it): in the dev profile every temporary keeps its
+  own stack slot, and the mount path measured ~14 KiB deep — a 16 KiB stack overflowed into
+  its guard page at boot (a double fault, before the frames were trimmed). It opens the device
+  itself and keeps it on its own stack, so no other thread can reach it. The `Sfs` lock is
+  taken with preemption disabled for bounded in-memory work only; a commit is sealed under it,
+  written with it released, and published under it again. From the boot proof on, the task
+  stays runnable on the BSP (it polls for requests and the pacing deadline each time it is
+  scheduled): nothing after it in `kmain` may wait for the BSP's ready queue to drain.
+- *Failures go read-only.* A commit whose I/O fails, or whose seal needs a committed block
+  that cannot be read back intact (an I/O error, or a block that no longer matches its
+  pointer's hash), leaves the volume read-only and the task stops committing — it does not
+  re-read the bad block every `COMMIT_INTERVAL`. The previous generation stays intact on disk.
+- *`Corrupt` at boot (a deviation from §7.1 / A9).* §7.1 has a `Corrupt` disk mount
+  read-only-empty and report. FS-1a's task reports
+  (`[sfs] mount: corrupt (<damage>; never formatted over) FAIL`) and exits, leaving both slots
+  untouched; the read-only-empty mount and the shell's explicit `format` arrive with FS-2's
+  facade, the first code that could use them.
+- *A23's counting allocator.* A process-wide counting `#[global_allocator]` needs an
+  `unsafe impl GlobalAlloc`, which the kernel crate forbids. FS-1a asserts the property
+  instead: every FS structure is a fixed-size heap block built at mount (the slab, the
+  allocator tables, the commit plan, the caller's workspace — nothing grows, nothing is sized
+  by the device), and the host test shows the footprint is identical for the 16 MiB window
+  and a 1 GiB device (≤ 300 KiB) and unchanged across 40 commits. A true counting allocator
+  (which would also catch a stray temporary) needs a test-only crate outside the forbid
+  boundary; it moves to FS-1b (A23, A31).
 
 Every PR: the entire FS runs on `MemDevice` on the host — this is where the real coverage
 is; Miri on `sfs::codec` and `blk` (scoped step; honest value on a `forbid(unsafe_code)`
@@ -473,8 +604,9 @@ answer, and the shell says so.
 | Memory | whole tree on heap | one 256 KiB slab, dirty ≤ 48 of its 64 blocks | same, larger slab when the heap grows |
 | Crash | data loss to seed | previous generation | same |
 
-The hash cost per block is reported as a deterministic `hashed=N` counter in the scrub and
-commit lines (never a wall-clock gate on a shared CI runner); throughput is recorded
+The hash cost is reported as deterministic counters, never as a wall-clock gate on a shared
+CI runner: the commit line's `blocks=B` (§11 — every block a commit writes is hashed exactly
+once, when it is sealed) and `hashed=N` in FS-1b's scrub line; throughput is recorded
 non-gating for three runs before any floor is considered. PIO is the transport bottleneck:
 every sector is 256 `outw`/`inw` with status polling. The format never asks PIO for more than
 it must, but throughput stays CPU-bound until DMA. The DMA spec will add `hal::pci`
@@ -486,8 +618,12 @@ the shape it needs.
 ## 14. Open questions
 
 1. **Hash primitive per block.** SHA-256 in-tree costs ~5 µs per 4 KiB block scalar; fine on
-   PIO, dominant on DMA. BLAKE3 (dependency) or a hardware-SHA tier (`sha_ni`, a `hal::simd`
-   sibling) later — behind `kernel::hash::Hasher` so the format does not change.
+   PIO, dominant on DMA. A hardware SHA-256 tier (`sha_ni`, a `hal::simd` sibling) changes
+   nothing on disk. A different primitive (BLAKE3, a dependency) **is** a format change —
+   every stored hash differs — and v2 has no field naming the algorithm, so it needs a future
+   `hash_alg` field (a reserved superblock field read as `0 = SHA-256`, or a version bump);
+   `kernel::hash::Hasher` keeps the code agile, not the format (corrected in the FS-1a review,
+   A29).
 2. **Rollback protection** (§12): TPM NV vs paired device. Decide with the identity spec;
    the `anchor` field is reserved.
 3. **KDF memory** (§10): Argon2id's ≥ 19 MiB vs the 4 MiB heap — arena from the frame
@@ -530,7 +666,7 @@ where they set conditions, the PR that owns them is named.
 | A10 | §4 | `Key` had no parse/alignment rule. 17 bytes packed LE at fixed offsets. | applied |
 | A11 | §6 | `read(BlockNo, &mut Block)` would cap future DMA. `read_blocks`/`write_blocks` + `flush`. | applied |
 | A12 | §7.3/§9/§10 | On-disk fields that cannot be added later: blob **domains** (dedup never spans users; `Public` vs `User(n)`), `dirent_key`, KDF-params + wrap slot inside the signed superblock, metadata reserve. | applied (FS-1a) |
-| A13 | §9 | Storage attenuation must be a lattice with decidable `⊑`: path *components*, `blobs` never `List`, `Snapshot`/`Rollback` distinct from `Write`, quotas, expiry; Kani "never amplifies". | applied (type + Kani in FS-1a; enforcement FS-4) |
+| A13 | §9 | Storage attenuation must be a lattice with decidable `⊑`: path *components*, `blobs` never `List`, `Snapshot`/`Rollback` distinct from `Write`, quotas, expiry; Kani "never amplifies". | type + Kani in FS-1c (after component PR-2); enforcement FS-4 |
 | A14 | §9/§12 | Attestation record = superblock hash, framed with `signing_key_id`, `prev_record_hash`, `anchor`; mismatch has three cases; response is read-only + finding + PolicyAgent consent + KeyAgent refusal; vector `Unavailable` under an ephemeral key. | applied |
 | A15 | §10 | Encrypt dirent names and xattr values (leaf payload, no shape change); per-object keys for crypto-shred; residual leak stated; cache zeroize. | applied |
 | A16 | §8/§11 | "Every prefix" is the wrong durability model. Unflushed-subset model in `MemDevice`; shadow map advanced at commit; torn variants at sector granularity for blocks 0/1; seeded PRNG + shrinker; 20 seeds < 30 s. | applied |
@@ -540,8 +676,27 @@ where they set conditions, the PR that owns them is named.
 | A20 | §11 | Fuzz lane: not a gate for FS-1 (first-party, `forbid(unsafe_code)`, DoS not UB) but required by FS-2, in its own workspace; one kind-selected parser target + one whole-image mount/scrub/list/read target. | FS-2 |
 | A21 | §11 | Race model: threaded host model of the cache / `sfs-commit` hand-off — the gap the component review (A7 there) already named. | FS-1b |
 | A22 | §10 | Argon2id at ≥ 19 MiB does not fit the 4 MiB heap under an infallible allocator. | identity spec |
-| A23 | §11 | Counting allocator for the heap-cap test; asserted `reclaim<=N` and `hashed=N` counters; adversarial mount corpus as an FS-1a deliverable. | FS-1a/1b/4 |
+| A23 | §11 | Counting allocator for the heap-cap test; asserted `reclaim<=N` and `hashed=N` counters; adversarial mount corpus as an FS-1a deliverable. | corpus: FS-1a (done); counting allocator: FS-1b (A31); counters: FS-1b/4 |
 | A24 | — | `docs/security/` still does not exist (component A10). | component PR-2 |
+
+**FS-1a code review, round 1 (2026-10-03): follow-ups, each owned.** Fixed in the round
+itself: CI's cached disk image (the boot tests now own and recreate theirs), a scheduler reap
+that could spin on the heap lock with interrupts off, read-only on a failed miss, an
+`alloc_run` refusal that changed state, the first-fit Kani proof, and the ATA channel lock
+being enforceable only by convention. Recorded above: the slot tie rule, LSB-first bitmaps,
+the `tree_id` values, `Pointer::NULL`, the unvalidated fields, the KDF / keyring layout, the
+deferred-free bound, and the `Corrupt`-at-boot deviation (§11; deviation 8 of the FS-1a
+report). Still open:
+
+| # | Where | Finding | Owner |
+|---|---|---|---|
+| A25 | §6/§8 | `sfs-commit` waits by yield-polling (it stays runnable on the BSP forever). `sched` needs park/unpark with a wake permit and an optional mono-tick deadline, designed together with component PR-2's blocking bus receive, replacing the poll. | sched, before FS-2 |
+| A26 | §7.1/§10 | The format seed — `fs_uuid` and `dirent_key` — comes from the tick counters: low entropy. It needs a real entropy source before anything writes dirents, since `dirent_key` exists to defeat precomputed collision floods. | before FS-2 |
+| A27 | §7.1/§12 | Mount never falls back to the older slot: if the newer valid superblock's tree turns out damaged, the volume is `Corrupt` though the previous generation may be intact. Decide the fallback policy (and how it interacts with rollback protection). | FS-1b / FS-5 |
+| A28 | §7.3 | The blob key carries 112 bits of the hash (6 bytes in `obj`, 8 in `off`): two blobs in one domain can share a key with different full hashes. FS-4 must chain such collisions or refuse the second blob — never treat an equal key as an equal blob. | FS-4 |
+| A29 | §14.1 | Hash agility was claimed for free ("behind `Hasher`, the format does not change"); a new primitive needs a `hash_alg` field. Claim corrected in §14.1. | whoever changes the hash (a format change) |
+| A30 | §8/§13 | Hashing runs under the `Sfs` lock (seal, verified inserts) with preemption off. Measure the worst case per commit and per mutating operation, and move hashing out from under the lock if it is not small. | FS-1b |
+| A31 | §11 | The real counting allocator for the heap-cap test (A23): a test-support crate outside the `forbid(unsafe_code)` boundary. | FS-1b |
 
 **Minds change on.** Architect: FS-1b's torn-commit harness not drivable without the facade
 (then FS-2 moves up); shell files mostly > 1 KiB (then inline grows). Reviewer: a proven

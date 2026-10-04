@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         Some("test") => do_test(),
         Some("test-kvm") => do_test_kvm(),
         Some("check-no-vector") => do_check_no_vector(),
+        Some("check-ata-callers") => do_check_ata_callers(),
         Some("check-component-imports") => do_check_component_imports(),
         Some("screenshot") => do_screenshot(),
         Some("boot-timing") => {
@@ -54,7 +55,7 @@ fn main() -> ExitCode {
         other => {
             eprintln!(
                 "Usage: cargo xtask <build|run|test|test-kvm|check-no-vector|\
-                 check-component-imports|screenshot|boot-timing [runs]>\n\
+                 check-ata-callers|check-component-imports|screenshot|boot-timing [runs]>\n\
                  Unknown subcommand: {:?}",
                 other
             );
@@ -98,8 +99,55 @@ fn disk_img_path() -> PathBuf {
     kr("target/sentinelos-disk.img")
 }
 
-/// Ensure a raw disk image exists, then return the QEMU args that attach it as a
-/// **persistent legacy ATA (ISA IDE) disk** the `hal::ata` driver can read/write.
+/// The boot tests' own disk image — never `make run`'s dev image. `make test`,
+/// `make test-kvm` and `boot-timing` delete and recreate it blank at the start
+/// of every run ([`prepare_test_disk`]), so no test depends on what an earlier
+/// kernel, an earlier run, or a CI cache left on a disk.
+fn test_disk_img_path() -> PathBuf {
+    kr("target/sentinelos-test-disk.img")
+}
+
+/// Set to `1` to keep the test disk between runs (local multi-boot work); the
+/// boot test then asserts the SentinelFS chain relative to whatever is on it.
+const KEEP_TEST_DISK_ENV: &str = "SENTINELOS_KEEP_TEST_DISK";
+
+/// Create `img` as a zero-filled sparse image of [`DISK_IMG_BYTES`] (replacing
+/// any file already there).
+fn create_blank_disk(img: &Path) -> std::io::Result<()> {
+    if let Some(parent) = img.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_file(img);
+    fs::File::create(img)?.set_len(DISK_IMG_BYTES)
+}
+
+/// Recreate the test disk blank — unless [`KEEP_TEST_DISK_ENV`] is `1` and the
+/// disk exists, in which case it is kept. Returns whether the disk is blank.
+fn prepare_test_disk() -> Result<bool, String> {
+    let img = test_disk_img_path();
+    let keep = std::env::var(KEEP_TEST_DISK_ENV).is_ok_and(|v| v == "1");
+    if keep && img.exists() {
+        println!(
+            "{KEEP_TEST_DISK_ENV}=1: keeping the test disk {} (the SentinelFS chain is \
+             asserted relative to it)",
+            img.display()
+        );
+        return Ok(false);
+    }
+    create_blank_disk(&img)
+        .map_err(|e| format!("could not create the test disk {}: {e}", img.display()))?;
+    println!(
+        "Created a blank test disk: {} ({} MiB)",
+        img.display(),
+        DISK_IMG_BYTES / (1024 * 1024)
+    );
+    Ok(true)
+}
+
+/// Ensure the **dev** disk image exists (`make run`, `make screenshot`; never
+/// the boot tests, see [`test_disk_img_path`]), then return the QEMU args that
+/// attach it ([`ide_disk_args`]). Created only if missing, so data written by a
+/// previous boot survives.
 ///
 /// On the **q35** machine the onboard `if=ide` storage is an AHCI/SATA controller
 /// that does **not** answer the legacy command-block ports (`0x1F0..=0x1F7`) the
@@ -136,6 +184,13 @@ fn disk_args() -> Vec<String> {
     } else {
         println!("Using existing disk image: {}", img.display());
     }
+    ide_disk_args(&img)
+}
+
+/// QEMU arguments attaching `img` as the primary master of a legacy ISA IDE
+/// controller (the ports `hal::ata` drives; see [`disk_args`] for why q35's
+/// own IDE does not do).
+fn ide_disk_args(img: &Path) -> Vec<String> {
     vec![
         "-drive".into(),
         format!("if=none,id=sosdisk,file={},format=raw", img.display()),
@@ -448,6 +503,237 @@ const COMP_HELLO_REQUIRED: &[&str] = &[
     "runtime=native",
     "reply=ok",
 ];
+/// SentinelFS FS-1a (`docs/specs/2026-09-18-sentinelfs-design.md` §11): the
+/// `sfs-commit` task mounted the SentinelFS window of the IDE disk (formatting
+/// it first only on a blank image), every block it read verified, and the line
+/// has exactly the shape
+/// `[sfs] mount: gen=N slot=S sb=<8 hex> verified=yes groups=1 free=N/N reserve=64 ok`
+/// ([`parse_sfs_mount`]). The writer puts generation `g` in slot `g % 2`, so
+/// `slot == gen % 2` holds on every boot of a healthy image.
+const SFS_MOUNT_PREFIX: &str = "[sfs] mount: ";
+/// The empty commit that follows the mount: generation `N + 1` into the other
+/// slot, so the slot alternates on every boot
+/// (`[sfs] commit: gen=N+1 slot=1-S sb=<8 hex> blocks=B flushes=2 ok`).
+const SFS_COMMIT_PREFIX: &str = "[sfs] commit: ";
+
+/// A parsed `[sfs] mount:` / `[sfs] commit:` line's fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SfsLine {
+    gen: u64,
+    slot: u64,
+    /// The short superblock hash, as printed (8 lowercase hex digits).
+    sb: [u8; 8],
+    /// Mount lines: free / total blocks (0 on commit lines).
+    free: u64,
+    total: u64,
+    /// Commit lines: blocks written and flushes issued (0 on mount lines).
+    blocks: u64,
+    flushes: u64,
+}
+
+/// A decimal field: digits only, no sign, no empty string.
+fn sfs_dec(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Eight lowercase hex digits (the short superblock hash), as bytes.
+fn sfs_hex8(s: &str) -> Option<[u8; 8]> {
+    let b: [u8; 8] = s.as_bytes().try_into().ok()?;
+    b.iter()
+        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+        .then_some(b)
+}
+
+/// Parse exactly
+/// `[sfs] mount: gen=N slot=S sb=<8 hex> verified=yes groups=1 free=N/N reserve=64 ok`
+/// — every field, in order, nothing else. `None` for any other shape.
+fn parse_sfs_mount(line: &str) -> Option<SfsLine> {
+    let mut it = line.trim_end().strip_prefix(SFS_MOUNT_PREFIX)?.split(' ');
+    let gen = sfs_dec(it.next()?.strip_prefix("gen=")?)?;
+    let slot = sfs_dec(it.next()?.strip_prefix("slot=")?)?;
+    let sb = sfs_hex8(it.next()?.strip_prefix("sb=")?)?;
+    if it.next()? != "verified=yes" || it.next()? != "groups=1" {
+        return None;
+    }
+    let (free, total) = it.next()?.strip_prefix("free=")?.split_once('/')?;
+    let (free, total) = (sfs_dec(free)?, sfs_dec(total)?);
+    if it.next()? != "reserve=64" || it.next()? != "ok" || it.next().is_some() {
+        return None;
+    }
+    Some(SfsLine {
+        gen,
+        slot,
+        sb,
+        free,
+        total,
+        blocks: 0,
+        flushes: 0,
+    })
+}
+
+/// Parse exactly `[sfs] commit: gen=N slot=S sb=<8 hex> blocks=B flushes=F ok`.
+fn parse_sfs_commit(line: &str) -> Option<SfsLine> {
+    let mut it = line.trim_end().strip_prefix(SFS_COMMIT_PREFIX)?.split(' ');
+    let gen = sfs_dec(it.next()?.strip_prefix("gen=")?)?;
+    let slot = sfs_dec(it.next()?.strip_prefix("slot=")?)?;
+    let sb = sfs_hex8(it.next()?.strip_prefix("sb=")?)?;
+    let blocks = sfs_dec(it.next()?.strip_prefix("blocks=")?)?;
+    let flushes = sfs_dec(it.next()?.strip_prefix("flushes=")?)?;
+    if it.next()? != "ok" || it.next().is_some() {
+        return None;
+    }
+    Some(SfsLine {
+        gen,
+        slot,
+        sb,
+        free: 0,
+        total: 0,
+        blocks,
+        flushes,
+    })
+}
+
+/// Blocks in the SentinelFS window of the 16 MiB test disk: (32 768 − 2 048
+/// sectors) / 8 sectors per block.
+const SFS_TEST_TOTAL_BLOCKS: u64 = 3840;
+/// Printed only by a boot that formatted a blank (`Unformatted`) window:
+/// `[sfs] format: window lba=2048 blocks=3840 groups=1 gen=1 sb=<8 hex> (was unformatted)`.
+const SFS_FORMAT_PREFIX: &str = "[sfs] format: ";
+/// The toy `kernel::fs`'s line on a disk it has never written.
+const FS_FIRST_BOOT_PREFIX: &str = "[fs] persistence: first boot";
+/// The toy `kernel::fs`'s line once the previous boot's marker file survived.
+const FS_PROVEN_PREFIX: &str =
+    "[fs] persistence PROVEN: /persist-test.txt survived reboot -> \"persisted by SentinelOS at tick ";
+
+/// A parsed `[sfs] format:` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SfsFormat {
+    blocks: u64,
+    groups: u64,
+    sb: [u8; 8],
+}
+
+/// Parse exactly
+/// `[sfs] format: window lba=2048 blocks=B groups=G gen=1 sb=<8 hex> (was unformatted)`.
+fn parse_sfs_format(line: &str) -> Option<SfsFormat> {
+    let mut it = line.trim_end().strip_prefix(SFS_FORMAT_PREFIX)?.split(' ');
+    if it.next()? != "window" || it.next()? != "lba=2048" {
+        return None;
+    }
+    let blocks = sfs_dec(it.next()?.strip_prefix("blocks=")?)?;
+    let groups = sfs_dec(it.next()?.strip_prefix("groups=")?)?;
+    if it.next()? != "gen=1" {
+        return None;
+    }
+    let sb = sfs_hex8(it.next()?.strip_prefix("sb=")?)?;
+    if it.next()? != "(was" || it.next()? != "unformatted)" || it.next().is_some() {
+        return None;
+    }
+    Some(SfsFormat { blocks, groups, sb })
+}
+
+/// The persistence chain across the boot test's two boots on one disk: boot 2
+/// must mount exactly the generation, slot and superblock boot 1 committed
+/// (and never format), and the toy `kernel::fs` must prove its marker file
+/// survived. On a `fresh` (blank) disk the absolute values are pinned too:
+/// boot 1 formats (`(was unformatted)`, 3 840 blocks, one group) and mounts
+/// generation 1 in slot 1 with the superblock it wrote, then commits
+/// generation 2 into slot 0; boot 2 mounts generation 2 in slot 0 and commits
+/// generation 3 into slot 1; the toy FS reports its first boot on boot 1.
+/// Pure (two logs in, verdict out) so the unit tests can drive it. Returns a
+/// one-line summary.
+fn check_persistence_chain(boot1: &str, boot2: &str, fresh: bool) -> Result<String, String> {
+    fn find<'a>(log: &'a str, prefix: &str) -> Option<&'a str> {
+        log.lines().find(|l| l.starts_with(prefix)).map(str::trim_end)
+    }
+    fn text(sb: &[u8; 8]) -> String {
+        String::from_utf8_lossy(sb).into_owned()
+    }
+    let mount = |log: &str, boot: u32| {
+        find(log, SFS_MOUNT_PREFIX)
+            .and_then(parse_sfs_mount)
+            .ok_or_else(|| format!("boot {boot}: no well-formed `{SFS_MOUNT_PREFIX}…` line"))
+    };
+    let commit = |log: &str, boot: u32| {
+        find(log, SFS_COMMIT_PREFIX)
+            .and_then(parse_sfs_commit)
+            .ok_or_else(|| format!("boot {boot}: no well-formed `{SFS_COMMIT_PREFIX}…` line"))
+    };
+    let (m1, c1) = (mount(boot1, 1)?, commit(boot1, 1)?);
+    let (m2, c2) = (mount(boot2, 2)?, commit(boot2, 2)?);
+
+    if (m2.gen, m2.slot, m2.sb) != (c1.gen, c1.slot, c1.sb) {
+        return Err(format!(
+            "boot 2 did not mount what boot 1 committed: boot 1 committed gen={} slot={} sb={}, \
+             boot 2 mounted gen={} slot={} sb={}",
+            c1.gen,
+            c1.slot,
+            text(&c1.sb),
+            m2.gen,
+            m2.slot,
+            text(&m2.sb)
+        ));
+    }
+    if let Some(line) = find(boot2, SFS_FORMAT_PREFIX) {
+        return Err(format!(
+            "boot 2 formatted the disk again (boot 1's filesystem was not found): '{line}'"
+        ));
+    }
+    if fresh {
+        let format_line = find(boot1, SFS_FORMAT_PREFIX).unwrap_or("");
+        match parse_sfs_format(format_line) {
+            Some(f) if f.blocks == SFS_TEST_TOTAL_BLOCKS && f.groups == 1 && f.sb == m1.sb => {}
+            _ => {
+                return Err(format!(
+                    "boot 1 on a blank disk: expected `[sfs] format: window lba=2048 \
+                     blocks={SFS_TEST_TOTAL_BLOCKS} groups=1 gen=1 sb={} (was unformatted)` \
+                     (the superblock the mount then read): '{format_line}'",
+                    text(&m1.sb)
+                ))
+            }
+        }
+        let got = [
+            (m1.gen, m1.slot),
+            (c1.gen, c1.slot),
+            (m2.gen, m2.slot),
+            (c2.gen, c2.slot),
+        ];
+        if got != [(1, 1), (2, 0), (2, 0), (3, 1)] {
+            return Err(format!(
+                "on a blank disk expected (gen, slot): boot 1 mount (1, 1), commit (2, 0); \
+                 boot 2 mount (2, 0), commit (3, 1) — got {got:?}"
+            ));
+        }
+        if find(boot1, FS_FIRST_BOOT_PREFIX).is_none() {
+            return Err(format!(
+                "boot 1 on a blank disk: the toy FS did not report its first boot \
+                 (`{FS_FIRST_BOOT_PREFIX} …`)"
+            ));
+        }
+    }
+    let Some(proven) = find(boot2, FS_PROVEN_PREFIX) else {
+        return Err(format!(
+            "boot 2: the toy FS did not prove boot 1's marker survived (`{FS_PROVEN_PREFIX}…`)"
+        ));
+    };
+    Ok(format!(
+        "PERSISTENCE CHAIN PROVEN across two boots{}: SentinelFS boot 1 mounted gen={} slot={} \
+         and committed gen={} slot={} sb={}; boot 2 mounted exactly that and committed gen={} \
+         slot={}; toy FS: '{proven}'",
+        if fresh { " on a blank disk" } else { " (kept disk)" },
+        m1.gen,
+        m1.slot,
+        c1.gen,
+        c1.slot,
+        text(&c1.sb),
+        c2.gen,
+        c2.slot
+    ))
+}
+
 /// Component model PR-2 (`docs/specs/2026-09-18-component-model-design.md`
 /// §14): bus + capabilities on the kernel-wide host. `from` is kernel-stamped
 /// on every delivery, a component with no capability is denied by default,
@@ -850,6 +1136,283 @@ fn do_check_no_vector() -> ExitCode {
     }
 }
 
+/// The one kernel source file allowed to name `hal::ata` (relative to
+/// `kernel/`): `kernel::blk::ata` holds the IDE channel lock around every
+/// command, because two kernel paths (the toy `kernel::fs` and the
+/// `sfs-commit` task) share the disk and `hal::ata` must never see two
+/// commands interleave.
+const ATA_DOOR: &str = "crates/kernel/src/blk/ata.rs";
+
+/// Rust source with every comment (line, doc and nested block), string literal
+/// (plain, byte and raw) and char literal blanked to spaces — newlines kept, so
+/// line numbers survive. Lifetimes (`'a`) are code and stay.
+fn strip_comments_and_strings(src: &str) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let next = b.get(i + 1).copied();
+        let prev = if i > 0 { Some(b[i - 1]) } else { None };
+        if c == '/' && next == Some('/') {
+            while i < b.len() && b[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < b.len() {
+                if b[i] == '/' && b.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if b[i] == '*' && b.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(blank(b[i]));
+                    i += 1;
+                }
+            }
+        } else if c == 'r'
+            && matches!(next, Some('"' | '#'))
+            && (prev.is_none_or(|p| !ident(p))
+                || (prev == Some('b') && (i < 2 || !ident(b[i - 2]))))
+        {
+            // A raw string `r"…"` / `r#"…"#` (or `br…`); `r#ident` is code.
+            let mut j = i + 1;
+            while b.get(j) == Some(&'#') {
+                j += 1;
+            }
+            let hashes = j - i - 1;
+            if b.get(j) != Some(&'"') {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            let mut k = j + 1;
+            let end = loop {
+                if k >= b.len() {
+                    break b.len();
+                }
+                if b[k] == '"' && (1..=hashes).all(|h| b.get(k + h) == Some(&'#')) {
+                    break k + 1 + hashes;
+                }
+                k += 1;
+            };
+            while i < end {
+                out.push(blank(b[i]));
+                i += 1;
+            }
+        } else if c == '"' {
+            out.push(' ');
+            i += 1;
+            while i < b.len() {
+                if b[i] == '\\' {
+                    out.push(' ');
+                    i += 1;
+                    if i < b.len() {
+                        out.push(blank(b[i]));
+                        i += 1;
+                    }
+                    continue;
+                }
+                let done = b[i] == '"';
+                out.push(blank(b[i]));
+                i += 1;
+                if done {
+                    break;
+                }
+            }
+        } else if c == '\'' && next == Some('\\') {
+            // An escaped char literal: '\n', '\\', '\'', '\u{…}'.
+            out.push_str("   ");
+            i += 3;
+            while i < b.len() && b[i] != '\'' {
+                out.push(blank(b[i]));
+                i += 1;
+            }
+            if i < b.len() {
+                out.push(' ');
+                i += 1;
+            }
+        } else if c == '\'' && b.get(i + 2) == Some(&'\'') {
+            // A plain char literal 'x'.
+            out.push_str("   ");
+            i += 3;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Lines (1-based) where `src`'s code — comments and literals excluded — names
+/// `hal::ata`: as a path (`hal::ata::read_sectors`, `use hal::ata;`,
+/// `hal :: ata`) or as a member of a `use hal::{…}` group. A guard against
+/// accident, not against a deliberate alias (`use hal as h;`), which review
+/// catches.
+fn find_ata_references(src: &str) -> Vec<usize> {
+    #[derive(PartialEq)]
+    enum Tok {
+        Ident(String),
+        PathSep,
+        Open,
+        Close,
+        Comma,
+        Other,
+    }
+    let code = strip_comments_and_strings(src);
+    let chars: Vec<char> = code.chars().collect();
+    let mut toks: Vec<(usize, Tok)> = Vec::new();
+    let mut line = 1;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\n' {
+            line += 1;
+            i += 1;
+        } else if c.is_whitespace() {
+            i += 1;
+        } else if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            toks.push((line, Tok::Ident(chars[start..i].iter().collect())));
+        } else if c == ':' && chars.get(i + 1) == Some(&':') {
+            toks.push((line, Tok::PathSep));
+            i += 2;
+        } else {
+            let t = match c {
+                '{' => Tok::Open,
+                '}' => Tok::Close,
+                ',' => Tok::Comma,
+                _ => Tok::Other,
+            };
+            toks.push((line, t));
+            i += 1;
+        }
+    }
+    let is_ident = |t: Option<&(usize, Tok)>, name: &str| {
+        matches!(t, Some((_, Tok::Ident(s))) if s == name)
+    };
+    let mut lines = Vec::new();
+    for i in 0..toks.len() {
+        if !is_ident(toks.get(i), "hal") || toks.get(i + 1).map(|t| &t.1) != Some(&Tok::PathSep) {
+            continue;
+        }
+        if is_ident(toks.get(i + 2), "ata") {
+            lines.push(toks[i].0);
+        } else if toks.get(i + 2).map(|t| &t.1) == Some(&Tok::Open) {
+            // `use hal::{…}`: `ata` as a member at the group's top level.
+            let mut depth = 0usize;
+            for j in i + 2..toks.len() {
+                match &toks[j].1 {
+                    Tok::Open => depth += 1,
+                    Tok::Close => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Tok::Ident(s)
+                        if s == "ata"
+                            && depth == 1
+                            && matches!(toks[j - 1].1, Tok::Open | Tok::Comma) =>
+                    {
+                        lines.push(toks[j].0)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    lines.dedup();
+    lines
+}
+
+/// Every `.rs` file under `dir`, recursively (directory order).
+fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            rust_files(&path, out)?;
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// `make check-ata-callers`: fail if any kernel source outside [`ATA_DOOR`]
+/// (and outside `hal`, which defines the module) names `hal::ata` in code, so
+/// the channel lock cannot be bypassed by accident. Also fails if the door
+/// itself stops naming it — then this guard would be checking the wrong file.
+fn do_check_ata_callers() -> ExitCode {
+    let root = kernel_root();
+    let mut files = Vec::new();
+    if let Err(e) = rust_files(&root.join("crates"), &mut files) {
+        eprintln!("check-ata-callers: could not list kernel sources: {e}");
+        return ExitCode::FAILURE;
+    }
+    files.sort();
+    let hal = root.join("crates/hal");
+    let door = root.join(ATA_DOOR);
+    let mut scanned = 0;
+    let mut door_refs = 0;
+    let mut violations = Vec::new();
+    for f in files.iter().filter(|f| !f.starts_with(&hal)) {
+        let src = match fs::read_to_string(f) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("check-ata-callers: could not read {}: {e}", f.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        scanned += 1;
+        let lines = find_ata_references(&src);
+        if *f == door {
+            door_refs = lines.len();
+            continue;
+        }
+        let rel = f.strip_prefix(&root).unwrap_or(f).display().to_string();
+        violations.extend(lines.into_iter().map(|l| format!("{rel}:{l}")));
+    }
+    if door_refs == 0 {
+        eprintln!(
+            "check-ata-callers FAILED: {ATA_DOOR} no longer names hal::ata — the channel lock \
+             moved, so this guard is checking the wrong file. Update ATA_DOOR."
+        );
+        return ExitCode::FAILURE;
+    }
+    if violations.is_empty() {
+        println!(
+            "check-ata-callers PASSED: {scanned} kernel source files scanned; only {ATA_DOOR} \
+             names hal::ata ({door_refs} line(s)), so every ATA command holds the channel lock."
+        );
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "check-ata-callers FAILED: hal::ata named outside {ATA_DOOR}. Call \
+             kernel::blk::ata::{{identify, read_sectors, write_sectors}} instead — they hold the \
+             IDE channel lock the sfs-commit task relies on:"
+        );
+        for v in &violations {
+            eprintln!("  {v}");
+        }
+        ExitCode::FAILURE
+    }
+}
+
+
 // ── check-component-imports ────────────────────────────────────────────────────
 
 /// Component modules, relative to the kernel root: code that runs **as a
@@ -1188,10 +1751,6 @@ fn do_check_component_imports() -> ExitCode {
     }
 }
 
-/// Boot the kernel headless in QEMU, poll the serial log, and assert the boot
-/// markers. `kvm = false` is the portable TCG test (CI default); `kvm = true`
-/// adds real acceleration + `-cpu host` and additionally requires the x2APIC
-/// **enable** line (proving the SMP AP1 write sequence executed on real silicon).
 /// The QEMU machine arguments shared by every way this repo boots the kernel
 /// ([`boot_test`] and [`do_boot_timing`]).
 ///
@@ -1234,6 +1793,16 @@ fn qemu_base_args(kvm: bool, iso: &Path, serial_arg: &str) -> Vec<String> {
     qargs
 }
 
+/// Serial logs of the boot test's two boots, relative to `kernel/`.
+const BOOT_TEST_LOGS: [&str; 2] = ["target/serial.log", "target/serial-boot2.log"];
+
+/// The boot test: build once, then boot **twice** on a blank test disk
+/// ([`prepare_test_disk`]), asserting every boot line on both boots
+/// ([`check_boot_log`]) and the persistence chain between them
+/// ([`check_persistence_chain`]). `kvm = false` is the portable TCG test (CI
+/// default); `kvm = true` adds real acceleration + `-cpu host` and additionally
+/// requires the x2APIC **enable** line (proving the SMP AP1 write sequence
+/// executed on real silicon).
 fn boot_test(kvm: bool) -> ExitCode {
     let Some(elf) = build_kernel() else {
         return ExitCode::FAILURE;
@@ -1241,16 +1810,59 @@ fn boot_test(kvm: bool) -> ExitCode {
     let Some(iso) = build_iso(&elf) else {
         return ExitCode::FAILURE;
     };
+    let fresh = match prepare_test_disk() {
+        Ok(fresh) => fresh,
+        Err(e) => {
+            eprintln!("TEST FAILED: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let disk = test_disk_img_path();
 
-    let serial_log = kr("target/serial.log");
+    let mut logs: Vec<String> = Vec::with_capacity(BOOT_TEST_LOGS.len());
+    for (i, rel) in BOOT_TEST_LOGS.iter().enumerate() {
+        let boot = i + 1;
+        println!("=== boot {boot} of {} (serial log: {rel}) ===", BOOT_TEST_LOGS.len());
+        let started = Instant::now();
+        let (log, found) = run_boot(kvm, &iso, &disk, &kr(rel));
+        println!(
+            "boot {boot}: {} ms from QEMU launch to the end marker (200 ms polling)",
+            started.elapsed().as_millis()
+        );
+        if check_boot_log(kvm, &log, found) != ExitCode::SUCCESS {
+            eprintln!(
+                "TEST FAILED on boot {boot} of {} (serial log: kernel/{rel}).",
+                BOOT_TEST_LOGS.len()
+            );
+            return ExitCode::FAILURE;
+        }
+        logs.push(log);
+    }
+    match check_persistence_chain(&logs[0], &logs[1], fresh) {
+        Ok(summary) => {
+            println!("{summary}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("TEST FAILED: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// One headless boot of `iso` with `disk` attached as the IDE primary master:
+/// COM1 goes to `serial_log`, polled every 200 ms until [`END_MARKER`] appears
+/// or [`BOOT_TIMEOUT_SECS`] pass, then QEMU is killed. Returns the final log and
+/// whether the marker appeared.
+fn run_boot(kvm: bool, iso: &Path, disk: &Path, serial_log: &Path) -> (String, bool) {
     let pcap = kr("target/net.pcap");
 
     // Remove stale log + pcap from a previous run.
-    let _ = fs::remove_file(&serial_log);
+    let _ = fs::remove_file(serial_log);
     let _ = fs::remove_file(&pcap);
 
     let serial_arg = format!("file:{}", serial_log.display());
-    let qargs = qemu_base_args(kvm, &iso, &serial_arg);
+    let qargs = qemu_base_args(kvm, iso, &serial_arg);
 
     println!(
         "Launching QEMU ({}) ...",
@@ -1264,7 +1876,7 @@ fn boot_test(kvm: bool) -> ExitCode {
     let mut child = Command::new("qemu-system-x86_64")
         .args(&qargs)
         .args(e1000_args(pcap.to_str().unwrap()))
-        .args(disk_args())
+        .args(ide_disk_args(disk))
         .spawn()
         .expect("failed to spawn qemu-system-x86_64");
 
@@ -1275,7 +1887,7 @@ fn boot_test(kvm: bool) -> ExitCode {
 
     while Instant::now() < deadline {
         std::thread::sleep(poll_interval);
-        let log = fs::read_to_string(&serial_log).unwrap_or_default();
+        let log = fs::read_to_string(serial_log).unwrap_or_default();
         if log.contains(END_MARKER) {
             found = true;
             break;
@@ -1287,11 +1899,19 @@ fn boot_test(kvm: bool) -> ExitCode {
     let _ = child.wait();
 
     // Read final log (may have grown slightly after the last poll).
-    let log = fs::read_to_string(&serial_log).unwrap_or_default();
-    println!("--- serial.log ---");
+    let log = fs::read_to_string(serial_log).unwrap_or_default();
+    let name = serial_log
+        .file_name()
+        .map_or_else(|| serial_log.display().to_string(), |n| n.to_string_lossy().into_owned());
+    println!("--- {name} ---");
     println!("{}", log);
-    println!("--- end serial.log ---");
+    println!("--- end {name} ---");
+    (log, found)
+}
 
+/// Every per-boot assertion over one boot's serial `log` (`found`: whether the
+/// end marker appeared in time). [`boot_test`] runs it on both boots.
+fn check_boot_log(kvm: bool, log: &str, found: bool) -> ExitCode {
     if !found {
         eprintln!(
             "TEST FAILED: end-marker '{}' not found within {} s.",
@@ -1474,6 +2094,59 @@ fn boot_test(kvm: bool) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+
+    // SentinelFS FS-1a: the mount line has exactly the specified shape, the
+    // slot matches the generation's parity, and the boot's empty commit moved
+    // to the next generation in the other slot.
+    let Some(sfs_mount_line) = log.lines().find(|l| l.starts_with(SFS_MOUNT_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: SentinelFS mount line '{}…' missing (did `kernel::sfs::prove_mount` run?).",
+            SFS_MOUNT_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    let sfs_mount = match parse_sfs_mount(sfs_mount_line) {
+        Some(m)
+            if m.gen >= 1
+                && m.slot == m.gen % 2
+                && m.total == SFS_TEST_TOTAL_BLOCKS
+                && m.free <= m.total =>
+        {
+            m
+        }
+        _ => {
+            eprintln!(
+                "TEST FAILED: the SentinelFS mount line is not `[sfs] mount: gen=N slot=S \
+                 sb=<8 hex> verified=yes groups=1 free=N/{SFS_TEST_TOTAL_BLOCKS} reserve=64 ok` \
+                 with slot = gen % 2 and free <= total: '{}'",
+                sfs_mount_line
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let sfs_commit_line = log
+        .lines()
+        .find(|l| l.starts_with(SFS_COMMIT_PREFIX))
+        .unwrap_or("");
+    match parse_sfs_commit(sfs_commit_line) {
+        Some(c)
+            if c.gen == sfs_mount.gen + 1
+                && c.slot == 1 - sfs_mount.slot
+                && c.blocks == 1
+                && c.flushes == 2 => {}
+        _ => {
+            eprintln!(
+                "TEST FAILED: expected `[sfs] commit: gen={} slot={} sb=<8 hex> blocks=1 \
+                 flushes=2 ok` after the mount (the boot's empty commit: the next generation, \
+                 in the other slot, only the superblock written, both flushes): '{}'",
+                sfs_mount.gen + 1,
+                1 - sfs_mount.slot,
+                sfs_commit_line
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    println!("SentinelFS FS-1a proven: '{sfs_mount_line}' then '{sfs_commit_line}'");
 
     // Component model PR-2: attested `from`, deny by default, forgeries refused,
     // denials logged — the exact line, with denies-logged >= 1.
@@ -2236,6 +2909,217 @@ ffffffff80105000 <isr_common>:\n\
         assert!(!raw.contains(SCHED_COOPERATIVE_PREFIX));
         assert!(!deferred.contains(SCHED_COOPERATIVE_PREFIX));
     }
+
+    #[test]
+    fn sfs_mount_line_parses_only_the_exact_shape() {
+        use super::{parse_sfs_mount, SfsLine};
+
+        let good =
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=64 ok";
+        assert_eq!(
+            parse_sfs_mount(good),
+            Some(SfsLine {
+                gen: 12,
+                slot: 0,
+                sb: *b"0a1b2c3d",
+                free: 3836,
+                total: 3840,
+                blocks: 0,
+                flushes: 0,
+            })
+        );
+        assert!(parse_sfs_mount(&format!("{good}\r")).is_some());
+        for bad in [
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=64 FAIL",
+            "[sfs] mount: gen=12 slot=0 sb=0A1B2C3D verified=yes groups=1 free=3836/3840 reserve=64 ok",
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3 verified=yes groups=1 free=3836/3840 reserve=64 ok",
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=no groups=1 free=3836/3840 reserve=64 ok",
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=2 free=3836/3840 reserve=64 ok",
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836 reserve=64 ok",
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=32 ok",
+            "[sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=64 ok extra",
+            "[sfs] mount: gen=-1 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=64 ok",
+            "[sfs] mount: slot=0 gen=12 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=64 ok",
+            "[sfs] mount: corrupt (superblocks; never formatted over) FAIL",
+            "[sfs] mount: no-disk (no-device) skipped",
+            " [sfs] mount: gen=12 slot=0 sb=0a1b2c3d verified=yes groups=1 free=3836/3840 reserve=64 ok",
+        ] {
+            assert_eq!(parse_sfs_mount(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn sfs_commit_line_parses_only_the_exact_shape() {
+        use super::parse_sfs_commit;
+
+        let c = parse_sfs_commit("[sfs] commit: gen=13 slot=1 sb=ffff0000 blocks=1 flushes=2 ok")
+            .unwrap();
+        assert_eq!((c.gen, c.slot, c.blocks, c.flushes), (13, 1, 1, 2));
+        assert_eq!(&c.sb, b"ffff0000");
+        assert_eq!(parse_sfs_commit("[sfs] commit: io FAIL"), None);
+        assert_eq!(parse_sfs_commit("[sfs] commit: TIMEOUT FAIL"), None);
+        assert_eq!(
+            parse_sfs_commit("[sfs] commit: gen=13 slot=1 sb=ffff0000 blocks=1 flushes=2 FAIL"),
+            None
+        );
+        assert_eq!(parse_sfs_commit(""), None);
+    }
+
+    /// The two boots of a blank-disk `make test`, as the kernel prints them.
+    fn chain_logs() -> (String, String) {
+        let boot1 = "\
+[fs] no valid image on disk; seeding + saving\n\
+[fs] persistence: first boot — writing /persist-test.txt (reboot to prove it survives)\n\
+[sfs] format: window lba=2048 blocks=3840 groups=1 gen=1 sb=11111111 (was unformatted)\n\
+[sfs] mount: gen=1 slot=1 sb=11111111 verified=yes groups=1 free=3836/3840 reserve=64 ok\n\
+[sfs] commit: gen=2 slot=0 sb=22222222 blocks=1 flushes=2 ok\n";
+        let boot2 = "\
+[fs] loaded filesystem from disk (32768 sectors)\n\
+[fs] persistence PROVEN: /persist-test.txt survived reboot -> \"persisted by SentinelOS at tick 812\"\n\
+[sfs] mount: gen=2 slot=0 sb=22222222 verified=yes groups=1 free=3836/3840 reserve=64 ok\n\
+[sfs] commit: gen=3 slot=1 sb=33333333 blocks=1 flushes=2 ok\n";
+        (boot1.to_string(), boot2.to_string())
+    }
+
+    #[test]
+    fn the_persistence_chain_holds_on_the_kernels_own_lines() {
+        use super::check_persistence_chain;
+
+        let (b1, b2) = chain_logs();
+        let summary = check_persistence_chain(&b1, &b2, true).unwrap();
+        assert!(summary.contains("committed gen=2 slot=0 sb=22222222"), "{summary}");
+        // A kept disk drops the absolute values but not the chain.
+        let (k1, k2) = (
+            b1.replace("gen=1 slot=1", "gen=7 slot=1")
+                .replace("gen=2 slot=0", "gen=8 slot=0"),
+            b2.replace("gen=2 slot=0", "gen=8 slot=0")
+                .replace("gen=3 slot=1", "gen=9 slot=1"),
+        );
+        assert!(check_persistence_chain(&k1, &k2, false).is_ok());
+        assert!(check_persistence_chain(&k1, &k2, true).is_err(), "not a blank disk");
+    }
+
+    #[test]
+    fn the_persistence_chain_refuses_every_break() {
+        use super::check_persistence_chain;
+
+        let (b1, b2) = chain_logs();
+        let breaks: [(&str, String, String); 7] = [
+            (
+                "boot 2 mounted another superblock",
+                b1.clone(),
+                b2.replace("sb=22222222 verified", "sb=2222222f verified"),
+            ),
+            (
+                "boot 2 formatted",
+                b1.clone(),
+                format!(
+                    "[sfs] format: window lba=2048 blocks=3840 groups=1 gen=1 sb=44444444 (was unformatted)\n{b2}"
+                ),
+            ),
+            (
+                "boot 1 did not format a blank disk",
+                b1.replace("[sfs] format:", "[sfs] formatted:"),
+                b2.clone(),
+            ),
+            (
+                "the format and the mount disagree",
+                b1.replace("gen=1 sb=11111111 (was", "gen=1 sb=1111111f (was"),
+                b2.clone(),
+            ),
+            (
+                "no toy-FS first boot",
+                b1.replace("first boot", "second boot"),
+                b2.clone(),
+            ),
+            ("no toy-FS proof", b1.clone(), b2.replace("PROVEN", "LOST")),
+            (
+                "boot 2 has no commit line",
+                b1.clone(),
+                b2.replace("[sfs] commit: gen=3 slot=1 sb=33333333 blocks=1 flushes=2 ok", "[sfs] commit: io FAIL"),
+            ),
+        ];
+        for (why, a, b) in &breaks {
+            assert!(check_persistence_chain(a, b, true).is_err(), "{why}");
+        }
+    }
+
+    #[test]
+    fn sfs_format_line_parses_only_the_exact_shape() {
+        use super::{parse_sfs_format, SfsFormat};
+
+        let good = "[sfs] format: window lba=2048 blocks=3840 groups=1 gen=1 sb=0a1b2c3d (was unformatted)";
+        assert_eq!(
+            parse_sfs_format(good),
+            Some(SfsFormat {
+                blocks: 3840,
+                groups: 1,
+                sb: *b"0a1b2c3d"
+            })
+        );
+        for bad in [
+            "[sfs] format: window lba=0 blocks=3840 groups=1 gen=1 sb=0a1b2c3d (was unformatted)",
+            "[sfs] format: window lba=2048 blocks=3840 groups=1 gen=2 sb=0a1b2c3d (was unformatted)",
+            "[sfs] format: window lba=2048 blocks=3840 groups=1 gen=1 sb=0a1b2c3d",
+            "[sfs] format: window lba=2048 blocks=3840 groups=1 gen=1 sb=0A1B2C3D (was unformatted)",
+            "[sfs] format: window lba=2048 blocks=3840 groups=1 gen=1 sb=0a1b2c3d (was unformatted) x",
+        ] {
+            assert_eq!(parse_sfs_format(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn ata_guard_flags_code_that_names_hal_ata() {
+        use super::find_ata_references;
+
+        for (src, want) in [
+            ("use hal::ata::{self, SECTOR_SIZE};", vec![1]),
+            ("fn f() {\n    let d = hal::ata::identify();\n}", vec![2]),
+            ("use hal::{ata, serial};", vec![1]),
+            ("use hal::{serial, ata::DiskInfo};", vec![1]),
+            ("use hal::{\n    serial,\n    ata,\n};", vec![3]),
+            ("let x = hal :: ata :: identify();", vec![1]),
+            ("let q = '\"'; let d = hal::ata::identify();", vec![1]),
+            ("fn f<'a>(s: &'a str) { hal::ata::identify(); }", vec![1]),
+            ("let r = r#\"x\"#; hal::ata::identify();", vec![1]),
+        ] {
+            assert_eq!(find_ata_references(src), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn ata_guard_ignores_comments_literals_and_other_modules() {
+        use super::find_ata_references;
+
+        for src in [
+            "// hal::ata::read_sectors",
+            "/// see [`hal::ata`]",
+            "//! the `hal::ata` TCB module",
+            "/* hal::ata /* nested */ hal::ata */",
+            "let s = \"hal::ata::identify\";",
+            "let s = \"escaped \\\" hal::ata\";",
+            "let s = r#\"hal::ata \"quoted\" \"#;",
+            "let s = br\"hal::ata\";",
+            "let c = '\\''; // hal::ata",
+            "hal::atapi::probe(); hal::serial::write_str(\"ata\");",
+            "use hal::{serial, sync::SpinMutex};",
+            "use crate::blk::ata::{self, SECTOR_SIZE};",
+            "fn ata() {} let hal = 1;",
+        ] {
+            assert_eq!(find_ata_references(src), Vec::<usize>::new(), "{src}");
+        }
+    }
+
+    #[test]
+    fn the_ata_door_is_the_only_kernel_file_naming_hal_ata() {
+        // The guard CI runs, run here too against the real tree.
+        use super::{find_ata_references, kernel_root, ATA_DOOR};
+
+        let door = std::fs::read_to_string(kernel_root().join(ATA_DOOR)).unwrap();
+        assert!(!find_ata_references(&door).is_empty(), "the door names hal::ata");
+        let fs = std::fs::read_to_string(kernel_root().join("crates/kernel/src/fs.rs")).unwrap();
+        assert_eq!(find_ata_references(&fs), Vec::<usize>::new(), "kernel::fs goes through the door");
+    }
 }
 
 /// `cargo xtask boot-timing [runs]` — boot the SAME ISO `runs` times and report
@@ -2271,6 +3155,14 @@ fn do_boot_timing(runs: usize) -> ExitCode {
     let mode = if kvm { "KVM + -cpu host" } else { "TCG" };
     let serial_log = kr("target/serial-timing.log");
     let pcap = kr("target/net-timing.pcap");
+    // The timing boots use the boot tests' disk, recreated blank first (never
+    // `make run`'s dev image); every run after the first mounts what the
+    // previous one committed.
+    if let Err(e) = prepare_test_disk() {
+        eprintln!("boot-timing: {e}");
+        return ExitCode::FAILURE;
+    }
+    let disk = test_disk_img_path();
 
     println!("Timing {runs} boot(s) under {mode} ...");
 
@@ -2286,7 +3178,7 @@ fn do_boot_timing(runs: usize) -> ExitCode {
         let mut child = Command::new("qemu-system-x86_64")
             .args(qemu_base_args(kvm, &iso, &serial_arg))
             .args(e1000_args(pcap.to_str().unwrap()))
-            .args(disk_args())
+            .args(ide_disk_args(&disk))
             // QEMU's own startup chatter would interleave with the per-run
             // lines; the serial log is the signal here.
             .stdout(Stdio::null())

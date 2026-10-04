@@ -81,6 +81,20 @@ jobs:
           MIRIFLAGS: -Zmiri-disable-isolation
         run: "cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu -- hash:: host:: cap:: bus::"
 
+      # SentinelFS FS-1a (docs/specs/2026-09-18-sentinelfs-design.md §11): the
+      # block layer (`blk::` — header/pointer codec, bitmaps, extents, the
+      # verified cache, the allocator, MemDevice) and SentinelFS (`sfs::` —
+      # superblock codec, slot selection, key encoding, mount/commit, random
+      # image mutations). Tests that hash whole images hundreds of times (the
+      # crash matrices, the corpus, replay) or allocate a 1 GiB device are
+      # `#[cfg_attr(miri, ignore)]`; they run natively in Kernel CI. Same
+      # scoping rule as above: do not widen it.
+      - name: "cargo +nightly miri test -p kernel blk:: sfs::"
+        working-directory: kernel
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: "cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu -- blk:: sfs::"
+
   # GATING — promoted from experimental on 2026-07-24, per the original promotion
   # plan: three consecutive real CI runs discharged every hal harness (apic/cpuid/
   # ata decode, plus simd's VNNI bias-correction proofs). A failure or timeout
@@ -139,9 +153,11 @@ jobs:
   # by weakening it — see `kernel::ml::proofs` and `kernel::sched::proofs`.
   #
   # The lesson worth keeping: Kani runs fine locally (`cargo kani -p kernel
-  # -Z unstable-options --ignore-global-asm`, ~60 s for the whole suite). A
-  # harness that has never been discharged locally does not belong in this
-  # gating job. Measure before adding one.
+  # -Z unstable-options --ignore-global-asm`: 28 harnesses in ~290 s, measured
+  # 2026-10-03 on a 4-core machine shared with another Kani job — no longer the
+  # ~60 s it was before SentinelFS FS-1a; every harness stays under its 60 s
+  # cap). A harness that has never been discharged locally does not belong in
+  # this gating job. Measure before adding one.
   #
   # The step-level cap stays as a hang backstop. It is now redundant with the
   # job-level cap for gate purposes (a gating job holds the gate whether it ends
