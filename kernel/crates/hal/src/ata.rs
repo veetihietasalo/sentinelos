@@ -124,6 +124,15 @@ const DRIVE_LBA_MASTER: u8 = 0xE0;
 const REG_DEVICE_CONTROL: u16 = 0x3F6;
 /// Device Control: software reset (SRST, bit 2).
 const CTRL_SRST: u8 = 1 << 2;
+/// Device Control: device interrupts disabled (nIEN, bit 1). This driver
+/// polls; after a reset it states "no device interrupts" explicitly rather
+/// than inherit whatever the firmware left.
+const CTRL_NIEN: u8 = 1 << 1;
+/// TSC cycles SRST is held: ≥ 5 µs at any TSC ≤ 5 GHz.
+const SRST_HOLD: u64 = 25_000;
+/// TSC cycles to wait after clearing SRST before polling BSY: ≥ 2 ms at any
+/// TSC ≤ 5 GHz (the drive may not even assert BSY sooner).
+const SRST_SETTLE: u64 = 10_000_000;
 
 /// Status waits are bounded by **time**, not by a count of status reads (a
 /// count is no deadline: QEMU completes IDE PIO and `FLUSH CACHE`
@@ -135,14 +144,18 @@ const CTRL_SRST: u8 = 1 << 2;
 const SECTOR_BUDGET: u64 = 4_000_000_000;
 /// See [`SECTOR_BUDGET`].
 const FLUSH_BUDGET: u64 = 40_000_000_000;
-/// See [`SECTOR_BUDGET`]: the wait for BSY to clear after a software reset.
-const RESET_BUDGET: u64 = 40_000_000_000;
+/// The wait for BSY to clear after a software reset: ATA allows a drive up to
+/// 31 s, so this is ≥ 31 s at any TSC ≤ 5 GHz. Only a drive that already
+/// timed out ever waits here.
+const RESET_BUDGET: u64 = 160_000_000_000;
 // ≥ 0.8 s per sector and ≥ 8 s per flush or reset even at 5 GHz, and the
 // backstop far above the old 100 000-read limit.
 const _: () = {
     assert!(SECTOR_BUDGET >= 5_000_000_000 * 8 / 10);
     assert!(FLUSH_BUDGET >= 5_000_000_000 * 8);
-    assert!(RESET_BUDGET >= 5_000_000_000 * 8);
+    assert!(RESET_BUDGET >= 5_000_000_000 * 31);
+    assert!(SRST_HOLD >= 5_000 * 5); // 5 µs at 5 GHz
+    assert!(SRST_SETTLE >= 5_000_000 * 2); // 2 ms at 5 GHz
     assert!(POLL_BACKSTOP > 100_000 * 1000);
 };
 
@@ -213,15 +226,17 @@ unsafe fn inb(port: u16) -> u8 {
 /// The caller must ensure `port` names a register that is safe to write with
 /// `value`. All call sites write only primary-channel ATA command-block
 /// registers (`0x1F2..=0x1F7`) with documented command/parameter bytes, or
-/// the control-block Device Control register (`0x3F6`) with SRST set or
-/// `0x00` (the timeout recovery, [`reset_channel`]).
+/// the control-block Device Control register (`0x3F6`) with `SRST | nIEN`
+/// or `nIEN` (the timeout recovery, [`reset_channel`]).
 #[inline]
 unsafe fn outb(port: u16, value: u8) {
     // SAFETY: `out dx, al` writes the byte in `al` to the I/O port in `dx`. The
     // contract that `port`/`value` are a valid, write-safe ATA register pair is
     // delegated to this function's `# Safety` section and upheld by every caller
-    // (only ATA command-block registers with defined LBA/seccount/command bytes).
-    // Device-only effect, `nomem`/`nostack`.
+    // (ATA command-block registers `0x1F2..=0x1F7` with defined LBA/seccount/
+    // command bytes, and the Device Control register `0x3F6` with
+    // `SRST | nIEN` or `nIEN` from `reset_channel`). Device-only effect,
+    // `nomem`/`nostack`.
     unsafe {
         asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack));
     }
@@ -293,7 +308,6 @@ fn delay_400ns() {
     }
 }
 
-/// Spin (bounded) until BSY clears, returning the final status byte.
 /// What one status read means to a wait.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Poll {
@@ -363,6 +377,7 @@ fn wait_not_busy_for(budget: u64) -> Result<u8, AtaError> {
     poll_until(status, crate::cpu::rdtsc, budget, POLL_BACKSTOP, not_busy)
 }
 
+/// Spin (deadline-bounded) until BSY clears, returning the final status byte.
 fn wait_not_busy() -> Result<u8, AtaError> {
     wait_not_busy_for(SECTOR_BUDGET)
 }
@@ -383,26 +398,37 @@ fn wait_for_drq() -> Result<(), AtaError> {
 /// Recover the channel after a timeout: a command that timed out may still be
 /// running, or stopped mid-transfer with DRQ pending, and the next command
 /// must not start against that. Software reset (SRST) aborts whatever the
-/// drive is doing and returns it to the post-reset state: set SRST, hold it
-/// ≥ 5 µs, clear it, then wait (bounded) for BSY to clear. Interrupts stay
-/// as they were (nIEN is written 0, its power-on value, which this module
-/// never changes). The next command selects the drive and programs every
-/// register again, as each one already does.
+/// drive is doing and returns it to the post-reset state: write
+/// `SRST | nIEN`, hold ≥ 5 µs ([`SRST_HOLD`]), write `nIEN` (SRST clear,
+/// device interrupts off — this driver polls), wait ≥ 2 ms
+/// ([`SRST_SETTLE`]), then wait for BSY to clear (bounded by
+/// [`RESET_BUDGET`], the 31 s ATA allows). The next command selects the drive
+/// and programs every register again, as each one already does.
 fn reset_channel() {
     // SAFETY: writes the primary channel's Device Control register (`0x3F6`)
-    // with SRST set — a documented control-block register and value. A reset
-    // only affects the drive (it aborts the command in progress); it cannot
-    // alias or corrupt Rust memory. `outb`'s contract holds.
-    unsafe { outb(REG_DEVICE_CONTROL, CTRL_SRST) };
-    // ≥ 5 µs with SRST held: each alternate-status read is ≥ 100 ns on the
-    // ISA timing the port I/O models; 64 reads is ≥ 6.4 µs.
-    for _ in 0..64 {
-        let _ = alt_status();
-    }
-    // SAFETY: as above, clearing SRST (and leaving nIEN at its power-on 0).
-    unsafe { outb(REG_DEVICE_CONTROL, 0) };
-    delay_400ns();
+    // with `SRST | nIEN` — a documented control-block register and value. A
+    // reset only affects the drive (it aborts the command in progress, and
+    // nIEN only gates the drive's interrupt line, which this driver never
+    // uses); it cannot alias or corrupt Rust memory. `outb`'s contract holds.
+    unsafe { outb(REG_DEVICE_CONTROL, CTRL_SRST | CTRL_NIEN) };
+    spin_cycles(SRST_HOLD);
+    // SAFETY: as above, with SRST clear and nIEN set.
+    unsafe { outb(REG_DEVICE_CONTROL, CTRL_NIEN) };
+    spin_cycles(SRST_SETTLE);
     let _ = wait_not_busy_for(RESET_BUDGET);
+}
+
+/// Busy-wait at least `cycles` TSC cycles (bounded by the read backstop if
+/// the TSC does not advance).
+fn spin_cycles(cycles: u64) {
+    let start = crate::cpu::rdtsc();
+    for _ in 0..POLL_BACKSTOP {
+        if crate::cpu::rdtsc().saturating_sub(start) >= cycles {
+            return;
+        }
+        #[cfg(not(kani))]
+        core::hint::spin_loop();
+    }
 }
 
 /// After a timeout, reset the channel before handing the error back (see
@@ -469,6 +495,12 @@ fn issue_command(cmd: u8) {
 /// `0xFF`, the classic "floating bus" of an absent drive, or IDENTIFY never
 /// asserts DRQ), so the kernel can boot without a disk attached. Returns
 /// [`AtaError::DeviceError`]/[`AtaError::Timeout`] on a misbehaving controller.
+///
+/// An absent disk answers at once (`NoDevice`); a present one that never
+/// answers now blocks its caller for up to [`SECTOR_BUDGET`] then the reset's
+/// [`SRST_SETTLE`] + [`RESET_BUDGET`] — seconds to tens of seconds, by design
+/// (deadlines, not read counts). The kernel calls it from the `sfs-commit`
+/// task and the toy `kernel::fs` probe, never from an interrupt path.
 pub fn identify() -> Result<DiskInfo, AtaError> {
     recover(identify_inner())
 }

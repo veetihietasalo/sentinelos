@@ -120,7 +120,9 @@ pub struct Sfs {
     scrub_last: Option<Result<Report, BlkError>>,
     scrub_ws: Option<Box<ScrubWs>>,
     /// FS-1b: no interval commit while a caller's multi-operation group is in
-    /// progress (requested commits are still served).
+    /// progress (requested commits are still served). A single flag: one
+    /// group at a time (the boot proof). FS-2's facade, with concurrent
+    /// callers, needs a count or an owner here.
     hold: bool,
     /// FS-1b: the boot's test-control sector, and the armed commit cut.
     control: Control,
@@ -405,6 +407,15 @@ fn commit_task() {
 
 /// Read the test-control sector ([`proof::CONTROL_LBA`]) through the
 /// channel lock; anything unreadable or without the magic is no request.
+/// Only kernels built with the `test-hooks` feature (the boot tests') read
+/// it at all: a production kernel never halts because a disk carries it.
+#[cfg(not(feature = "test-hooks"))]
+fn read_control(_buf: &mut Block) -> Control {
+    Control::None
+}
+
+/// See the production variant above: this is the boot tests' build.
+#[cfg(feature = "test-hooks")]
 fn read_control(buf: &mut Block) -> Control {
     let sector = &mut buf[..crate::blk::SECTOR_SIZE];
     match crate::blk::ata::read_sectors(proof::CONTROL_LBA, 1, sector) {
@@ -450,15 +461,26 @@ fn serve_read(dev: &mut AtaDevice, ws: &mut Workspace) {
 fn serve_scrub(dev: &mut AtaDevice) {
     let job = with_sfs(|s| {
         if s.scrub_req <= s.scrub_served {
-            return None;
+            return Ok(None);
         }
-        let v = s.volume.as_ref()?;
+        // A request that cannot run is answered with an error, never with
+        // the previous scrub's report.
+        let (Some(v), Some(sws)) = (s.volume.as_ref(), s.scrub_ws.take()) else {
+            return Err(());
+        };
         let info = v.info();
-        Some((*v.superblock(), info.sb_hash, info.slot, s.scrub_ws.take()?))
+        Ok(Some((*v.superblock(), info.sb_hash, info.slot, sws)))
     });
-    let Some((sb, hash, slot, mut sws)) = job else {
-        with_sfs(|s| s.scrub_served = s.scrub_req);
-        return;
+    let (sb, hash, slot, mut sws) = match job {
+        Ok(Some(job)) => job,
+        Ok(None) => return,
+        Err(()) => {
+            with_sfs(|s| {
+                s.scrub_served = s.scrub_req;
+                s.scrub_last = Some(Err(BlkError::BadBuffer));
+            });
+            return;
+        }
     };
     let report = scrub(dev, &mut sws, &sb, &hash, slot);
     with_sfs(|s| {

@@ -148,6 +148,15 @@ pub fn decode_head(buf: &[u8]) -> Result<(u8, usize), CodecError> {
     Ok((level, n))
 }
 
+/// Leaf packing, the one rule both the encoder and the decoder use: the data
+/// of the next item (`len` bytes) ends where the previous item's data starts
+/// (`cursor`; the block end for item 0), and must not reach into the item
+/// table, which ends at `table_end`. Returns where it starts.
+#[must_use]
+pub fn place(cursor: usize, len: usize, table_end: usize) -> Option<usize> {
+    cursor.checked_sub(len).filter(|&start| start >= table_end)
+}
+
 /// Most entries of `stride` bytes a block of `block_len` bytes can hold.
 const fn max_entries(block_len: usize, stride: usize) -> usize {
     block_len.saturating_sub(NODE_HDR) / stride
@@ -205,9 +214,8 @@ pub fn decode_leaf<const C: usize>(
         if usize::from(len) > ITEM_MAX {
             return Err(CodecError::Corrupt);
         }
-        let start = cursor
-            .checked_sub(usize::from(len))
-            .filter(|&s| s >= table_end && s == usize::from(off))
+        let start = place(cursor, usize::from(len), table_end)
+            .filter(|&s| s == usize::from(off))
             .ok_or(CodecError::Corrupt)?;
         out.push(key, Span { src, off, len })?;
         cursor = start;
@@ -287,6 +295,7 @@ pub fn encode_leaf<const C: usize>(
         return Err(CodecError::Size);
     }
     start(out, 0, n)?;
+    let table_end = NODE_HDR + n * LEAF_SLOT;
     let mut cursor = out.len();
     // Bounded by the node's capacity (a constant), ended early at `n`.
     for i in 0..C {
@@ -306,7 +315,7 @@ pub fn encode_leaf<const C: usize>(
             .get(usize::from(span.src))
             .and_then(|s| s.get(from..from.checked_add(len)?))
             .ok_or(CodecError::Source)?;
-        cursor = cursor.checked_sub(len).ok_or(CodecError::Size)?;
+        cursor = place(cursor, len, table_end).ok_or(CodecError::Size)?;
         out.get_mut(cursor..cursor + len)
             .ok_or(CodecError::Size)?
             .copy_from_slice(data);
@@ -693,19 +702,44 @@ mod proofs {
         packing_round_trips(1, 4);
     }
 
-    /// Leaf packing, two items (the packing order and the gap): data of
-    /// 0 or 1 byte each — what two items add over one is the order and the
-    /// boundaries, not longer data.
-    ///
-    /// **Not in the gating suite:** it verifies, but in ~195 s, over the
-    /// 60 s per-harness cap (A19). Run it with
-    /// `RUSTFLAGS="--cfg kani_slow" cargo kani -p kernel --harness
-    /// leaf_packing_two_items_round_trip`. Two-item packing is covered by
-    /// the host round-trip tests; one item and decode totality gate here.
-    #[cfg(kani_slow)]
+    /// Leaf-packing totality at the **real** 4096-byte block, `CAP = 4`:
+    /// for any item lengths ≤ `ITEM_MAX` whose entries fit the payload
+    /// (the encoder's weight check), [`place`] places every item — packing
+    /// never fails — and the data ranges are consecutive from the block end
+    /// (so disjoint), each ending where the previous starts, and all at or
+    /// past the end of the item table. Encode and decode both run exactly
+    /// this arithmetic, so it is the format's packing rule; the byte copying
+    /// around it is covered by the one-item round trip above and the host
+    /// tests. Integers only — no byte arrays.
     #[kani::proof]
-    #[kani::unwind(119)]
-    fn leaf_packing_two_items_round_trip() {
-        packing_round_trips(2, 1);
+    #[kani::unwind(5)]
+    fn leaf_packing_is_total_at_4k() {
+        const BLOCK: usize = crate::blk::BLOCK_SIZE;
+        let n: usize = kani::any();
+        kani::assume(n >= 1 && n <= 4);
+        let lens: [u16; 4] = kani::any();
+        let mut weight = 0usize;
+        for (i, &len) in lens.iter().enumerate() {
+            kani::assume(usize::from(len) <= ITEM_MAX);
+            if i < n {
+                weight += LEAF_SLOT + usize::from(len);
+            }
+        }
+        kani::assume(weight <= payload_limit(BLOCK) as usize);
+        let table_end = NODE_HDR + n * LEAF_SLOT;
+        let mut cursor = BLOCK;
+        for (i, &len) in lens.iter().enumerate() {
+            if i >= n {
+                break;
+            }
+            let start = place(cursor, usize::from(len), table_end);
+            assert!(start.is_some());
+            let start = start.unwrap_or(0);
+            assert!(start + usize::from(len) == cursor);
+            assert!(start >= table_end && cursor <= BLOCK);
+            cursor = start;
+        }
+        // The rest of the payload (the canonical zero gap) is what is left.
+        assert!(cursor >= table_end);
     }
 }

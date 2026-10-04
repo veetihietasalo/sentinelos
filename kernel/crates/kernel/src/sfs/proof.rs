@@ -27,12 +27,20 @@
 //!    right after the K-th block write of this boot's ledger commit, inside
 //!    the dirty set, before any flush; it prints
 //!    `[sfs] torn-commit: cut-after=K gen=N dirty=D halting` first. `xtask`
-//!    SIGKILLs QEMU (`cache=writeback`: the guest's writes are in the host's
-//!    page cache, unflushed — what a power cut leaves).
+//!    SIGKILLs QEMU (`cache=writeback`: the K writes QEMU completed are in the
+//!    host's page cache and reach the image; nothing after them does).
 //! 2. `Verify { after: K, gen: N }` — the next boot mounts, checks the
 //!    ledger, and prints
 //!    `[sfs] torn-commit: cut-after=K recovered-gen=N-1 data-intact=yes ok`
 //!    only if it mounted generation `N − 1` and its ledger is intact.
+//!
+//! A SIGKILLed QEMU is not a power cut — the host keeps QEMU's writes, in
+//! order — so this proves that a commit's first K copy-on-write writes land
+//! only in free blocks (xtask checks exactly K window blocks changed and
+//! neither superblock slot) and that the next boot mounts `N − 1`
+//! byte-exactly. Flush ordering (any unflushed subset, any order, torn
+//! superblock sectors) is proven by the host crash matrix (`sfs::crash`),
+//! the real durability evidence.
 
 use super::key::{item as kinds, Key};
 use super::service::{read_block, request_scrub, scrub_outcome, wait_for, with_sfs};

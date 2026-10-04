@@ -622,7 +622,12 @@ FS-1 splits in two, and attestation waits for the identity spec.
   **exactly 2** window blocks changed and neither superblock slot; the recovery boot must pass
   every boot assertion, mount exactly the previous commit (generation, slot and superblock hash)
   and print `[sfs] torn-commit: cut-after=2 recovered-gen=3 data-intact=yes ok`. +2 boots,
-  ~10 s of CI.
+  ~10 s of CI. What it proves, stated exactly: a SIGKILLed QEMU is **not** a power cut (the host
+  keeps every write QEMU made, in order), so the stage proves that a commit's first K CoW writes
+  land only in free blocks and that the next boot mounts N − 1 byte-exactly; flush ordering
+  (unflushed subsets, reordering, torn sectors) is proven by the host crash matrix, which is the
+  durability evidence. The control sector is honoured only by kernels built with the
+  `test-hooks` feature, which only the boot tests build.
 - *`flush` on ATA, now.* `hal::ata::write_sectors` is unflushed and `flush()` waits for BSY
   before `FLUSH CACHE` (row A2 amended, invariant 16); `AtaDevice::flush` is the real barrier
   and the toy `kernel::fs` flushes once per save through `blk::ata`. Status waits end at a TSC

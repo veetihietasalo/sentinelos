@@ -238,19 +238,23 @@ fn run_cmd(cmd: &mut Command) -> bool {
 
 /// Build the boot ELF for x86_64-unknown-none. Returns path to the ELF.
 fn build_kernel() -> Option<PathBuf> {
+    build_kernel_with(false)
+}
+
+/// Build the kernel; `test_hooks` enables the `test-hooks` feature (the boot
+/// tests' kernel only: the SentinelFS test-control sector is honoured only
+/// there, so a production kernel never halts on a disk that carries it).
+fn build_kernel_with(test_hooks: bool) -> Option<PathBuf> {
     let root = kernel_root();
-    println!("Building kernel for x86_64-unknown-none ...");
-    let ok = run_cmd(
-        Command::new("cargo")
-            .args([
-                "build",
-                "--package",
-                "boot",
-                "--target",
-                "x86_64-unknown-none",
-            ])
-            .current_dir(&root),
+    println!(
+        "Building kernel for x86_64-unknown-none{} ...",
+        if test_hooks { " (feature test-hooks)" } else { "" }
     );
+    let mut args = vec!["build", "--package", "boot", "--target", "x86_64-unknown-none"];
+    if test_hooks {
+        args.extend(["--features", "test-hooks"]);
+    }
+    let ok = run_cmd(Command::new("cargo").args(&args).current_dir(&root));
     if !ok {
         return None;
     }
@@ -1910,7 +1914,7 @@ const BOOT_TEST_LOGS: [&str; 2] = ["target/serial.log", "target/serial-boot2.log
 /// requires the x2APIC **enable** line (proving the SMP AP1 write sequence
 /// executed on real silicon).
 fn boot_test(kvm: bool) -> ExitCode {
-    let Some(elf) = build_kernel() else {
+    let Some(elf) = build_kernel_with(true) else {
         return ExitCode::FAILURE;
     };
     let Some(iso) = build_iso(&elf) else {
@@ -1975,9 +1979,19 @@ const TORN_LOGS: [&str; 2] = ["target/serial-torn.log", "target/serial-recover.l
 /// 1. The test-control sector asks for a cut after [`SFS_TORN_CUT_AFTER`]
 ///    block writes; the kernel mounts, stages the next ledger generation N,
 ///    and halts inside that commit's dirty set (`… gen=N dirty=D halting`,
-///    `K ≤ D`, no commit line). xtask SIGKILLs QEMU at once: with
-///    `cache=writeback` the K blocks sit in the host page cache unflushed —
-///    a power cut's leftovers.
+///    `K ≤ D`, no commit line). xtask SIGKILLs QEMU at once. With
+///    `cache=writeback` the K writes QEMU completed reach the image (through
+///    the host page cache); nothing after them does.
+///
+/// **What this proves, and what it does not.** A SIGKILLed QEMU is not a
+/// power cut: the host keeps every write QEMU made, in order, so this stage
+/// cannot reorder or drop unflushed writes. It proves that the first K
+/// copy-on-write writes of a commit land only in blocks free in the committed
+/// state (exactly K window blocks change, neither superblock slot does) and
+/// that the next boot mounts generation N − 1 byte-exactly (same slot and
+/// superblock hash, ledger intact). Flush ordering — any subset of unflushed
+/// writes, in any order, torn superblock sectors — is proven on the host by
+/// `kernel::sfs::crash`'s crash matrix, which is the real durability evidence.
 /// 2. The control sector asks the next boot to verify: it must mount
 ///    **exactly** the previous boot's commit (generation N − 1, same slot and
 ///    superblock hash), find its ledger intact, and print
