@@ -298,8 +298,9 @@ fn replaying_the_same_operations_yields_the_same_superblocks_and_image() {
 #[test]
 fn a_structurally_bad_node_with_a_valid_hash_is_corrupt_and_read_only() {
     let mut fs = Fs::fresh(256);
-    for i in 0..30u64 {
-        fs.put(key(i), &[i as u8; 300]).unwrap();
+    // 14 × 900 bytes: three leaves under a level-1 root (kept small for Miri).
+    for i in 0..14u64 {
+        fs.put(key(i), &[i as u8; 900]).unwrap();
     }
     fs.commit().unwrap();
     assert_eq!(root_level(&fs), Some(1));
@@ -331,8 +332,9 @@ fn a_structurally_bad_node_with_a_valid_hash_is_corrupt_and_read_only() {
 #[test]
 fn a_flipped_bit_in_a_committed_node_is_refused_at_read() {
     let mut fs = Fs::fresh(256);
-    for i in 0..30u64 {
-        fs.put(key(i), &[i as u8; 300]).unwrap();
+    // 14 × 900 bytes: three leaves under a level-1 root (kept small for Miri).
+    for i in 0..14u64 {
+        fs.put(key(i), &[i as u8; 900]).unwrap();
     }
     fs.commit().unwrap();
     let root = fs.v.superblock().root;
