@@ -405,7 +405,7 @@ pub fn on_irq() {
     // IRQ12 → slave-PIC vector 0x2C. EOI both the slave and the master (the slave
     // reaches the CPU through the master's cascade); `pic::end_of_interrupt`
     // handles the both-PIC EOI for slave-range vectors.
-    crate::pic::end_of_interrupt(VECTOR_MOUSE);
+    crate::ioapic::device_eoi(VECTOR_MOUSE);
 }
 
 /// Program the i8042 to deliver mouse interrupts, put the mouse into streaming

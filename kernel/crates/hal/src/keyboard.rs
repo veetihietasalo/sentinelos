@@ -216,7 +216,29 @@ pub fn on_irq() {
     ring_push(scancode);
     // IRQ1 → master-PIC vector PIC1_OFFSET + 1 (0x21). EOI lets the PIC deliver
     // the next keystroke.
-    crate::pic::end_of_interrupt(VECTOR_KEYBOARD);
+    crate::ioapic::device_eoi(VECTOR_KEYBOARD);
+}
+
+/// Discard a byte left in the i8042 output buffer, if any; returns whether one
+/// was discarded.
+///
+/// Called once when device IRQs move from the 8259 to the IOAPIC (SMP 3b-ii):
+/// IRQ1/IRQ12 are edge-triggered, so an edge raised while the old route was
+/// masked and the new one not yet open is lost — and the i8042 raises no
+/// further edge until its buffer is drained. Draining it here (the same policy
+/// as `init`'s stale-byte drain) re-arms delivery at the cost of at most one
+/// boot-time byte.
+pub fn drain_stale_output() -> bool {
+    // SAFETY: (K6) reads the i8042 status port (`0x64`) and, if its output
+    // buffer is full, the data port (`0x60`) — pure device reads, exactly
+    // `init`'s drain. Cannot alias Rust memory. `inb`'s contract holds.
+    unsafe {
+        if inb(PS2_STATUS_CMD) & STATUS_OUT_FULL != 0 {
+            let _ = inb(PS2_DATA);
+            return true;
+        }
+    }
+    false
 }
 
 /// Program the i8042 controller to deliver keyboard interrupts, then unmask IRQ1.

@@ -34,7 +34,7 @@ mod heap;
 mod paging;
 
 pub use addr::{PhysAddr, VirtAddr, PAGE_SIZE};
-pub use bootinfo::{hhdm_offset, usable_regions, UsableRegion};
+pub use bootinfo::{hhdm_offset, overlaps_kernel_owned, usable_regions, UsableRegion};
 pub use frame::FrameAllocator;
 pub use heap::{LockedHeap, HEAP_SIZE, HEAP_START};
 pub use paging::{ActivePageTable, MapError, PageFlags};
@@ -86,6 +86,32 @@ impl From<MapError> for MmioError {
 /// Returns [`MmioError::NotInitialised`] if `init` has not run, or
 /// [`MmioError::MapFailed`] if a page could not be mapped.
 pub fn map_mmio(phys: PhysAddr, len: usize) -> Result<VirtAddr, MmioError> {
+    map_window(phys, len, PageFlags::mmio())
+}
+
+/// Map a physical **firmware-table** region (ACPI RSDP/RSDT/XSDT/MADT) into the
+/// same higher-half window, **read-only, non-executable, cache-attribute from
+/// the MTRRs** (`PageFlags::kernel_ro()`: no PCD/PWT, so a table in RAM that the
+/// HHDM may also map write-back is not aliased with a conflicting UC mapping,
+/// and a table in BIOS ROM gets whatever the MTRRs declare for it).
+///
+/// Limine base revision 3 no longer guarantees that the HHDM covers ACPI or
+/// reserved memory, so `hal::acpi` cannot simply add the HHDM offset. Returns
+/// the [`VirtAddr`] for `phys` (in-page offset preserved). The caller
+/// (`hal::acpi::read_phys`) has already refused ranges that overlap
+/// kernel-owned RAM ([`overlaps_kernel_owned`]).
+///
+/// # Errors
+///
+/// As [`map_mmio`].
+pub fn map_firmware_ro(phys: PhysAddr, len: usize) -> Result<VirtAddr, MmioError> {
+    map_window(phys, len, PageFlags::kernel_ro())
+}
+
+/// The shared body of [`map_mmio`] / [`map_firmware_ro`]: bump-allocate a
+/// virtual span in the MMIO window and map every page of `[phys, phys + len)`
+/// with `flags`.
+fn map_window(phys: PhysAddr, len: usize, flags: PageFlags) -> Result<VirtAddr, MmioError> {
     let hhdm = hhdm_offset().ok_or(MmioError::NotInitialised)?;
 
     // Page-align the physical span: floor the base, ceil the end, so the whole
@@ -102,7 +128,6 @@ pub fn map_mmio(phys: PhysAddr, len: usize) -> Result<VirtAddr, MmioError> {
     let virt_base = MMIO_NEXT.fetch_add(span, Ordering::Relaxed) as u64;
 
     let table = ActivePageTable::new(hhdm);
-    let flags = PageFlags::mmio();
     for i in 0..pages {
         let virt = VirtAddr::new(virt_base + (i * PAGE_SIZE as usize) as u64);
         let frame = PhysAddr::new(phys_base + (i * PAGE_SIZE as usize) as u64);

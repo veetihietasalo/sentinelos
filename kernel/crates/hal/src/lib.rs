@@ -65,6 +65,13 @@
 //!   kernel's `ApMain` with an [`smp::ApInfo`]. No trampoline, no low-memory
 //!   reservation, no MADT parser — the bootloader we already trust for the BSP's
 //!   mode switch and page tables does the same for the APs.
+//! - [`acpi`] — the Limine RSDP and a bounded, copy-out reader of firmware
+//!   tables ([`acpi::rsdp_phys`], [`acpi::read_phys`]); all ACPI parsing is in
+//!   the safe kernel (`kernel::acpi`).
+//! - [`ioapic`] — IOAPIC register access and redirection entries
+//!   ([`ioapic::IoApic`], [`ioapic::RedirectionEntry`]) plus
+//!   [`ioapic::device_eoi`], the EOI every device IRQ handler issues: the LAPIC
+//!   when it delivered the vector (IOAPIC route), the 8259 otherwise.
 //! - [`ata`] — a legacy ATA (IDE) PIO disk driver on the primary channel
 //!   (`0x1F0..=0x1F7` + control `0x3F6`) with [`ata::identify`],
 //!   [`ata::read_sectors`], [`ata::write_sectors`] (512-byte sectors, LBA28,
@@ -128,6 +135,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod acpi;
 pub mod apic;
 pub mod ata;
 pub mod context;
@@ -139,6 +147,7 @@ pub mod framebuffer;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
+pub mod ioapic;
 pub mod keyboard;
 pub mod mm;
 pub mod mouse;

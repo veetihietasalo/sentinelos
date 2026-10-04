@@ -71,6 +71,9 @@ const REG_LVT_LINT0: u32 = 0x350;
 const REG_LVT_LINT1: u32 = 0x360;
 /// LVT Timer register (vector, mask, mode).
 const REG_LVT_TIMER: u32 = 0x320;
+/// In-Service Register, eight 32-bit words at `0x100 + 0x10 * n` (bit `v % 32`
+/// of word `v / 32` is vector `v`). Read-only.
+const REG_ISR_BASE: u32 = 0x100;
 /// Timer initial-count register (write starts the countdown).
 const REG_TIMER_INIT: u32 = 0x380;
 /// Timer current-count register (read-only).
@@ -482,6 +485,73 @@ pub fn eoi() {
     }
 }
 
+/// ISR register offset and bit for `vector` — pure, so the decode is
+/// host-tested and Kani-proved (`isr_slot_is_exact`).
+#[must_use]
+const fn isr_slot(vector: u8) -> (u32, u32) {
+    (
+        REG_ISR_BASE + ((vector as u32 >> 5) << 4),
+        vector as u32 & 31,
+    )
+}
+
+/// Whether the **calling core's** LAPIC has `vector` in service — i.e. the
+/// interrupt now being handled on `vector` was delivered as a LAPIC message
+/// (IOAPIC, IPI, LAPIC timer) and owes the LAPIC an EOI. `false` for a
+/// virtual-wire ExtINT delivery (never enters the ISR) and where this core has
+/// no LAPIC access path. Used by `ioapic::device_eoi` to EOI exactly the
+/// controller that delivered a device IRQ.
+#[must_use]
+pub fn in_service(vector: u8) -> bool {
+    let Some(mode) = access_mode() else {
+        return false;
+    };
+    let (reg, bit) = isr_slot(vector);
+    // SAFETY: (AP8) `mode` is live (x2APIC: EXTD set ⇒ MSR `0x810..=0x817`
+    // implemented; xAPIC: the AP4 mapping exists). `reg` is one of the eight
+    // ISR offsets `0x100..=0x170` (16-byte aligned, < 0x1000), a read-only
+    // register: reading it has no side effect and cannot alias Rust memory.
+    let word = unsafe { reg_read(mode, reg) } as u32;
+    word & (1 << bit) != 0
+}
+
+/// Mask the **calling core's** LVT LINT0 — take the 8259 out of the virtual
+/// wire once device IRQs are routed through the IOAPIC (SMP 3b-ii). Returns
+/// `false` without a LAPIC access path.
+#[must_use]
+pub fn mask_lint0() -> bool {
+    let Some(mode) = access_mode() else {
+        return false;
+    };
+    // SAFETY: (AP9) writes LVT LINT0 = masked over the live path — the same
+    // register and value `enable_ap` (AP3) writes on every AP. Routing only.
+    unsafe { reg_write(mode, REG_LVT_LINT0, LVT_MASKED) }
+    true
+}
+
+/// Restore the **calling core's** LVT LINT0 to ExtINT — the virtual-wire
+/// state `enable_bsp` (AP1) programs — for the IOAPIC rollback path. Returns
+/// `false` without a LAPIC access path.
+#[must_use]
+pub fn lint0_extint() -> bool {
+    let Some(mode) = access_mode() else {
+        return false;
+    };
+    // SAFETY: (AP9) writes LVT LINT0 = ExtINT, exactly AP1's value. Routing only.
+    unsafe { reg_write(mode, REG_LVT_LINT0, LVT_DELIVERY_EXTINT) }
+    true
+}
+
+/// Whether the **calling core's** LVT LINT0 is masked (read back from the
+/// LAPIC), or `None` without a LAPIC access path. Boot-proof evidence.
+#[must_use]
+pub fn lint0_masked() -> Option<bool> {
+    let mode = access_mode()?;
+    // SAFETY: (AP9) a read of LVT LINT0 over the live path; no side effect.
+    let v = unsafe { reg_read(mode, REG_LVT_LINT0) };
+    Some(v & LVT_MASKED != 0)
+}
+
 /// Start the **calling core's** LAPIC timer in one-shot mode with the maximum
 /// initial count and the interrupt **masked** — the calibration probe.
 ///
@@ -577,7 +647,16 @@ const fn initial_apic_id_from_ebx(ebx: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ebx_logical_cpu_count, ecx_has_x2apic, initial_apic_id_from_ebx};
+    use super::{ebx_logical_cpu_count, ecx_has_x2apic, initial_apic_id_from_ebx, isr_slot};
+
+    #[test]
+    fn isr_slot_maps_vectors_to_words_and_bits() {
+        assert_eq!(isr_slot(0x00), (0x100, 0));
+        assert_eq!(isr_slot(0x20), (0x110, 0));
+        assert_eq!(isr_slot(0x2C), (0x110, 12));
+        assert_eq!(isr_slot(0xF1), (0x170, 17));
+        assert_eq!(isr_slot(0xFF), (0x170, 31));
+    }
 
     #[test]
     fn initial_apic_id_is_ebx_31_24() {
@@ -620,7 +699,19 @@ mod tests {
 /// stable build (and `cargo test`) excludes this module. Run `cargo kani -p hal`.
 #[cfg(kani)]
 mod proofs {
-    use super::{ebx_logical_cpu_count, ecx_has_x2apic, initial_apic_id_from_ebx};
+    use super::{ebx_logical_cpu_count, ecx_has_x2apic, initial_apic_id_from_ebx, isr_slot};
+
+    /// Every vector maps to one of the eight ISR words (`0x100..=0x170`,
+    /// 16-byte aligned) and a bit `< 32`, and the pair identifies the vector.
+    #[kani::proof]
+    fn isr_slot_is_exact() {
+        let v: u8 = kani::any();
+        let (reg, bit) = isr_slot(v);
+        assert!((0x100..=0x170).contains(&reg));
+        assert_eq!(reg & 0xF, 0);
+        assert!(bit < 32);
+        assert_eq!(((reg - 0x100) / 0x10) * 32 + bit, u32::from(v));
+    }
 
     /// `initial_apic_id_from_ebx` is **total** and always fits 8 bits, for any EBX.
     #[kani::proof]
