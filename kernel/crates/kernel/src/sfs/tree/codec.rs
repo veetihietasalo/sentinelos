@@ -585,20 +585,30 @@ mod tests {
 mod proofs {
     use super::*;
 
-    /// A block of 72 + 2 × 21 + 8 bytes: room for two items with 8 data
-    /// bytes between them, or one with up to 29.
+    /// A leaf block of 72 + 2 × 21 + 8 bytes: two items with 8 data bytes
+    /// between them, or one with up to 29.
     const SMALL: usize = NODE_HDR + 2 * LEAF_SLOT + 8;
-    /// Loops run over at most the payload (`SMALL − 72` bytes) plus one.
-    const _: () = assert!(SMALL - NODE_HDR < 52);
+    /// Decode harness blocks: room for exactly one entry of each kind plus a
+    /// few spare bytes, so every loop in the decoders runs a handful of
+    /// times (CBMC's cost is the unwinding, not the logic).
+    const LEAF_ONE: usize = NODE_HDR + LEAF_SLOT + 6;
+    const INNER_ONE: usize = NODE_HDR + CHILD_LEN + 3;
 
-    /// Decode totality: any bytes in a shrunken leaf-or-internal block decode
-    /// to `Ok` or `Err` — no panic, no out-of-bounds read, no unbounded loop.
+    /// Leaf decode totality: any bytes decode to `Ok` or `Err` — no panic, no
+    /// out-of-bounds read, every loop bounded by the block.
     #[kani::proof]
-    #[kani::unwind(52)]
-    fn node_decode_is_total() {
-        let buf: [u8; SMALL] = kani::any();
+    #[kani::unwind(10)]
+    fn leaf_decode_is_total() {
+        let buf: [u8; LEAF_ONE] = kani::any();
         let mut leaf: Node<Span, 2> = Node::new(Span::EMPTY);
         let _ = decode_leaf(&buf, 0, &mut leaf);
+    }
+
+    /// Internal-node decode totality, as above.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn inner_decode_is_total() {
+        let buf: [u8; INNER_ONE] = kani::any();
         let mut inner: Node<Pointer, 2> = Node::new(Pointer::NULL);
         let _ = decode_inner(&buf, &mut inner);
     }
@@ -607,7 +617,7 @@ mod proofs {
     /// weight fits the shrunken block encodes `Ok`, and decodes back to the
     /// same keys with the same bytes for every item.
     #[kani::proof]
-    #[kani::unwind(52)]
+    #[kani::unwind(32)]
     fn leaf_packing_is_total_and_round_trips() {
         let src: [u8; 8] = kani::any();
         let n: usize = kani::any();

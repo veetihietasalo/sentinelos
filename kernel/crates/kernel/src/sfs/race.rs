@@ -266,8 +266,10 @@ fn run(callers: u64, ops: usize, seed: u64) {
     std::eprintln!(
         "race model: {commits} commits, {reads} miss reads, {sealed_reads} reads during a commit"
     );
+    // The shortened Miri run is too small to promise much contention.
+    let min_reads = if cfg!(miri) { 1 } else { 10 };
     assert!(
-        commits >= 2 && reads >= 10,
+        commits >= 2 && reads >= min_reads,
         "commits {commits}, reads {reads}"
     );
     // Cold remount: exactly the union of the callers' models, scrub clean.
