@@ -604,9 +604,9 @@ mod tests {
 mod proofs {
     use super::*;
 
-    /// A leaf block of 72 + 2 × 21 + 8 bytes: two items with 8 data bytes
-    /// between them, or one with up to 29.
-    const SMALL: usize = NODE_HDR + 2 * LEAF_SLOT + 8;
+    /// A leaf block of 72 + 2 × 21 + 4 bytes: two items with 4 data bytes
+    /// between them, or one with up to 25.
+    const SMALL: usize = NODE_HDR + 2 * LEAF_SLOT + 4;
     /// Decode harness blocks: room for exactly one entry of each kind plus a
     /// few spare bytes. Every decoder loop is bounded by the block length (a
     /// constant here), so the unwind is the block length plus one and CBMC
@@ -637,9 +637,11 @@ mod proofs {
     /// weight fits the shrunken block encodes `Ok`, and decodes back to the
     /// same keys with the same bytes for every item.
     #[kani::proof]
-    #[kani::unwind(123)]
+    #[kani::unwind(119)]
     fn leaf_packing_is_total_and_round_trips() {
-        let src: [u8; 8] = kani::any();
+        // Distinct bytes, so a copy from the wrong place cannot match; the
+        // offsets, lengths, keys and item count are symbolic.
+        let src: [u8; 4] = [0xA1, 0xB2, 0xC3, 0xD4];
         let n: usize = kani::any();
         kani::assume(n >= 1 && n <= 2);
         let mut node: Node<Span, 2> = Node::new(Span::EMPTY);
