@@ -118,7 +118,17 @@ fn totals() -> DenyTotals {
 }
 
 fn newest_record() -> Option<DenyRecord> {
-    with_host(|h| h.deny_len().checked_sub(1).and_then(|i| h.deny_record(i)))
+    record_back(0)
+}
+
+/// The record `back` places before the newest one held.
+fn record_back(back: u64) -> Option<DenyRecord> {
+    let back = usize::try_from(back).ok()?;
+    with_host(|h| {
+        h.deny_len()
+            .checked_sub(1 + back)
+            .and_then(|i| h.deny_record(i))
+    })
 }
 
 /// Counts every refusal the proof provokes and checks each was logged.
@@ -161,6 +171,25 @@ impl DenyWatch {
                 && r.action == Action::Grant
                 && r.reason == reason
         })
+    }
+
+    /// A start refused for a `Required` request: two refusals, reported once
+    /// each — the precise `cause`, then `missing-required` — both logged as
+    /// `holder`'s grant.
+    fn refused_required(&mut self, holder: Sender, cause: DenyReason) -> bool {
+        self.expected += 2;
+        let t = totals();
+        let two = t.total == self.total + 2;
+        self.total = t.total;
+        let rec = |back: u64, reason: DenyReason| {
+            record_back(back).is_some_and(|r| {
+                r.seq + 1 + back == t.logged
+                    && r.holder == holder
+                    && r.action == Action::Grant
+                    && r.reason == reason
+            })
+        };
+        two && rec(1, cause) && rec(0, DenyReason::MissingRequired)
     }
 
     /// `n` refusals the rate limit may suppress: counted, not checked per record.
@@ -342,12 +371,12 @@ fn run(w: &World, watch: &mut DenyWatch, v: &mut Verdict, carol_refusal: bool) {
     let strict = instantiate(&HOST, &probe::CAROL_STRICT_MANIFEST);
     v.strict_refused = strict == Err(InstantiateError::MissingRequiredCap)
         && with_host(|h| h.instance_count()) == before
-        && watch.refused_at_start(
+        && watch.refused_required(
             Sender {
                 instance: InstanceId::KERNEL,
                 component: CAROL_STRICT_ID,
             },
-            DenyReason::MissingRequired,
+            DenyReason::PolicyRefused,
         );
 
     // ── manifest-tamper: alice's id with her declarations edited ──

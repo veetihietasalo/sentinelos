@@ -247,13 +247,17 @@ impl Manifest {
         ComponentId::derive(self.code, self.params, self.caps, self.provides)
     }
 
-    /// Check the declarations are canonical, then hash what would run and
-    /// compare with the claimed id. The only way to obtain a [`Verified`]
-    /// token, which instantiation requires. A non-canonical `provides`
-    /// (unsorted or duplicated) is refused before hashing.
+    /// Check the declarations are canonical and meaningful, then hash what
+    /// would run and compare with the claimed id. The only way to obtain a
+    /// [`Verified`] token, which instantiation requires. A non-canonical
+    /// `provides` (unsorted or duplicated) and a request that can never mean
+    /// anything ([`CapRequest::is_meaningful`]) are refused before hashing.
     pub fn verify(&self) -> Result<Verified<'_>, InstantiateError> {
         if !provides_is_canonical(self.provides) {
             return Err(InstantiateError::NonCanonicalProvides);
+        }
+        if !self.caps.iter().all(CapRequest::is_meaningful) {
+            return Err(InstantiateError::MalformedRequest);
         }
         if self.derived_id() == self.id {
             Ok(Verified { manifest: self })
@@ -280,6 +284,11 @@ pub enum InstantiateError {
     /// The manifest's `provides` is not strictly ascending (unsorted or a
     /// duplicate): one set, one encoding. Refused before hashing.
     NonCanonicalProvides,
+    /// A capability request that can never mean anything: no operation, an
+    /// operation bit no `Op` names (FS-1c's reserved 8..=12 included), or an
+    /// attenuation that never fits (`Message.max_len > MAX_PAYLOAD`). Refused
+    /// before hashing, so every declaration an id binds is meaningful.
+    MalformedRequest,
     /// The runtime has no component for these bytes.
     UnknownCode,
     /// The host's or the runtime's instance table is full.
@@ -299,6 +308,7 @@ impl InstantiateError {
         match self {
             InstantiateError::IdMismatch => "id-mismatch",
             InstantiateError::NonCanonicalProvides => "non-canonical-provides",
+            InstantiateError::MalformedRequest => "malformed-request",
             InstantiateError::UnknownCode => "unknown-code",
             InstantiateError::TooManyInstances => "too-many-instances",
             InstantiateError::RuntimeRejected => "runtime-rejected",
@@ -577,6 +587,23 @@ impl<R: ComponentRuntime> Host<R> {
         Ok((requested, bound))
     }
 
+    /// Log a start refused for a `Required` request: first the precise
+    /// `cause` (`no-route`, `no-provider`, `not-provided`, `policy-refused`,
+    /// `table-full`, …), then `missing-required` — both in the kernel's
+    /// bucket, under the unborn component's name.
+    fn refuse_start(&mut self, now: Tick, unborn: Sender, cause: DenyReason) {
+        for reason in [cause, DenyReason::MissingRequired] {
+            self.deny.record(
+                now,
+                UNBOUND_BUCKET,
+                unborn,
+                CapIndex::KERNEL,
+                Action::Grant,
+                reason,
+            );
+        }
+    }
+
     /// Verify, then instantiate — [`Self::instantiate_verified`] after
     /// [`Manifest::verify`]. Tests only: it hashes inside whatever lock the
     /// caller holds, which must never be the kernel-wide host's (the kernel
@@ -647,15 +674,8 @@ impl<R: ComponentRuntime> Host<R> {
                         room -= 1;
                     }
                 }
-                if planned.is_err() && need == CapNeed::Required {
-                    self.deny.record(
-                        now,
-                        UNBOUND_BUCKET,
-                        unborn,
-                        CapIndex::KERNEL,
-                        Action::Grant,
-                        DenyReason::MissingRequired,
-                    );
+                if let (Err(cause), CapNeed::Required) = (planned, need) {
+                    self.refuse_start(now, unborn, cause);
                     return Err(InstantiateError::MissingRequiredCap);
                 }
                 plan[i] = planned;
@@ -699,14 +719,7 @@ impl<R: ComponentRuntime> Host<R> {
                         // undo everything, and log it as a refused start.
                         self.caps.clear_table(slot);
                         self.runtime.release(handle);
-                        self.deny.record(
-                            now,
-                            UNBOUND_BUCKET,
-                            unborn,
-                            CapIndex::KERNEL,
-                            Action::Grant,
-                            DenyReason::MissingRequired,
-                        );
+                        self.refuse_start(now, unborn, reason);
                         return Err(InstantiateError::MissingRequiredCap);
                     }
                     // Instantiation is the kernel's act: rate-limited in the
@@ -1192,13 +1205,25 @@ mod tests {
 /// `P(s) = P(s')`: `s = s'`. The collision resistance of SHA-256 then lifts
 /// frame injectivity to `ComponentId`.
 ///
+/// **What is machine-checked:** Kani proves the three lemmas; the
+/// composition is the paper argument above, not a Kani run.
+///
+/// The self-delimiting lemma is checked with `TAIL = 8` arbitrary trailing
+/// bytes — the shortest real tail, an empty `P` (`le64(0)`). For longer tails
+/// it rests on the decoder being **causal**: `Cursor` reads bytes strictly in
+/// order, each read advancing `pos`, and uses `b.len` only to detect the end
+/// (a read at `pos >= len` fails). Its result therefore depends only on the
+/// first `pos` bytes; on `R(r)` followed by anything, `pos` stops at
+/// `|R(r)|` (the harness checks this), so no byte of the tail is ever read,
+/// whatever the tail's length.
+///
 /// Why three harnesses: one over the whole frame (up to 209 bytes, 128 of
 /// them symbolic service names) did not fit — two symbolic frames compared
 /// byte for byte ran CBMC out of memory (15 GiB), a whole-frame round trip
 /// with every length dispatched to a constant took ~4.5 s of symbolic
 /// execution per branch over 144 branches, and the declarations alone as one
 /// round trip took 437 s. Split along the frame's own fields, each harness
-/// stays under the 60 s budget, and together they prove the same statement.
+/// stays under the 60 s budget.
 #[cfg(kani)]
 mod proofs {
     use super::{frame_head, frame_provides, frame_requests, FrameSink, ID_DOMAIN_TAG};
@@ -1290,8 +1315,10 @@ mod proofs {
     const PROVS: usize = 2;
     /// One framed request with today's only attenuation (2 bytes).
     const REQ_LEN: usize = 32 + 4 + 1 + 1 + 2 + 2;
-    /// Arbitrary bytes after the requests, for the self-delimiting check.
-    const TAIL: usize = 2;
+    /// Arbitrary bytes after the requests, for the self-delimiting check: 8,
+    /// the shortest tail a real frame has (`P` with no services is
+    /// `le64(0)`). Longer tails: the causality argument in the module docs.
+    const TAIL: usize = 8;
     /// The buffer is `CHUNKS` arrays of 32 bytes, not one long array: CBMC
     /// tracks the cells of an array of at most 64 elements one by one (field
     /// sensitivity), so bytes written at constant positions stay constants

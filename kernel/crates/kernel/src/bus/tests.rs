@@ -1291,3 +1291,171 @@ fn an_edited_manifest_is_refused_before_anything_runs() {
         "no instance, and no grant was even planned"
     );
 }
+
+/// The record just before the newest.
+fn second_last_deny(h: &Host<NativeRuntime>) -> DenyRecord {
+    h.deny_record(h.deny_len() - 2).unwrap()
+}
+
+/// alice's required bob request refused for `cause`: no start, and the log
+/// says why (the precise cause, then `missing-required`), both as alice.
+fn assert_required_refused_for(cell: &Cell, cause: DenyReason) {
+    let before = cell.lock().deny_totals().total;
+    let n = cell.lock().instance_count();
+    assert_eq!(
+        instantiate(cell, &probe::ALICE_MANIFEST),
+        Err(InstantiateError::MissingRequiredCap)
+    );
+    let h = cell.lock();
+    assert_eq!(h.instance_count(), n, "nothing started");
+    assert_eq!(
+        h.deny_totals().total,
+        before + 2,
+        "cause and missing-required"
+    );
+    let unborn = who(InstanceId::KERNEL, ALICE_ID);
+    let first = second_last_deny(&h);
+    let last = last_deny(&h);
+    assert_eq!(
+        (first.holder, first.action, first.reason),
+        (unborn, Action::Grant, cause)
+    );
+    assert_eq!(
+        (last.holder, last.action, last.reason),
+        (unborn, Action::Grant, DenyReason::MissingRequired)
+    );
+}
+
+#[test]
+fn a_required_request_refused_by_no_route_logs_the_cause() {
+    // Only carol's service is routed; alice requires bob's.
+    static ONLY_CAROL: [Route; 1] = [Route {
+        service: probe::CAROL_SERVICE,
+        provider: CAROL_ID,
+    }];
+    let cell = with_policy(&ONLY_CAROL, probe::POLICY_RULES);
+    instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    instantiate(&cell, &probe::CAROL_MANIFEST).unwrap();
+    assert_required_refused_for(&cell, DenyReason::NoRoute);
+}
+
+#[test]
+fn a_required_request_refused_by_not_provided_logs_the_cause() {
+    // bob's service misrouted to carol, whose id-bound manifest does not
+    // provide it.
+    static MISROUTED: [Route; 2] = [
+        Route {
+            service: probe::BOB_SERVICE,
+            provider: CAROL_ID,
+        },
+        Route {
+            service: probe::CAROL_SERVICE,
+            provider: CAROL_ID,
+        },
+    ];
+    let cell = with_policy(&MISROUTED, probe::POLICY_RULES);
+    instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    instantiate(&cell, &probe::CAROL_MANIFEST).unwrap();
+    assert_required_refused_for(&cell, DenyReason::NotProvided);
+}
+
+#[test]
+fn a_required_request_refused_by_the_policy_logs_the_cause() {
+    // Routed and provided, but the allow-list names only carol's service.
+    static ONLY_CAROL_RULE: [PolicyRule; 1] = [probe::POLICY_RULES[1]];
+    let cell = with_policy(probe::POLICY_ROUTES, &ONLY_CAROL_RULE);
+    instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    instantiate(&cell, &probe::CAROL_MANIFEST).unwrap();
+    assert_required_refused_for(&cell, DenyReason::PolicyRefused);
+}
+
+#[test]
+fn a_restarted_provider_is_bound_by_a_new_holder() {
+    let cell = fresh();
+    let old_bob = instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    instantiate(&cell, &probe::CAROL_MANIFEST).unwrap();
+    let old_alice = instantiate(&cell, &probe::ALICE_MANIFEST).unwrap();
+    // bob restarts: everything naming the old instance goes with it.
+    terminate(&cell, old_bob).unwrap();
+    let new_bob = instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    assert_ne!(new_bob, old_bob);
+    {
+        let h = cell.lock();
+        let stale = h.granted(old_alice, 0).unwrap();
+        assert!(
+            h.caps().get(slot(&h, old_alice), stale).is_err(),
+            "the old alice's grant died with the old bob (no rebind, §18.7)"
+        );
+    }
+    // A new alice resolves the same route to the same id — the new instance.
+    terminate(&cell, old_alice).unwrap();
+    let alice = instantiate(&cell, &probe::ALICE_MANIFEST).unwrap();
+    let h = cell.lock();
+    let to_bob = h.granted(alice, 0).expect("bound again");
+    assert_eq!(
+        h.caps().get(slot(&h, alice), to_bob).unwrap().cap.target,
+        Target::Instance(new_bob)
+    );
+}
+
+#[test]
+fn a_meaningless_request_is_refused_before_hashing() {
+    let bad_requests: [CapRequest; 4] = [
+        // No operation.
+        CapRequest {
+            ops: OpSet::EMPTY,
+            ..probe::ALICE_ASKS_FOR_BOB
+        },
+        // An undefined bit (FS-1c's reserved bit 8, not defined yet).
+        CapRequest {
+            ops: OpSet::from_bits(Op::Send.bit() | (1 << 8)),
+            ..probe::ALICE_ASKS_FOR_BOB
+        },
+        // A bit far outside anything named.
+        CapRequest {
+            ops: OpSet::from_bits(1 << 31),
+            ..probe::ALICE_ASKS_FOR_BOB
+        },
+        // An attenuation that never fits.
+        CapRequest {
+            attenuation: Attenuation::Message {
+                max_len: (crate::host::codec::MAX_PAYLOAD + 1) as u16,
+            },
+            ..probe::ALICE_ASKS_FOR_BOB
+        },
+    ];
+    for bad in bad_requests {
+        assert!(!bad.is_meaningful());
+    }
+    assert!(probe::ALICE_ASKS_FOR_BOB.is_meaningful());
+    static NO_OPS: [CapRequest; 1] = [CapRequest {
+        ops: OpSet::EMPTY,
+        ..probe::ALICE_ASKS_FOR_BOB
+    }];
+    static UNDEFINED_BIT: [CapRequest; 1] = [CapRequest {
+        ops: OpSet::from_bits(1 << 8),
+        ..probe::ALICE_ASKS_FOR_BOB
+    }];
+    static TOO_LONG: [CapRequest; 1] = [CapRequest {
+        attenuation: Attenuation::Message { max_len: u16::MAX },
+        ..probe::ALICE_ASKS_FOR_BOB
+    }];
+    let cell = fresh();
+    for caps in [&NO_OPS[..], &UNDEFINED_BIT[..], &TOO_LONG[..]] {
+        // Even with an honest id for exactly these declarations.
+        let m = honest(Manifest {
+            caps,
+            ..probe::ALICE_MANIFEST
+        });
+        assert_eq!(m.verify().err(), Some(InstantiateError::MalformedRequest));
+        assert_eq!(
+            instantiate(&cell, &m),
+            Err(InstantiateError::MalformedRequest)
+        );
+    }
+    assert_eq!(cell.lock().instance_count(), 0);
+    assert_eq!(
+        InstantiateError::MalformedRequest.label(),
+        "malformed-request"
+    );
+}

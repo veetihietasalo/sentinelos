@@ -647,9 +647,7 @@ fn parse_sfs_format(line: &str) -> Option<SfsFormat> {
 /// one-line summary.
 fn check_persistence_chain(boot1: &str, boot2: &str, fresh: bool) -> Result<String, String> {
     fn find<'a>(log: &'a str, prefix: &str) -> Option<&'a str> {
-        log.lines()
-            .find(|l| l.starts_with(prefix))
-            .map(str::trim_end)
+        log.lines().find(|l| l.starts_with(prefix)).map(str::trim_end)
     }
     fn text(sb: &[u8; 8]) -> String {
         String::from_utf8_lossy(sb).into_owned()
@@ -725,11 +723,7 @@ fn check_persistence_chain(boot1: &str, boot2: &str, fresh: bool) -> Result<Stri
         "PERSISTENCE CHAIN PROVEN across two boots{}: SentinelFS boot 1 mounted gen={} slot={} \
          and committed gen={} slot={} sb={}; boot 2 mounted exactly that and committed gen={} \
          slot={}; toy FS: '{proven}'",
-        if fresh {
-            " on a blank disk"
-        } else {
-            " (kept disk)"
-        },
+        if fresh { " on a blank disk" } else { " (kept disk)" },
         m1.gen,
         m1.slot,
         c1.gen,
@@ -1310,8 +1304,9 @@ fn find_ata_references(src: &str) -> Vec<usize> {
             i += 1;
         }
     }
-    let is_ident =
-        |t: Option<&(usize, Tok)>, name: &str| matches!(t, Some((_, Tok::Ident(s))) if s == name);
+    let is_ident = |t: Option<&(usize, Tok)>, name: &str| {
+        matches!(t, Some((_, Tok::Ident(s))) if s == name)
+    };
     let mut lines = Vec::new();
     for i in 0..toks.len() {
         if !is_ident(toks.get(i), "hal") || toks.get(i + 1).map(|t| &t.1) != Some(&Tok::PathSep) {
@@ -1419,6 +1414,7 @@ fn do_check_ata_callers() -> ExitCode {
         ExitCode::FAILURE
     }
 }
+
 
 // ── check-component-imports ────────────────────────────────────────────────────
 
@@ -1829,10 +1825,7 @@ fn boot_test(kvm: bool) -> ExitCode {
     let mut logs: Vec<String> = Vec::with_capacity(BOOT_TEST_LOGS.len());
     for (i, rel) in BOOT_TEST_LOGS.iter().enumerate() {
         let boot = i + 1;
-        println!(
-            "=== boot {boot} of {} (serial log: {rel}) ===",
-            BOOT_TEST_LOGS.len()
-        );
+        println!("=== boot {boot} of {} (serial log: {rel}) ===", BOOT_TEST_LOGS.len());
         let started = Instant::now();
         let (log, found) = run_boot(kvm, &iso, &disk, &kr(rel));
         println!(
@@ -1910,10 +1903,9 @@ fn run_boot(kvm: bool, iso: &Path, disk: &Path, serial_log: &Path) -> (String, b
 
     // Read final log (may have grown slightly after the last poll).
     let log = fs::read_to_string(serial_log).unwrap_or_default();
-    let name = serial_log.file_name().map_or_else(
-        || serial_log.display().to_string(),
-        |n| n.to_string_lossy().into_owned(),
-    );
+    let name = serial_log
+        .file_name()
+        .map_or_else(|| serial_log.display().to_string(), |n| n.to_string_lossy().into_owned());
     println!("--- {name} ---");
     println!("{}", log);
     println!("--- end {name} ---");
@@ -3008,10 +3000,7 @@ ffffffff80105000 <isr_common>:\n\
 
         let (b1, b2) = chain_logs();
         let summary = check_persistence_chain(&b1, &b2, true).unwrap();
-        assert!(
-            summary.contains("committed gen=2 slot=0 sb=22222222"),
-            "{summary}"
-        );
+        assert!(summary.contains("committed gen=2 slot=0 sb=22222222"), "{summary}");
         // A kept disk drops the absolute values but not the chain.
         let (k1, k2) = (
             b1.replace("gen=1 slot=1", "gen=7 slot=1")
@@ -3020,10 +3009,7 @@ ffffffff80105000 <isr_common>:\n\
                 .replace("gen=3 slot=1", "gen=9 slot=1"),
         );
         assert!(check_persistence_chain(&k1, &k2, false).is_ok());
-        assert!(
-            check_persistence_chain(&k1, &k2, true).is_err(),
-            "not a blank disk"
-        );
+        assert!(check_persistence_chain(&k1, &k2, true).is_err(), "not a blank disk");
     }
 
     #[test]
@@ -3143,16 +3129,9 @@ ffffffff80105000 <isr_common>:\n\
         use super::{find_ata_references, kernel_root, ATA_DOOR};
 
         let door = std::fs::read_to_string(kernel_root().join(ATA_DOOR)).unwrap();
-        assert!(
-            !find_ata_references(&door).is_empty(),
-            "the door names hal::ata"
-        );
+        assert!(!find_ata_references(&door).is_empty(), "the door names hal::ata");
         let fs = std::fs::read_to_string(kernel_root().join("crates/kernel/src/fs.rs")).unwrap();
-        assert_eq!(
-            find_ata_references(&fs),
-            Vec::<usize>::new(),
-            "kernel::fs goes through the door"
-        );
+        assert_eq!(find_ata_references(&fs), Vec::<usize>::new(), "kernel::fs goes through the door");
     }
 }
 

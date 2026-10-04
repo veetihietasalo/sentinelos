@@ -255,6 +255,10 @@ impl OpSet {
     /// No operations.
     pub const EMPTY: OpSet = OpSet(0);
 
+    /// Every bit an [`Op`] names today. Bits outside it are undefined (FS-1c
+    /// will define 8..=12); a manifest that asks for one is refused.
+    pub const DEFINED: OpSet = OpSet::of(&[Op::Send, Op::Request, Op::Reply, Op::Delegate]);
+
     /// The set holding exactly `ops`.
     pub const fn of(ops: &[Op]) -> OpSet {
         let mut bits = 0;
@@ -687,6 +691,20 @@ pub struct CapRequest {
     pub attenuation: Attenuation,
     /// Refuse to start without it, or not.
     pub need: CapNeed,
+}
+
+impl CapRequest {
+    /// Whether this request means something, so the declaration an id binds
+    /// is never vacuous: at least one operation, only operations an [`Op`]
+    /// names today (undefined bits — FS-1c's reserved 8..=12 included — are
+    /// refused, not ignored), and an attenuation that fits an instance target
+    /// (`Message.max_len <= MAX_PAYLOAD`). `Manifest::verify` refuses a
+    /// manifest with any request for which this is false.
+    pub fn is_meaningful(&self) -> bool {
+        !self.ops.is_empty()
+            && self.ops.is_subset_of(OpSet::DEFINED)
+            && self.attenuation.fits(&Target::Instance(InstanceId::KERNEL))
+    }
 }
 
 /// One route: requests for `service` go to instances of component
