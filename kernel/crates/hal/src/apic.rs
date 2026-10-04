@@ -486,7 +486,8 @@ pub fn eoi() {
 }
 
 /// ISR register offset and bit for `vector` — pure, so the decode is
-/// host-tested and Kani-proved (`isr_slot_is_exact`).
+/// host-tested and Kani-proved (`isr_slot_is_exact`). Used by
+/// [`eoi_if_in_service`].
 #[must_use]
 const fn isr_slot(vector: u8) -> (u32, u32) {
     (
@@ -495,24 +496,29 @@ const fn isr_slot(vector: u8) -> (u32, u32) {
     )
 }
 
-/// Whether the **calling core's** LAPIC has `vector` in service — i.e. the
-/// interrupt now being handled on `vector` was delivered as a LAPIC message
-/// (IOAPIC, IPI, LAPIC timer) and owes the LAPIC an EOI. `false` for a
-/// virtual-wire ExtINT delivery (never enters the ISR) and where this core has
-/// no LAPIC access path. Used by `ioapic::device_eoi` to EOI exactly the
-/// controller that delivered a device IRQ.
+/// If the **calling core's** LAPIC has `vector` in service, EOI it and return
+/// `true`; otherwise do nothing and return `false`. The access path is read
+/// once, so a device IRQ costs one `IA32_APIC_BASE` read, one ISR read and one
+/// EOI write — not two path lookups (each an MSR read, a VM exit on KVM).
+/// `ioapic::device_eoi` falls back to the 8259 on `false`.
 #[must_use]
-pub fn in_service(vector: u8) -> bool {
+pub fn eoi_if_in_service(vector: u8) -> bool {
     let Some(mode) = access_mode() else {
         return false;
     };
     let (reg, bit) = isr_slot(vector);
-    // SAFETY: (AP8) `mode` is live (x2APIC: EXTD set ⇒ MSR `0x810..=0x817`
+    // SAFETY: (AP8) `mode` is live (x2APIC: EXTD set ⇒ MSRs `0x810..=0x817`
     // implemented; xAPIC: the AP4 mapping exists). `reg` is one of the eight
     // ISR offsets `0x100..=0x170` (16-byte aligned, < 0x1000), a read-only
     // register: reading it has no side effect and cannot alias Rust memory.
     let word = unsafe { reg_read(mode, reg) } as u32;
-    word & (1 << bit) != 0
+    if word & (1 << bit) == 0 {
+        return false;
+    }
+    // SAFETY: (AP6) as `eoi`: the write-only EOI register over the same live
+    // path; acknowledging an interrupt cannot alias Rust memory.
+    unsafe { reg_write(mode, REG_EOI, 0) }
+    true
 }
 
 /// Mask the **calling core's** LVT LINT0 — take the 8259 out of the virtual

@@ -264,17 +264,20 @@ struct Nic {
     mac: [u8; 6],
 }
 
-/// A tiny spin mutex local to this module (the `mm::sync` one is private). At
-/// bring-up the kernel is single-core, so it never actually spins.
+/// A tiny spin mutex local to this module. The kernel is SMP, so it can spin
+/// when two cores reach the NIC at once; within one core it cannot deadlock,
+/// because [`NicLock::with`] masks interrupts for the whole critical section
+/// and the NIC handler ([`on_irq`]) is the only interrupt-context user.
 struct NicLock {
     locked: AtomicBool,
     inner: core::cell::UnsafeCell<Option<Nic>>,
 }
 
 // SAFETY: access to the inner `Option<Nic>` is serialised by the `locked`
-// atomic (only one critical section runs at a time), and the kernel is
-// single-core at bring-up, so the inner value is never touched concurrently —
-// exactly the `Sync` invariant. The `Nic`'s raw addresses (MMIO base, DMA
+// atomic: its Acquire compare-exchange admits exactly one critical section at
+// a time on any core, and the Release store publishes that section's writes to
+// the next holder — so the inner value is never touched concurrently, exactly
+// the `Sync` invariant. The `Nic`'s raw addresses (MMIO base, DMA
 // frames) are valid for the program's lifetime.
 unsafe impl Sync for NicLock {}
 

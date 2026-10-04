@@ -36,10 +36,10 @@
 //! It is **never** taken from interrupt context ([`device_eoi`] touches only the
 //! LAPIC), so it needs no interrupt masking to be deadlock-free.
 //!
-//! Registry: `kernel/docs/hal-tcb.md` §2m (IO1–IO3) and invariant 4.16.
+//! Registry: `kernel/docs/hal-tcb.md` §2m (IO1–IO4) and invariant 17.
 
 use crate::mm::{self, PhysAddr};
-use crate::sync::SpinMutex;
+use crate::sync::{SpinGuard, SpinMutex};
 
 /// `IOREGSEL` offset in the window.
 const IOREGSEL: u64 = 0x00;
@@ -181,15 +181,16 @@ impl RedirectionEntry {
         })
     }
 
-    /// Whether `hal` will program this entry: fixed / lowest-priority delivery
-    /// must name a vector ≥ [`MIN_DEVICE_VECTOR`] unless the entry is masked.
+    /// Whether `hal` will program this entry. A masked entry is inert and may
+    /// hold anything. An **unmasked** entry must be fixed delivery of a vector
+    /// ≥ [`MIN_DEVICE_VECTOR`]: SMI, NMI, INIT and ExtINT delivery would let a
+    /// device line reset or seize a core, lowest-priority needs a logical
+    /// destination `hal` never programs, and a vector below `0x20` would enter
+    /// an exception stub whose error-code expectation does not match.
     #[must_use]
     pub const fn is_programmable(self) -> bool {
-        let vectored = matches!(
-            self.delivery,
-            DeliveryMode::Fixed | DeliveryMode::LowestPriority
-        );
-        self.masked || !vectored || self.vector >= MIN_DEVICE_VECTOR
+        self.masked
+            || (matches!(self.delivery, DeliveryMode::Fixed) && self.vector >= MIN_DEVICE_VECTOR)
     }
 }
 
@@ -237,17 +238,22 @@ impl IoApic {
     /// type-1 `address`) and read its identity.
     ///
     /// The address comes from firmware, so it is checked before anything is
-    /// mapped: 16-byte aligned (both registers 4-byte aligned in one window),
-    /// non-wrapping, and overlapping no kernel-owned RAM — a lying table can
-    /// therefore never turn the two register writes below into stores to
-    /// kernel memory. The window is mapped uncached through the audited
-    /// `mm::map_mmio`, then the version register must read back plausibly.
+    /// mapped: it is the MADT's 32-bit field (so it cannot carry bits at or
+    /// above `MAXPHYADDR` that a page-table leaf would ignore or alias — and
+    /// `mm::map_mmio` independently refuses any such span, `mm::phys_span`),
+    /// 16-byte aligned (both registers 4-byte aligned in one window), and
+    /// overlapping no kernel-owned RAM. A lying table can therefore never turn
+    /// the register writes below into stores to kernel memory; it can still
+    /// make `hal` poke some *other* device's MMIO at that address, which is the
+    /// residual trust placed in firmware (hal-tcb IO1). The window is mapped
+    /// uncached, then the version register must read back plausibly.
     ///
     /// # Errors
     ///
     /// See [`MapError`].
-    pub fn map(phys: u64) -> Result<Self, MapError> {
-        if phys & 0xF != 0 || phys.checked_add(WINDOW_LEN as u64).is_none() {
+    pub fn map(phys: u32) -> Result<Self, MapError> {
+        let phys = u64::from(phys);
+        if phys & 0xF != 0 {
             return Err(MapError::BadAddress);
         }
         if mm::overlaps_kernel_owned(phys, WINDOW_LEN as u64) {
@@ -261,14 +267,17 @@ impl IoApic {
             version: 0,
             max_entry: 0,
         };
-        let ver = dev.read_reg(REG_VER);
+        let (ver, id) = {
+            let g = IOAPIC_LOCK.lock();
+            (dev.sel_read(&g, REG_VER), dev.sel_read(&g, REG_ID))
+        };
         if !version_plausible(ver) {
             return Err(MapError::NoDevice);
         }
         let (version, max_entry) = decode_version(ver);
         dev.version = version;
         dev.max_entry = max_entry;
-        dev.id = ((dev.read_reg(REG_ID) >> 24) & 0x0F) as u8;
+        dev.id = ((id >> 24) & 0x0F) as u8;
         Ok(dev)
     }
 
@@ -291,28 +300,30 @@ impl IoApic {
         self.max_entry as u16 + 1
     }
 
-    /// One indirect register read: select `reg`, read the window.
-    fn read_reg(&self, reg: u32) -> u32 {
-        let _guard = IOAPIC_LOCK.lock();
+    /// One indirect register read: select `reg`, read the window. Takes the
+    /// held [`IOAPIC_LOCK`] guard, so every select/window pair — and every
+    /// multi-register sequence a caller builds from these — runs under one
+    /// acquisition: the pairing is enforced by the signature.
+    fn sel_read(&self, _held: &SpinGuard<'_, ()>, reg: u32) -> u32 {
         // SAFETY: (IO2) `self.base` is the uncached mapping of a 0x20-byte IOAPIC
-        // window that `map` validated (aligned, not kernel RAM) and mapped; it is
-        // never unmapped. `IOREGSEL` (+0) and `IOWIN` (+0x10) are 4-byte aligned
-        // `u32` registers inside it. Volatile because they are device registers;
-        // the global lock keeps the select and the window access paired. Device
-        // register access cannot alias Rust memory.
+        // window that `map` validated (aligned, below MAXPHYADDR, not kernel RAM)
+        // and mapped; it is never unmapped. `IOREGSEL` (+0) and `IOWIN` (+0x10)
+        // are 4-byte aligned `u32` registers inside it. Volatile because they are
+        // device registers; the caller holds the global lock, so the select and
+        // the window access stay paired. Device register access cannot alias
+        // Rust memory.
         unsafe {
             core::ptr::write_volatile((self.base + IOREGSEL) as *mut u32, reg);
             core::ptr::read_volatile((self.base + IOWIN) as *const u32)
         }
     }
 
-    /// One indirect register write: select `reg`, write the window.
-    fn write_reg(&self, reg: u32, value: u32) {
-        let _guard = IOAPIC_LOCK.lock();
-        // SAFETY: (IO2/IO3) as `read_reg` — the validated, mapped window; both
+    /// One indirect register write: select `reg`, write the window (lock held).
+    fn sel_write(&self, _held: &SpinGuard<'_, ()>, reg: u32, value: u32) {
+        // SAFETY: (IO2/IO3) as `sel_read` — the validated, mapped window; both
         // accesses are aligned volatile `u32` device-register stores under the
-        // pairing lock. Callers pass only the ID/version or a redirection-table
-        // index `< 0x10 + 2 * pins` (checked in `write_entry`).
+        // held pairing lock. Callers pass only a redirection-table index
+        // `< 0x10 + 2 * pins` (checked in `write_entry`).
         unsafe {
             core::ptr::write_volatile((self.base + IOREGSEL) as *mut u32, reg);
             core::ptr::write_volatile((self.base + IOWIN) as *mut u32, value);
@@ -333,9 +344,12 @@ impl IoApic {
         }
         let raw = entry.to_raw();
         let low = REG_REDTBL + 2 * u32::from(pin);
-        self.write_reg(low, (raw as u32) | (BIT_MASKED as u32));
-        self.write_reg(low + 1, (raw >> 32) as u32);
-        self.write_reg(low, raw as u32);
+        // One acquisition for the whole three-write sequence: no other core can
+        // interleave a write to the same entry between its halves.
+        let g = IOAPIC_LOCK.lock();
+        self.sel_write(&g, low, (raw as u32) | (BIT_MASKED as u32));
+        self.sel_write(&g, low + 1, (raw >> 32) as u32);
+        self.sel_write(&g, low, raw as u32);
         true
     }
 
@@ -347,7 +361,10 @@ impl IoApic {
             return None;
         }
         let low = REG_REDTBL + 2 * u32::from(pin);
-        let raw = u64::from(self.read_reg(low)) | (u64::from(self.read_reg(low + 1)) << 32);
+        let raw = {
+            let g = IOAPIC_LOCK.lock();
+            u64::from(self.sel_read(&g, low)) | (u64::from(self.sel_read(&g, low + 1)) << 32)
+        };
         RedirectionEntry::from_raw(raw)
     }
 
@@ -366,9 +383,7 @@ impl IoApic {
 /// which never sets a LAPIC ISR bit). Exactly one EOI is issued, to the
 /// controller that actually delivered the interrupt. See the module docs.
 pub fn device_eoi(vector: u8) {
-    if crate::apic::in_service(vector) {
-        crate::apic::eoi();
-    } else {
+    if !crate::apic::eoi_if_in_service(vector) {
         crate::pic::end_of_interrupt(vector);
     }
 }
@@ -420,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_vectors_are_not_programmable_unless_masked_or_unvectored() {
+    fn only_fixed_device_vectors_are_programmable_unmasked() {
         let mut e = RedirectionEntry {
             masked: false,
             vector: 0x1F,
@@ -429,12 +444,19 @@ mod tests {
         assert!(!e.is_programmable());
         e.vector = 0x20;
         assert!(e.is_programmable());
-        e.vector = 0x08;
-        e.masked = true;
-        assert!(e.is_programmable());
-        e.masked = false;
-        e.delivery = DeliveryMode::Nmi;
-        assert!(e.is_programmable());
+        for mode in [
+            DeliveryMode::LowestPriority,
+            DeliveryMode::Smi,
+            DeliveryMode::Nmi,
+            DeliveryMode::Init,
+            DeliveryMode::ExtInt,
+        ] {
+            e.delivery = mode;
+            e.masked = false;
+            assert!(!e.is_programmable(), "{mode:?} unmasked");
+            e.masked = true;
+            assert!(e.is_programmable(), "{mode:?} masked");
+        }
         assert!(RedirectionEntry::MASKED.is_programmable());
     }
 
@@ -499,17 +521,14 @@ mod proofs {
         }
     }
 
-    /// A programmable, unmasked, vectored entry never names an exception vector.
+    /// Every entry `hal` will program unmasked is fixed delivery of a device
+    /// vector — never SMI/NMI/INIT/ExtINT/lowest-priority, never an exception
+    /// vector.
     #[kani::proof]
     fn programmable_entries_never_target_exception_vectors() {
         let e = any_entry();
-        if e.is_programmable()
-            && !e.masked
-            && matches!(
-                e.delivery,
-                DeliveryMode::Fixed | DeliveryMode::LowestPriority
-            )
-        {
+        if e.is_programmable() && !e.masked {
+            assert!(matches!(e.delivery, DeliveryMode::Fixed));
             assert!(e.vector >= MIN_DEVICE_VECTOR);
         }
     }

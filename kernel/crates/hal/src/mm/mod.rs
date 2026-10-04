@@ -60,6 +60,9 @@ pub enum MmioError {
     NotInitialised,
     /// A page in the region could not be mapped (out of frames or a clash).
     MapFailed(MapError),
+    /// The physical range is empty, overflows, or reaches past `MAXPHYADDR`
+    /// ([`phys_span`]).
+    BadRange,
 }
 
 impl From<MapError> for MmioError {
@@ -108,20 +111,78 @@ pub fn map_firmware_ro(phys: PhysAddr, len: usize) -> Result<VirtAddr, MmioError
     map_window(phys, len, PageFlags::kernel_ro())
 }
 
-/// The shared body of [`map_mmio`] / [`map_firmware_ro`]: bump-allocate a
-/// virtual span in the MMIO window and map every page of `[phys, phys + len)`
-/// with `flags`.
+/// Physical-address width the CPU implements (`MAXPHYADDR`): CPUID
+/// `0x8000_0008` EAX[7:0] where that leaf exists, else the architectural
+/// fallback of 36. Clamped to `[32, 52]` (52 is the architectural maximum a
+/// 4-level/5-level PTE can name).
+#[must_use]
+pub const fn decode_phys_addr_bits(max_extended_leaf: u32, leaf_8008_eax: u32) -> u8 {
+    if max_extended_leaf < 0x8000_0008 {
+        return 36;
+    }
+    let bits = (leaf_8008_eax & 0xFF) as u8;
+    if bits < 32 {
+        32
+    } else if bits > 52 {
+        52
+    } else {
+        bits
+    }
+}
+
+/// This CPU's `MAXPHYADDR` (see [`decode_phys_addr_bits`]); pure `cpuid`.
+#[must_use]
+pub fn phys_addr_bits() -> u8 {
+    let max_ext = crate::cpuid::raw(0x8000_0000, 0).eax;
+    let eax = if max_ext >= 0x8000_0008 {
+        crate::cpuid::raw(0x8000_0008, 0).eax
+    } else {
+        0
+    };
+    decode_phys_addr_bits(max_ext, eax)
+}
+
+/// The page-aligned physical span `map_window` would map for `[phys, phys + len)`,
+/// as `(page_base, span_bytes)`, or `None` if the request is empty, overflows
+/// `u64` (the add or the round-up), or ends — rounded up to a page — above
+/// `1 << phys_bits`.
+///
+/// This is the whole physical-address validation for every firmware- or
+/// device-supplied address `hal` maps: a page-table leaf is built as
+/// `phys | flags` with no mask, so an address with bits at or above
+/// `MAXPHYADDR` would otherwise alias a low frame (bits 52–62 are ignored /
+/// software-available) or fault with `RSVD`, and would slip past
+/// [`overlaps_kernel_owned`], which compares raw values. Pure, so it is
+/// host-tested and Kani-proved (`phys_span_is_bounded`).
+#[must_use]
+pub const fn phys_span(phys: u64, len: u64, phys_bits: u8) -> Option<(u64, u64)> {
+    if len == 0 || phys_bits > 52 {
+        return None;
+    }
+    let Some(end) = phys.checked_add(len) else {
+        return None;
+    };
+    let Some(end_ceil) = end.checked_add(PAGE_SIZE - 1) else {
+        return None;
+    };
+    let end_ceil = end_ceil & !(PAGE_SIZE - 1);
+    if end_ceil > (1u64 << phys_bits) {
+        return None;
+    }
+    let base = phys & !(PAGE_SIZE - 1);
+    Some((base, end_ceil - base))
+}
+
+/// The shared body of [`map_mmio`] / [`map_firmware_ro`]: validate the span
+/// ([`phys_span`] against this CPU's `MAXPHYADDR`), bump-allocate a virtual
+/// span in the MMIO window and map every page of `[phys, phys + len)` with
+/// `flags`.
 fn map_window(phys: PhysAddr, len: usize, flags: PageFlags) -> Result<VirtAddr, MmioError> {
     let hhdm = hhdm_offset().ok_or(MmioError::NotInitialised)?;
-
-    // Page-align the physical span: floor the base, ceil the end, so the whole
-    // region is covered by whole 4 KiB pages.
-    let phys_base = phys.frame_floor().as_u64();
+    let (phys_base, span) =
+        phys_span(phys.as_u64(), len as u64, phys_addr_bits()).ok_or(MmioError::BadRange)?;
     let offset_in_page = phys.as_u64() - phys_base;
-    let phys_end = PhysAddr::new(phys.as_u64() + len as u64)
-        .frame_ceil()
-        .as_u64();
-    let span = (phys_end - phys_base) as usize;
+    let span = usize::try_from(span).map_err(|_| MmioError::BadRange)?;
     let pages = span / PAGE_SIZE as usize;
 
     // Reserve a contiguous virtual span from the MMIO bump cursor.
@@ -479,4 +540,78 @@ pub fn init(allocator: &LockedHeap) -> Result<MemoryInfo, InitError> {
         total_frames,
         heap_bytes: HEAP_SIZE as usize,
     })
+}
+
+#[cfg(test)]
+mod phys_span_tests {
+    use super::{decode_phys_addr_bits, phys_span};
+
+    #[test]
+    fn spans_round_to_pages_and_preserve_base() {
+        assert_eq!(
+            phys_span(0xFEC0_0000, 0x20, 36),
+            Some((0xFEC0_0000, 0x1000))
+        );
+        assert_eq!(phys_span(0xF5A30, 36, 36), Some((0xF5000, 0x1000)));
+        assert_eq!(phys_span(0xFFF, 2, 36), Some((0, 0x2000)));
+    }
+
+    #[test]
+    fn rejects_empty_overflow_and_beyond_maxphyaddr() {
+        assert_eq!(phys_span(0x1000, 0, 36), None);
+        // Bits above MAXPHYADDR (the aliasing bypass): kernel frame | 1 << 52.
+        assert_eq!(phys_span(0x10_0000 | (1 << 52), 0x20, 52), None);
+        assert_eq!(phys_span(0x10_0000 | (1 << 40), 0x20, 39), None);
+        // Wrapping add and wrapping page round-up.
+        assert_eq!(phys_span(u64::MAX, 1, 52), None);
+        assert_eq!(phys_span(0xFFFF_FFFF_FFFF_FFC0, 0x20, 52), None);
+        // Ends exactly at the limit: allowed; one byte past: refused.
+        assert_eq!(
+            phys_span((1 << 36) - 0x1000, 0x1000, 36),
+            Some(((1 << 36) - 0x1000, 0x1000))
+        );
+        assert_eq!(phys_span((1 << 36) - 0x1000, 0x1001, 36), None);
+        assert_eq!(phys_span(0, 1, 53), None);
+    }
+
+    #[test]
+    fn phys_addr_bits_decode() {
+        assert_eq!(decode_phys_addr_bits(0x8000_0007, 0xFF), 36);
+        assert_eq!(decode_phys_addr_bits(0x8000_0008, 0x3027), 39);
+        assert_eq!(decode_phys_addr_bits(0x8000_0008, 0x0010), 32);
+        assert_eq!(decode_phys_addr_bits(0x8000_0008, 0x00FF), 52);
+    }
+}
+
+#[cfg(kani)]
+mod phys_span_proofs {
+    use super::{decode_phys_addr_bits, phys_span, PAGE_SIZE};
+
+    /// For every address, length and width, an accepted span is page-aligned,
+    /// non-empty, covers `[phys, phys + len)`, and lies entirely below
+    /// `1 << phys_bits` — so no mapped frame carries a bit at or above
+    /// `MAXPHYADDR`.
+    #[kani::proof]
+    fn phys_span_is_bounded() {
+        let phys: u64 = kani::any();
+        let len: u64 = kani::any();
+        let bits: u8 = kani::any();
+        if let Some((base, span)) = phys_span(phys, len, bits) {
+            assert!(bits <= 52);
+            assert_eq!(base % PAGE_SIZE, 0);
+            assert_eq!(span % PAGE_SIZE, 0);
+            assert!(span >= PAGE_SIZE);
+            assert!(base <= phys);
+            let end = base + span;
+            assert!(end >= phys + len);
+            assert!(end <= 1u64 << bits);
+        }
+    }
+
+    /// The width decode is total and always within `[32, 52]`.
+    #[kani::proof]
+    fn phys_addr_bits_decode_is_clamped() {
+        let b = decode_phys_addr_bits(kani::any(), kani::any());
+        assert!((32..=52).contains(&b));
+    }
 }

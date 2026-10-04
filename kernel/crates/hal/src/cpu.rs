@@ -403,6 +403,23 @@ pub(crate) unsafe fn xrstor(area: *const u8, mask: u64) {
     }
 }
 
+/// Read the time-stamp counter (`rdtsc`). Used only as a coarse, monotonic
+/// bound on boot-time waits (`kernel::ioapic`'s PIT-liveness check), never as
+/// a calibrated clock.
+#[inline]
+#[must_use]
+pub fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: (C16) `rdtsc` reads the TSC into EDX:EAX. It is unprivileged
+    // unless CR4.TSD is set (never set by this kernel), touches no memory
+    // (`nomem`, `nostack`) and leaves RFLAGS unchanged (`preserves_flags`).
+    unsafe {
+        asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
+    }
+    (u64::from(hi) << 32) | u64::from(lo)
+}
+
 /// Halt the CPU until the next interrupt (`hlt`) — executed exactly once.
 ///
 /// If interrupts are disabled this parks the core until an NMI or reset.

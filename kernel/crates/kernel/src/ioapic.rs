@@ -53,8 +53,9 @@ const MADT_BUF_LEN: usize = 8 * 1024;
 
 /// PIT ticks the post-switch liveness check must observe.
 const PIT_LIVE_TICKS: u64 = 3;
-/// Spin bound for that check (≈ seconds even under TCG; reached only on failure).
-const PIT_LIVE_SPIN_LIMIT: u64 = 400_000_000;
+/// TSC-cycle bound for that check: 2^33 cycles is ~2–4 s at real TSC rates
+/// (and under TCG, whose TSC follows the host clock) — reached only on failure.
+const PIT_LIVE_TSC_LIMIT: u64 = 1 << 33;
 
 /// Where one ISA IRQ lands: its GSI and the electrical properties of that pin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +116,25 @@ pub const fn device_entry(route: IsaRoute, vector: u8, dest: u8) -> RedirectionE
     }
 }
 
+/// The route for a PCI device's legacy INTx line `irq` (its PCI
+/// interrupt-line register), or `None` to leave the device polled.
+///
+/// Only a line the MADT declares **level-triggered** through an ISA-bus
+/// override is routed: that is how the firmware says the line is a shared PCI
+/// interrupt it steers onto that GSI (QEMU: IRQ 5/9/10/11, flags `0xD`). A line
+/// without such an override is ambiguous — an ISA-style edge pin, or a PCI line
+/// whose real GSI only the ACPI `_PRT` (AML, not interpreted here) knows — and
+/// guessing could take over another source's pin (a PCI line of 2 with no
+/// override would land on the PIT's GSI 2). A GSI in `taken` is refused too.
+#[must_use]
+pub fn pci_legacy_route(madt: &MadtInfo, irq: u8, taken: &[u32]) -> Option<IsaRoute> {
+    let iso = madt.override_for_isa(irq)?;
+    if iso.trigger != Trigger::Level || taken.contains(&iso.gsi) {
+        return None;
+    }
+    Some(isa_route(madt, irq))
+}
+
 /// Routed sources, as bits of [`Router::routed`].
 const SRC_PIT: u8 = 1 << 0;
 const SRC_KBD: u8 = 1 << 1;
@@ -130,6 +150,9 @@ struct Router {
     madt: MadtInfo,
     dest: u8,
     routed: u8,
+    /// GSIs already carrying a route — no second source may claim one.
+    gsis: [u32; 4],
+    gsi_count: usize,
     irq0_gsi: u32,
     kbd_gsi: u32,
 }
@@ -137,6 +160,15 @@ struct Router {
 impl Router {
     fn route(&mut self, irq: u8, vector: u8, bit: u8) -> Option<IsaRoute> {
         let route = isa_route(&self.madt, irq);
+        self.claim(vector, bit, route)
+    }
+
+    /// Program `route` for source `bit` unless its GSI is already routed.
+    fn claim(&mut self, vector: u8, bit: u8, route: IsaRoute) -> Option<IsaRoute> {
+        if self.gsis[..self.gsi_count].contains(&route.gsi) {
+            return None;
+        }
+        let slot = self.gsis.get_mut(self.gsi_count)?;
         let (i, pin) = locate(
             &self.entries[..self.count],
             &self.pins[..self.count],
@@ -146,6 +178,8 @@ impl Router {
         if !io.write_entry(pin, device_entry(route, vector, self.dest)) {
             return None;
         }
+        *slot = route.gsi;
+        self.gsi_count += 1;
         self.routed |= bit;
         Some(route)
     }
@@ -196,12 +230,12 @@ fn reopen_pic() {
 /// (handlers registered, PIT programmed, 8259 lines open) and
 /// `hal::apic::enable_bsp` (a LAPIC access path — the new EOI target), before
 /// `init_lapic_timer` (which then calibrates against the IOAPIC-routed PIT) and
-/// before any AP is released. Returns whether the switch took; on `false` the
-/// 8259 virtual wire is untouched (or restored) and a reason was printed.
-pub fn init() -> bool {
+/// before any AP is released. On failure the 8259 virtual wire is untouched
+/// (or restored) and a reason is printed; [`active`] reports the outcome.
+pub fn init() {
     let Some(rsdp) = hal::acpi::rsdp_phys() else {
         fail("no RSDP from the bootloader");
-        return false;
+        return;
     };
     let mut root_buf = alloc::vec![0u8; ROOT_BUF_LEN];
     let mut madt_buf = alloc::vec![0u8; MADT_BUF_LEN];
@@ -209,20 +243,20 @@ pub fn init() -> bool {
         Ok(m) => m,
         Err(_) => {
             fail("ACPI MADT walk failed");
-            return false;
+            return;
         }
     };
     drop(root_buf);
     drop(madt_buf);
     if madt.ioapic_count == 0 {
         fail("MADT lists no IOAPIC");
-        return false;
+        return;
     }
 
     // The BSP's APIC ID: physical-mode IOAPIC destinations are 8 bits.
     let Ok(dest) = u8::try_from(hal::apic::cpuid_apic_id()) else {
         fail("BSP APIC ID does not fit an IOAPIC destination");
-        return false;
+        return;
     };
 
     let mut r = Router {
@@ -233,18 +267,20 @@ pub fn init() -> bool {
         madt,
         dest,
         routed: 0,
+        gsis: [0; 4],
+        gsi_count: 0,
         irq0_gsi: 0,
         kbd_gsi: 0,
     };
     for i in 0..r.count {
-        match IoApic::map(u64::from(r.entries[i].address)) {
+        match IoApic::map(r.entries[i].address) {
             Ok(io) => {
                 r.pins[i] = io.pins();
                 r.ioapics[i] = Some(io);
             }
             Err(_) => {
                 fail("an IOAPIC window could not be mapped");
-                return false;
+                return;
             }
         }
     }
@@ -253,7 +289,7 @@ pub fn init() -> bool {
         let gsi = isa_route(&r.madt, irq).gsi;
         if locate(&r.entries[..r.count], &r.pins[..r.count], gsi).is_none() {
             fail("an ISA IRQ's GSI is served by no IOAPIC");
-            return false;
+            return;
         }
     }
 
@@ -270,7 +306,7 @@ pub fn init() -> bool {
     let (Some(pit), Some(kbd), Some(_)) = (pit, kbd, mouse) else {
         rollback(&r);
         fail("programming a redirection entry failed");
-        return false;
+        return;
     };
     r.irq0_gsi = pit.gsi;
     r.kbd_gsi = kbd.gsi;
@@ -281,21 +317,21 @@ pub fn init() -> bool {
     // Prove the PIT now arrives through the IOAPIC (the 8259 cannot deliver it).
     let start = hal::pit::ticks();
     hal::cpu::enable_interrupts();
-    let mut spins = 0u64;
-    while hal::pit::ticks().wrapping_sub(start) < PIT_LIVE_TICKS && spins < PIT_LIVE_SPIN_LIMIT {
+    let tsc0 = hal::cpu::rdtsc();
+    while hal::pit::ticks().wrapping_sub(start) < PIT_LIVE_TICKS
+        && hal::cpu::rdtsc().wrapping_sub(tsc0) < PIT_LIVE_TSC_LIMIT
+    {
         core::hint::spin_loop();
-        spins += 1;
     }
     hal::cpu::disable_interrupts();
     if hal::pit::ticks().wrapping_sub(start) < PIT_LIVE_TICKS {
         rollback(&r);
         fail("PIT did not tick through the IOAPIC");
-        return false;
+        return;
     }
     PIT_LIVE.store(true, Ordering::Relaxed);
     *ROUTER.lock() = Some(r);
     ACTIVE.store(true, Ordering::Release);
-    true
 }
 
 /// Undo the switch: mask every IOAPIC pin, LINT0 back to ExtINT, reopen the 8259.
@@ -305,15 +341,17 @@ fn rollback(r: &Router) {
     reopen_pic();
 }
 
-/// Route the NIC's legacy INTx line (its PCI interrupt-line register value,
-/// treated as an ISA IRQ through the MADT overrides) to `vector` on the BSP.
+/// Route the NIC's legacy INTx line (its PCI interrupt-line register value)
+/// to `vector` on the BSP, under [`pci_legacy_route`]'s rule: only a line an
+/// ISA override declares level-triggered, and never onto a GSI another source
+/// already holds; otherwise the NIC stays polled (the idle loop drains frames
+/// either way).
 ///
 /// This relies on the firmware's legacy PIRQ steering also driving the IOAPIC
 /// pin with the same number — true on QEMU (ICH9's PIRQ router feeds the GSI
-/// array that fronts both the 8259 and the IOAPIC, and the MADT declares those
-/// lines level/active-high). The general answer is the ACPI `_PRT` (AML), which
-/// this kernel does not interpret; see hal-tcb invariant 4.16. Returns whether
-/// the line was routed.
+/// array that fronts both the 8259 and the IOAPIC). The general answer is the
+/// ACPI `_PRT` (AML), which this kernel does not interpret; see hal-tcb
+/// invariant 17. Returns whether the line was routed.
 #[must_use]
 pub fn route_nic(irq: u8, vector: u8) -> bool {
     if !active() || irq >= 16 {
@@ -323,7 +361,10 @@ pub fn route_nic(irq: u8, vector: u8) -> bool {
     let Some(r) = guard.as_mut() else {
         return false;
     };
-    r.route(irq, vector, SRC_NIC).is_some()
+    let Some(route) = pci_legacy_route(&r.madt, irq, &r.gsis[..r.gsi_count]) else {
+        return false;
+    };
+    r.claim(vector, SRC_NIC, route).is_some()
 }
 
 /// Count one keyboard IRQ (called by the vector-33 handler).
@@ -516,6 +557,27 @@ mod tests {
         assert_eq!(e.delivery, DeliveryMode::Fixed);
         assert!(!e.masked && e.active_low && e.level && e.is_programmable());
         assert_eq!(e.to_raw(), 0x0000_0000_0000_A02B);
+    }
+
+    #[test]
+    fn nic_lines_need_a_level_override_and_a_free_gsi() {
+        let m = qemu();
+        assert_eq!(
+            pci_legacy_route(&m, 11, &[2, 1, 12]),
+            Some(IsaRoute {
+                gsi: 11,
+                active_low: false,
+                level: true
+            })
+        );
+        // No override: ambiguous, stays polled (line 2 would hit the PIT's GSI).
+        assert_eq!(pci_legacy_route(&m, 2, &[]), None);
+        assert_eq!(pci_legacy_route(&m, 1, &[]), None);
+        // The IRQ0 override is edge ("conforms"): not a PCI line.
+        assert_eq!(pci_legacy_route(&m, 0, &[]), None);
+        // A level override onto a GSI another source holds.
+        assert_eq!(pci_legacy_route(&m, 10, &[10]), None);
+        assert_eq!(pci_legacy_route(&m, 16, &[]), None);
     }
 
     #[test]

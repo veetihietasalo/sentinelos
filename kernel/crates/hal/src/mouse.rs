@@ -55,6 +55,10 @@ const PS2_STATUS_CMD: u16 = 0x64;
 const STATUS_OUT_FULL: u8 = 1 << 0;
 /// Status-register bit 1: input buffer full (do **not** write a port until clear).
 const STATUS_IN_FULL: u8 = 1 << 1;
+/// Status bit 5: the output-buffer byte came from the auxiliary (mouse) port.
+const STATUS_AUX_DATA: u8 = 1 << 5;
+/// Bytes one IRQ12 may drain (bound against a wedged controller).
+const DRAIN_LIMIT: usize = 16;
 
 /// Controller command: enable the second (auxiliary / mouse) PS/2 port.
 const CMD_ENABLE_AUX: u8 = 0xA8;
@@ -374,12 +378,33 @@ fn decode_packet(flags: u8, raw_dx: u8, raw_dy: u8) -> MouseEvent {
 /// inside the TCB while the kernel handler remains `unsafe`-free.
 #[inline]
 pub fn on_irq() {
-    // SAFETY: reads the PS/2 controller data port (`0x60`), the documented place a
-    // mouse packet byte is delivered for IRQ12. Draining it is mandatory (the i8042
-    // stops raising IRQ12 until read) and is a pure device read that cannot alias or
-    // corrupt Rust memory. `inb`'s safety contract (valid, read-safe port) holds.
-    let byte = unsafe { inb(PS2_DATA) };
+    // Drain every mouse byte the controller holds, bounded, each read gated on
+    // the status register: output-buffer-full and AUX set (the byte is the
+    // mouse's). A keyboard byte is left for the IRQ1 handler; a spurious IRQ12
+    // reads nothing.
+    for _ in 0..DRAIN_LIMIT {
+        // SAFETY: (MS6) reads the i8042 status port (`0x64`) — a pure device
+        // read. `inb`'s contract holds.
+        let status = unsafe { inb(PS2_STATUS_CMD) };
+        if status & STATUS_OUT_FULL == 0 || status & STATUS_AUX_DATA == 0 {
+            break;
+        }
+        // SAFETY: (MS6) reads the PS/2 data port (`0x60`), which the status read
+        // just showed holds a mouse byte. Draining it is mandatory (the i8042
+        // stops raising IRQ12 until read) and is a pure device read that cannot
+        // alias or corrupt Rust memory. `inb`'s contract holds.
+        let byte = unsafe { inb(PS2_DATA) };
+        take_byte(byte);
+    }
 
+    // IRQ12 → vector 0x2C: EOI whichever controller delivered it — the LAPIC
+    // once IOAPIC-routed; on the legacy path both 8259s (the slave reaches the
+    // CPU through the master's cascade; `pic::end_of_interrupt` EOIs both).
+    crate::ioapic::device_eoi(VECTOR_MOUSE);
+}
+
+/// Advance the 3-byte packet reassembly with one mouse byte.
+fn take_byte(byte: u8) {
     match PHASE.load(Ordering::Relaxed) {
         0 => {
             // First byte must have bit 3 set; if not, the stream slipped — stay in
@@ -401,11 +426,6 @@ pub fn on_irq() {
             PHASE.store(0, Ordering::Relaxed);
         }
     }
-
-    // IRQ12 → slave-PIC vector 0x2C. EOI both the slave and the master (the slave
-    // reaches the CPU through the master's cascade); `pic::end_of_interrupt`
-    // handles the both-PIC EOI for slave-range vectors.
-    crate::ioapic::device_eoi(VECTOR_MOUSE);
 }
 
 /// Program the i8042 to deliver mouse interrupts, put the mouse into streaming
