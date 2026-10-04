@@ -29,7 +29,23 @@
 //! - [`read_sectors`] — read `count` contiguous 512-byte sectors starting at
 //!   `lba` into a caller buffer.
 //! - [`write_sectors`] — write `count` contiguous 512-byte sectors starting at
-//!   `lba` from a caller buffer (followed by a cache FLUSH so data hits media).
+//!   `lba` from a caller buffer. **Unflushed** (SentinelFS FS-1b): it returns
+//!   once the drive has accepted every sector and dropped BSY, which with a
+//!   write cache means "in the drive's cache", not "on the media".
+//! - [`flush`] — `FLUSH CACHE`: make every earlier write durable. Waits for
+//!   BSY to clear *before* issuing the command (the pre-FS-1b code issued it
+//!   straight after the data phase, while the drive could still be busy) and
+//!   again for its completion, then checks ERR/DF.
+//!
+//! # Durability contract
+//!
+//! Between two successful [`flush`] calls the drive may persist any subset of
+//! the sectors written, in any order; a single 512-byte sector write is
+//! atomic; [`flush`] returning `Ok` means every earlier write is durable. That
+//! is the model SentinelFS's commit protocol is designed against (spec §8:
+//! dirty blocks → flush → superblock → flush). A caller that needs a write to
+//! survive power loss calls [`flush`] after it (the toy `kernel::fs` does,
+//! once per save).
 //!
 //! # Concurrency model
 //!
@@ -38,11 +54,12 @@
 //! module does not serialise its callers; the kernel does. Since SentinelFS
 //! FS-1a two kernel paths drive the disk (`kernel::fs` and the `sfs-commit`
 //! task), and every call goes through `kernel::blk::ata`, which holds a
-//! kernel-side channel lock (`CHANNEL`) for exactly one command; no other
+//! kernel-side channel lock (`CHANNEL`) for exactly one command — `identify`,
+//! `read_sectors`, `write_sectors` and `flush` are one command each; no other
 //! kernel file may name this module (`cargo xtask check-ata-callers`, run in
 //! CI). That lock protects disk integrity, not memory safety: the port
 //! accesses below are sound however callers interleave — an interleaved
-//! command can corrupt a transfer, never memory (hal-tcb §7).
+//! command can corrupt a transfer, never memory (hal-tcb §4 invariant 16, §7).
 
 use core::arch::asm;
 
@@ -306,6 +323,14 @@ fn select_lba(lba: u32, count: u8) -> Result<(), AtaError> {
 }
 
 /// Issue an ATA command byte to the command register (`0x1F7`).
+///
+/// A command written while the drive is busy is ignored, so callers make sure
+/// BSY is clear first: `read_sectors` / `write_sectors` poll `wait_not_busy`
+/// after `select_lba`, and `flush` after its select (the FS-1b fix).
+/// `identify` (unchanged) does not poll first: it runs once per opener, and
+/// under the kernel's channel lock the previous command has always finished
+/// — `write_sectors` and `flush` now return only after BSY clears, and a read
+/// ends with its last data word.
 fn issue_command(cmd: u8) {
     // SAFETY: writes the command register on the primary channel with a defined
     // ATA opcode (`IDENTIFY`/`READ`/`WRITE`/`FLUSH`). Issuing a command only
@@ -420,7 +445,12 @@ pub fn read_sectors(lba: u32, count: u16, buf: &mut [u8]) -> Result<(), AtaError
 ///
 /// `buf.len()` must equal `count * 512`. The transfer is one PIO `WRITE SECTORS`
 /// command followed by `count * 256` word writes of the data register (BSY/DRQ
-/// polled before each sector), then a `FLUSH CACHE` so the data reaches media.
+/// polled before each sector); it returns once the drive has dropped BSY after
+/// the last sector without reporting ERR/DF.
+///
+/// **Not durable on its own** (FS-1b API split, hal-tcb row A2): the data may
+/// sit in the drive's write cache until the next [`flush`]. Before FS-1b this
+/// function ended every command with `FLUSH CACHE`.
 ///
 /// # Errors
 ///
@@ -446,8 +476,38 @@ pub fn write_sectors(lba: u32, count: u16, buf: &[u8]) -> Result<(), AtaError> {
         }
     }
 
-    // FLUSH CACHE so write-cached sectors are committed to the backing media —
-    // without this, data can be lost on power-off (the persistence guarantee).
+    // The command completes when the drive drops BSY after the last sector;
+    // ERR/DF then report a failed write. Waiting here also means the next
+    // command on the channel (often `flush`) never starts against a busy drive.
+    let s = wait_not_busy()?;
+    if s & (STATUS_ERR | STATUS_DF) != 0 {
+        return Err(AtaError::DeviceError);
+    }
+    Ok(())
+}
+
+/// `FLUSH CACHE`: make every sector written before this call durable.
+///
+/// Selects the primary master, waits for BSY to clear (a command written while
+/// the drive is busy is ignored — the A2 weakness of the pre-FS-1b code, which
+/// issued `FLUSH CACHE` straight after a write's data phase), issues
+/// `FLUSH CACHE`, and waits (bounded) for it to complete. A drive without a
+/// write cache completes it at once.
+///
+/// # Errors
+///
+/// [`AtaError::Timeout`] if the drive stays busy past the poll budget (before
+/// or after the command), [`AtaError::DeviceError`] if it reports ERR/DF. On
+/// either error nothing is known about the durability of the writes since the
+/// last successful flush.
+pub fn flush() -> Result<(), AtaError> {
+    // SAFETY: writes the primary channel's drive/head register (`0x1F6`) with
+    // the defined "LBA mode, master" select byte — a documented command-block
+    // register and value. Selecting the drive only routes the next command; it
+    // cannot alias or corrupt Rust-managed memory. `outb`'s contract holds.
+    unsafe { outb(REG_DRIVE, DRIVE_LBA_MASTER) };
+    delay_400ns();
+    wait_not_busy()?;
     issue_command(CMD_FLUSH);
     let s = wait_not_busy()?;
     if s & (STATUS_ERR | STATUS_DF) != 0 {

@@ -761,7 +761,8 @@ filesystem persistence in `kernel::fs` (so files survive a reboot). The primary
 channel uses the standard PC legacy ports: command block `0x1F0..=0x1F7` and the
 control-block Alternate Status register `0x3F6`. Addressing is 28-bit LBA
 (LBA28). The public surface (`identify`, `read_sectors`, `write_sectors`,
-`DiskInfo`, `AtaError`) is **safe** and returns `Result` so the kernel degrades
+`flush` — split out of `write_sectors` in SentinelFS FS-1b — `DiskInfo`,
+`AtaError`) is **safe** and returns `Result` so the kernel degrades
 to an in-memory filesystem when no disk is attached. All hardware access is
 funnelled through four private primitives — `inb`/`outb` (8-bit) and `inw`/`outw`
 (16-bit) — each with a `# Safety` rustdoc section. The serialiser, CRC, and tree
@@ -770,7 +771,7 @@ walk all live in `kernel::fs` under `#![forbid(unsafe_code)]`, **not** the TCB.
 | # | Location | Unsafe op | Why needed | Soundness argument | Verification |
 |---|----------|-----------|------------|--------------------|--------------|
 | A1 | `ata.rs` · `inb()` | `in al, dx` (8-bit port read) | Read the ATA status (`0x1F7`) / alternate-status (`0x3F6`) / LBA-mid/hi registers | `unsafe fn` whose `# Safety` requires a read-safe ATA register; all callers pass a primary-channel command/control-block port. Pure device read, `nomem`/`nostack`. | Reasoned + QEMU |
-| A2 | `ata.rs` · `outb()` | `out dx, al` (8-bit port write) | Program the seccount/LBA/drive-select registers and issue command bytes (`IDENTIFY`/`READ`/`WRITE`/`FLUSH`) | `unsafe fn` whose `# Safety` requires a write-safe ATA register; all callers pass a primary command-block port (`0x1F2..=0x1F7`) with a defined LBA/seccount/command byte. Sets up/starts a device operation only; device-only effect, `nomem`/`nostack`. | Reasoned + QEMU |
+| A2 | `ata.rs` · `outb()` | `out dx, al` (8-bit port write) | Program the seccount/LBA/drive-select registers and issue command bytes (`IDENTIFY`/`READ`/`WRITE`/`FLUSH CACHE`). **Amended in SentinelFS FS-1b:** `FLUSH CACHE` is no longer issued at the end of every `write_sectors`; it is the separate public `flush()` (select master → `wait_not_busy` → `FLUSH CACHE` → `wait_not_busy` → ERR/DF check), and `write_sectors` now ends by waiting for BSY to clear and checking ERR/DF. The pre-FS-1b code wrote `FLUSH CACHE` straight after the data phase without waiting for BSY (a command written to a busy drive is ignored); fixed. One new call site of this primitive: `flush()`'s drive select (`0x1F6` ← `0xE0`). | `unsafe fn` whose `# Safety` requires a write-safe ATA register; all callers pass a primary command-block port (`0x1F2..=0x1F7`) with a defined LBA/seccount/command byte. Sets up/starts a device operation only; device-only effect, `nomem`/`nostack`. The FS-1b split changes *when* the command byte `0xE7` is written and adds one drive-select write with the same documented value `select_lba`/`identify` already write — no new port, no new value, so the soundness argument is unchanged. What the split weakens is **durability**, not memory safety: a `write_sectors` that returns `Ok` may sit in the drive's cache until the next `flush()`; SentinelFS's commit protocol and the toy `kernel::fs` both call `flush()` where they need durability (invariant 16), and the QEMU torn-commit proof (`cache=writeback`, SIGKILL mid-commit) is the evidence that the protocol tolerates exactly that. | Reasoned + QEMU (incl. the FS-1b torn-commit stage) |
 | A3 | `ata.rs` · `inw()` | `in ax, dx` (16-bit port read) | Pull one PIO data word from the data register (`0x1F0`) during a sector read | `unsafe fn` whose `# Safety` requires the read-safe data port; the sole caller (`read_sectors`, and the IDENTIFY block) reads `0x1F0` **only after DRQ is asserted** (the drive is offering a word). Pure device read, `nomem`/`nostack`. | Reasoned + QEMU |
 | A4 | `ata.rs` · `outw()` | `out dx, ax` (16-bit port write) | Push one PIO data word into the data register (`0x1F0`) during a sector write | `unsafe fn` whose `# Safety` requires the write-safe data port; the sole caller (`write_sectors`) writes `0x1F0` **only after DRQ is asserted** (the drive is ready for a word). Device-only effect, `nomem`/`nostack`. | Reasoned + QEMU |
 
@@ -787,8 +788,9 @@ walk all live in `kernel::fs` under `#![forbid(unsafe_code)]`, **not** the TCB.
 > (`#![forbid(unsafe_code)]`): pure byte arithmetic over slices and `Vec`s, with
 > co-located host unit tests (round-trip, truncation/bad-tag rejection, CRC
 > known-vectors). The TCB's job is only to move 512-byte sectors to/from the
-> media (A1–A4). `write_sectors` ends with a `FLUSH CACHE` so data reaches the
-> backing image before the guest can power off.
+> media (A1–A4). Since SentinelFS FS-1b `write_sectors` is **unflushed** and
+> `flush()` (`FLUSH CACHE`) is a separate public call; `kernel::fs`'s save
+> ends with one `flush()`, and SentinelFS issues two per commit (spec §8).
 >
 > **Command serialisation moved to the kernel (SentinelFS FS-1a).** A command
 > is a request→poll→transfer sequence that must not interleave with another on
@@ -800,6 +802,18 @@ walk all live in `kernel::fs` under `#![forbid(unsafe_code)]`, **not** the TCB.
 > could only corrupt a transfer, never memory, so rows A1–A4 are unchanged —
 > still `nomem` port I/O whose soundness never depended on the caller being
 > single-threaded. (Doc-only change; `hal::ata`'s code is untouched.)
+>
+> **FS-1b API split (row A2 amended).** `hal::ata` gained a public `flush()`
+> and `write_sectors` stopped flushing; `CHANNEL` serialises `flush()` like
+> every other command (one command per lock hold), and invariant 16 (§4) makes
+> the command-serialisation rule part of the registry rather than a convention
+> recorded in a note. Evidence: `cargo +nightly miri test -p hal` and the hal
+> Kani suite unchanged-green (no new pure helper; the new code is port I/O,
+> Miri/Kani-opaque like A1–A4), `make test`'s double boot (the toy FS's
+> `persistence PROVEN` line now depends on its explicit `flush()`), and the
+> torn-commit stage (QEMU `cache=writeback`, the kernel halted after the
+> k-th block write of a commit, QEMU SIGKILLed, the next boot mounts
+> generation N−1 intact).
 
 ## 8. `hal::cpuid` — CPU identification (hardware report)
 
@@ -1039,3 +1053,18 @@ Context` — see the design doc's "sealed capability" argument, mirrored in
     yet, so only the BSP's own tick can carry either clock there. The PIT
     remains the wall clock for uptime display and the LAPIC calibration
     reference (invariant 14).
+16. **ATA commands are serialised by `kernel::blk::ata`'s `CHANNEL` lock, and
+    durability needs an explicit `flush()`.** (SentinelFS FS-1b.) Every
+    `hal::ata` entry point — `identify`, `read_sectors`, `write_sectors`,
+    `flush` — is one command sequence that must not interleave with another on
+    the primary channel; `hal::ata` does not lock, the kernel does:
+    `kernel::blk::ata` holds `CHANNEL` (a `hal::sync::SpinMutex`, waiters
+    yield instead of spinning, §5e) around exactly one call, and it is the only
+    kernel file that may name `hal::ata` (`cargo xtask check-ata-callers`, a CI
+    step). Interleaving would corrupt a transfer, never memory (rows A1–A4 stay
+    sound regardless). `write_sectors` returning `Ok` means the drive accepted
+    the data, possibly only into its write cache; only a later successful
+    `flush()` makes it durable, and between two flushes the drive may persist
+    any subset of the sectors written (a single sector is atomic). Callers that
+    promise durability flush: `kernel::fs` once per save, SentinelFS twice per
+    commit (dirty blocks → flush → superblock → flush).
