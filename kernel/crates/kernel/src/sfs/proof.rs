@@ -179,12 +179,14 @@ fn op<T>(
     mut f: impl FnMut(&mut Volume) -> Result<T, TreeError>,
 ) -> Result<T, TreeError> {
     for _ in 0..RETRIES {
-        let r = with_sfs(|s| match s.volume_mut() {
-            Some(v) => f(v),
-            None => Err(TreeError::Sealed),
+        let (r, epoch) = with_sfs(|s| match s.volume_mut() {
+            Some(v) => (f(v), v.epoch()),
+            None => (Err(TreeError::Sealed), 0),
         });
         match r {
-            Err(TreeError::Miss(p)) => read_block(p, timeout).map_err(|_| TreeError::Corrupt)?,
+            Err(TreeError::Miss(p)) => {
+                read_block(p, epoch, timeout).map_err(|_| TreeError::Corrupt)?;
+            }
             r => return r,
         }
     }

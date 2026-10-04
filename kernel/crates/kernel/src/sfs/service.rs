@@ -110,7 +110,7 @@ pub struct Sfs {
     last: Option<Result<CommitInfo, CommitError>>,
     last_commit_tick: u64,
     /// FS-1b: one outstanding miss to read for a caller (ticketed).
-    read_req: Option<Pointer>,
+    read_req: Option<(Pointer, u64)>,
     read_ticket: u64,
     read_served: u64,
     read_last: Option<Result<(), CommitError>>,
@@ -274,23 +274,26 @@ pub fn hold_commits(on: bool) {
 }
 
 /// Have the task read the committed block `p` names into the cache
-/// (verified), for a caller whose operation reported `Miss(p)`; waits,
+/// (verified), for a caller whose operation reported `Miss(p)` in commit
+/// `epoch` ([`Volume::epoch`], read under the same lock hold); waits,
 /// yielding, up to `timeout` mono ticks. The caller then retries its
 /// operation. A failed read or a block that no longer matches its hash
-/// leaves the volume read-only ([`Volume::resolve_miss`]).
+/// leaves the volume read-only — unless a commit has completed since the
+/// miss, which makes it stale, not damage ([`Volume::resolve_tree_miss`];
+/// the host race model found that case).
 ///
 /// # Errors
 ///
 /// The read's [`CommitError`]; [`CommitError::Busy`] if the task never
 /// answered in time.
-pub fn read_block(p: Pointer, timeout: u64) -> Result<(), CommitError> {
+pub fn read_block(p: Pointer, epoch: u64, timeout: u64) -> Result<(), CommitError> {
     let posted = wait_for(timeout, || {
         with_sfs(|s| {
             if s.read_req.is_some() {
                 return None;
             }
             s.read_ticket += 1;
-            s.read_req = Some(p);
+            s.read_req = Some((p, epoch));
             Some(s.read_ticket)
         })
     });
@@ -423,7 +426,7 @@ fn run_commit(dev: &mut AtaDevice, ws: &mut Workspace) {
 
 /// A caller's miss: read with the lock released, insert (verified) under it.
 fn serve_read(dev: &mut AtaDevice, ws: &mut Workspace) {
-    let Some(p) = with_sfs(|s| s.read_req) else {
+    let Some((p, epoch)) = with_sfs(|s| s.read_req) else {
         return;
     };
     let staging = ws.block();
@@ -431,7 +434,7 @@ fn serve_read(dev: &mut AtaDevice, ws: &mut Workspace) {
         .read_blocks(p.block, core::slice::from_mut(staging))
         .map(|()| &*staging);
     let res = with_sfs(|s| match s.volume.as_mut() {
-        Some(v) => v.resolve_miss(&p, read),
+        Some(v) => v.resolve_tree_miss(&p, read, epoch),
         None => Err(CommitError::Internal),
     });
     with_sfs(|s| {

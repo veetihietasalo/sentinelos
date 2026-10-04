@@ -372,3 +372,27 @@ fn a_one_gib_volume_mounts_and_works_like_the_small_one() {
     assert_eq!(fs.items().unwrap(), model_items(&model));
     assert_eq!(fs.scrub().bad, 0);
 }
+
+#[test]
+fn a_stale_miss_is_dropped_but_a_fresh_bad_one_is_damage() {
+    use crate::sfs::volume::CommitError;
+    let mut fs = Fs::fresh(256);
+    fs.put(key(1), b"one").unwrap();
+    fs.commit().unwrap();
+    fs.remount();
+    let epoch = fs.v.epoch();
+    let p = match fs.v.get(&key(1), &mut [0u8; ITEM_MAX]) {
+        Err(TreeError::Miss(p)) => p,
+        other => panic!("expected a miss, got {other:?}"),
+    };
+    let garbage = [0x77u8; BLOCK_SIZE];
+    // A commit since the miss: the block may have been reused — not damage.
+    assert_eq!(fs.v.resolve_tree_miss(&p, Ok(&garbage), epoch + 1), Ok(()));
+    assert!(!fs.v.is_read_only());
+    // The same epoch: the committed tree itself is bad.
+    assert_eq!(
+        fs.v.resolve_tree_miss(&p, Ok(&garbage), epoch),
+        Err(CommitError::Corrupt)
+    );
+    assert!(fs.v.is_read_only());
+}

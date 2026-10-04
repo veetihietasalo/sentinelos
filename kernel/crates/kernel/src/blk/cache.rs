@@ -385,6 +385,20 @@ impl Cache {
         }
     }
 
+    /// Drop every clean entry (memory pressure; the host race model uses it
+    /// to force misses). Dirty entries stay. Returns how many were dropped.
+    pub fn evict_all_clean(&mut self) -> usize {
+        let mut n = 0;
+        for s in self.slots.iter_mut() {
+            if matches!(s.state, State::Clean(_)) {
+                s.state = State::Empty;
+                s.tag = s.tag.wrapping_add(1);
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Whether `block` has a resident entry (clean or dirty).
     #[must_use]
     pub fn is_resident(&self, block: BlockNo) -> bool {

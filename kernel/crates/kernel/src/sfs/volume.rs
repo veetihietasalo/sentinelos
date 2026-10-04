@@ -460,6 +460,8 @@ pub struct Volume {
     sb_buf: Blocks,
     /// Misses the current seal has reported (reset once a seal succeeds).
     seal_misses: usize,
+    /// Commits completed since mount: the epoch a tree miss was reported in.
+    epoch: u64,
     /// The metadata tree (FS-1b) and its fixed scratch.
     tree: Tree,
     tws: Box<TreeWs>,
@@ -586,6 +588,7 @@ impl Volume {
             next: None,
             sb_buf: zeroed_blocks(1),
             seal_misses: 0,
+            epoch: 0,
             tree: Tree::new(TreeId::Root, sb.uuid, sb.root),
             tws: Box::new(TreeWs::new()),
         }))
@@ -615,6 +618,14 @@ impl Volume {
     #[must_use]
     pub fn is_dirty(&self) -> bool {
         self.alloc.is_dirty() || self.cache.dirty_count() > 0
+    }
+
+    /// Whether a commit is between [`begin_commit`](Self::begin_commit) and
+    /// [`finish_commit`](Self::finish_commit) (changes are refused, reads
+    /// are served).
+    #[must_use]
+    pub fn is_committing(&self) -> bool {
+        self.state == State::Committing
     }
 
     /// Whether the volume refuses changes after a failed commit or a failed
@@ -690,6 +701,12 @@ impl Volume {
         self.cache.evict(block)
     }
 
+    /// Drop every clean cached block (memory pressure; tests). Dirty entries
+    /// stay. Returns how many were dropped.
+    pub fn drop_all_clean(&mut self) -> usize {
+        self.cache.evict_all_clean()
+    }
+
     /// Resolve a miss ([`AllocError::Miss`] / [`CommitError::Miss`]) for `p`
     /// with `read`, the outcome of reading block `p.block` from the device
     /// (the caller does the I/O, with no lock held): the block enters the
@@ -720,6 +737,49 @@ impl Volume {
             Err(CacheError::Corrupt) => Err(self.fail(CommitError::Corrupt)),
             Err(_) => Err(self.fail(CommitError::Internal)),
         }
+    }
+
+    /// Commits completed since mount. Read it under the same lock hold as a
+    /// [`TreeError::Miss`] and pass it to
+    /// [`resolve_tree_miss`](Self::resolve_tree_miss).
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Resolve a tree operation's miss for `p`, reported in `epoch`, with
+    /// `read` (the device read the caller had done, lock released).
+    ///
+    /// With several callers a miss can go **stale** before it is served:
+    /// another caller copies the node, a commit frees its block, and a later
+    /// transaction reuses it — so the block may now be dirty, or rewritten on
+    /// disk. That can only happen across a commit (committed blocks are never
+    /// written, freed or reused inside one transaction). So if a commit has
+    /// completed since `epoch`, a block that no longer verifies or conflicts
+    /// with a dirty entry is dropped without harm (the caller retries its
+    /// operation from the root); within the same epoch the rule of
+    /// [`resolve_miss`](Self::resolve_miss) applies — the volume goes
+    /// read-only, because the committed tree itself is damaged.
+    ///
+    /// # Errors
+    ///
+    /// As [`resolve_miss`](Self::resolve_miss), only within the same epoch.
+    pub fn resolve_tree_miss(
+        &mut self,
+        p: &Pointer,
+        read: Result<&Block, BlkError>,
+        epoch: u64,
+    ) -> Result<(), CommitError> {
+        if epoch == self.epoch {
+            return self.resolve_miss(p, read);
+        }
+        if let Ok(block) = read {
+            // Inserted if it still verifies; otherwise stale, and ignored.
+            let _ = self
+                .cache
+                .insert_verified(p.block, HashRule::Metadata, &p.hash, block);
+        }
+        Ok(())
     }
 
     /// Read `p` from `dev` and insert it — the synchronous form of
@@ -977,6 +1037,7 @@ impl Volume {
         }
         self.alloc.commit_done();
         self.tree.commit_done();
+        self.epoch = self.epoch.wrapping_add(1);
         let blocks = self.nplan as u64 + 1;
         self.nplan = 0;
         self.sb.gen = staged.gen;

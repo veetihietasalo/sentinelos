@@ -39,6 +39,8 @@ mod crash;
 #[cfg(test)]
 mod heap;
 #[cfg(test)]
+mod race;
+#[cfg(test)]
 mod testkit;
 #[cfg(test)]
 mod tests;
