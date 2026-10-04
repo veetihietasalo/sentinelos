@@ -101,6 +101,12 @@ fn push_hex(out: &mut String, value: u64, width: usize) {
     }
 }
 
+/// Every built-in command verb `execute` dispatches.
+const BUILTINS: [&str; 15] = [
+    "help", "clear", "about", "mem", "cpuinfo", "devices", "echo", "uptime", "ls", "cat", "mkdir",
+    "write", "rm", "cd", "pwd",
+];
+
 /// The interactive shell: terminal content plus the command interpreter.
 ///
 /// Constructed with [`Shell::new`] (which seeds a friendly banner and an
@@ -309,6 +315,15 @@ impl Shell {
             Some((c, r)) => (c, r.trim_start()),
             None => (trimmed, ""),
         };
+
+        // Serial breadcrumb for built-in commands only (the verb, never the
+        // arguments): the boot test types `about` over QMP and asserts this
+        // line as end-to-end evidence that IOAPIC-routed keyboard IRQs reach
+        // the shell (SMP 3b-ii).
+        if BUILTINS.contains(&cmd) {
+            hal::serial::write_str("[shell] ran: ");
+            hal::serial::print_line(cmd);
+        }
 
         match cmd {
             "help" => self.cmd_help(),

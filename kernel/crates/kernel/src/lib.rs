@@ -30,6 +30,7 @@ pub mod hash;
 pub mod host;
 pub mod input;
 pub mod interrupts;
+pub mod ioapic;
 pub mod memory;
 pub mod ml;
 pub mod net;
@@ -141,6 +142,15 @@ pub fn kmain() -> ! {
         None => hal::println!("[smp] no LAPIC access path; staying on the legacy PIC"),
     }
 
+    // SMP phase 3b-ii: route the PIT, keyboard and mouse through the IOAPIC
+    // (ACPI MADT walk, overrides honoured, every IRQ to the BSP), masking the
+    // 8259 and LINT0. Needs the LAPIC access path above (the new EOI target);
+    // precedes the LAPIC-timer calibration (which then counts IOAPIC-routed PIT
+    // ticks) and AP bring-up. On any failure the 8259 virtual wire stays.
+    if hal::apic::lint0_masked().is_some() {
+        ioapic::init();
+    }
+
     // SMP phase 3: calibrate the LAPIC timer against the PIT and move the
     // scheduler tick onto it — on this core now, on every AP as it comes up
     // (they copy the calibrated count). The PIT stays the wall clock. Must
@@ -189,6 +199,8 @@ pub fn kmain() -> ! {
     // Register the NIC's receive-interrupt handler and unmask its PIC line (a
     // no-op if no NIC came up). Must run before `sti`, after `net::init`.
     interrupts::init_nic_irq();
+    // The routing summary, once the NIC's line has been routed too.
+    ioapic::report();
 
     // Bring up STORAGE: probe the legacy ATA disk and prove the on-disk
     // filesystem persists across reboots. This loads the filesystem image from
@@ -371,6 +383,7 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
         //    locked, the right-arrow (or Enter) starts the unlock; on the desktop
         //    every decoded event is fed to the shell.
         while let Some(scancode) = hal::keyboard::poll_scancode() {
+            ioapic::note_first_scancode();
             if let Some(event) = decoder.feed(scancode) {
                 if state.accepts_unlock() {
                     let is_unlock =
