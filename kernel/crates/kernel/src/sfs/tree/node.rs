@@ -220,12 +220,35 @@ impl<V: Entry, const CAP: usize> Node<V, CAP> {
         if !(after_prev && before_next) {
             return Err(NodeError::Order);
         }
-        self.keys.copy_within(i..self.len, i + 1);
-        self.vals.copy_within(i..self.len, i + 1);
-        self.keys[i] = k;
-        self.vals[i] = v;
+        // Shift `[i, len)` right by one. Every loop here runs over the
+        // capacity (a constant) and tests its range per element: the same
+        // results as `copy_within`, but CBMC unwinds a fixed trip count
+        // instead of modelling a symbolic-length move (which ran it out of
+        // memory at CAP = 4).
+        for j in (1..CAP).rev() {
+            if j > i && j <= self.len {
+                self.move_entry(j - 1, j);
+            }
+        }
+        self.set_entry(i, k, v);
         self.len += 1;
         Ok(())
+    }
+
+    /// Store `(k, v)` in slot `i` (a no-op past the capacity, which callers
+    /// never reach).
+    fn set_entry(&mut self, i: usize, k: Key, v: V) {
+        if let (Some(dk), Some(dv)) = (self.keys.get_mut(i), self.vals.get_mut(i)) {
+            *dk = k;
+            *dv = v;
+        }
+    }
+
+    /// Copy slot `from` to slot `to`.
+    fn move_entry(&mut self, from: usize, to: usize) {
+        if let (Some(&k), Some(&v)) = (self.keys.get(from), self.vals.get(from)) {
+            self.set_entry(to, k, v);
+        }
     }
 
     /// Append `(k, v)` after the last entry.
@@ -247,8 +270,11 @@ impl<V: Entry, const CAP: usize> Node<V, CAP> {
             self.key(i).ok_or(NodeError::Index)?,
             self.val(i).ok_or(NodeError::Index)?,
         );
-        self.keys.copy_within(i + 1..self.len, i);
-        self.vals.copy_within(i + 1..self.len, i);
+        for j in 0..CAP {
+            if j >= i && j + 1 < self.len {
+                self.move_entry(j + 1, j);
+            }
+        }
         self.len -= 1;
         Ok((k, v))
     }
@@ -269,16 +295,13 @@ impl<V: Entry, const CAP: usize> Node<V, CAP> {
                 return Err(NodeError::Order);
             }
         }
-        let (dk, dv) = (
-            self.keys
-                .get_mut(self.len..self.len + n)
-                .ok_or(NodeError::Full)?,
-            self.vals
-                .get_mut(self.len..self.len + n)
-                .ok_or(NodeError::Full)?,
-        );
-        dk.copy_from_slice(other.keys.get(..n).ok_or(NodeError::Index)?);
-        dv.copy_from_slice(other.vals.get(..n).ok_or(NodeError::Index)?);
+        for j in 0..CAP {
+            if j < n {
+                if let (Some(&k), Some(&v)) = (other.keys.get(j), other.vals.get(j)) {
+                    self.set_entry(self.len + j, k, v);
+                }
+            }
+        }
         self.len += n;
         Ok(())
     }
@@ -294,16 +317,13 @@ impl<V: Entry, const CAP: usize> Node<V, CAP> {
             return Err(NodeError::Index);
         }
         let n = self.len - at;
-        let (sk, sv) = (
-            self.keys.get(at..self.len).ok_or(NodeError::Index)?,
-            self.vals.get(at..self.len).ok_or(NodeError::Index)?,
-        );
-        let (dk, dv) = (
-            dst.keys.get_mut(..n).ok_or(NodeError::Full)?,
-            dst.vals.get_mut(..n).ok_or(NodeError::Full)?,
-        );
-        dk.copy_from_slice(sk);
-        dv.copy_from_slice(sv);
+        for j in 0..CAP {
+            if j < n {
+                if let (Some(&k), Some(&v)) = (self.keys.get(at + j), self.vals.get(at + j)) {
+                    dst.set_entry(j, k, v);
+                }
+            }
+        }
         dst.len = n;
         self.len = at;
         Ok(())
@@ -320,7 +340,10 @@ impl<V: Entry, const CAP: usize> Node<V, CAP> {
         let total = self.weight();
         let mut left = 0u64;
         let mut best: Option<(usize, u64)> = None;
-        for i in 1..self.len {
+        for i in 1..CAP {
+            if i >= self.len {
+                break;
+            }
             left += u64::from(self.val(i - 1)?.weight());
             let diff = (2 * left).abs_diff(total);
             if best.is_none_or(|(_, d)| diff < d) {
@@ -379,7 +402,7 @@ impl<V: Entry, const CAP: usize> Node<V, CAP> {
     /// keeps; exposed for proofs and decode checks).
     #[must_use]
     pub fn is_sorted(&self) -> bool {
-        self.keys().windows(2).all(|w| w[0] < w[1])
+        (1..CAP).all(|i| i >= self.len || self.keys.get(i - 1) < self.keys.get(i))
     }
 }
 
