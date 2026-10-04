@@ -168,7 +168,11 @@ jobs:
       # Every boot line is asserted on both boots, plus the persistence chain
       # between them (SentinelFS: format → gen 1 → commit gen 2, then mount gen 2
       # with boot 1's superblock hash → commit gen 3; the toy FS: first boot,
-      # then PROVEN).
+      # then PROVEN). Then the SentinelFS FS-1b torn-commit stage on the same
+      # disk: a boot cut inside its commit (cache=writeback, SIGKILL) and a
+      # recovery boot that must mount the previous generation intact — two
+      # more boots, ~10 s, cheap enough to gate every PR rather than a
+      # separate job that re-builds the ISO.
       - name: make test (boot test)
         working-directory: kernel
         run: make test
@@ -182,6 +186,8 @@ jobs:
           path: |
             kernel/target/serial.log
             kernel/target/serial-boot2.log
+            kernel/target/serial-torn.log
+            kernel/target/serial-recover.log
           if-no-files-found: ignore
 
       # Keep disk images out of the cache: the cache's post-job save runs after
