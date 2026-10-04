@@ -234,28 +234,37 @@ blocks nothing and touches none of PR-2b/PR-3's files).
   copies into two fixed buffers (4 KiB root, 8 KiB MADT). QEMU's q35 firmware
   (SeaBIOS) hands out a revision-0 RSDP, so the RSDT path is the one exercised at
   boot; the salvaged 2026-07-17 draft supported only the XSDT and would have
-  failed here. Kani: decode totality and bounds (`madt_body_decode_is_total_and_bounded`,
-  `one_entry_decode_is_total_and_exact`, `rsdp_decode_is_total`,
-  `root_entry_is_total`); host tests use QEMU's real MADT and RSDT bytes,
+  failed here. Kani, compositional (each harness < 60 s): the structure walk
+  `for_each_entry` is total and exactly tiles the table
+  (`madt_walk_is_total_and_tiles`), each structure decodes totally and exactly
+  (`one_entry_decode_is_total_and_exact`), `push` respects capacity
+  (`push_respects_capacity`), plus a composed 46-byte smoke
+  (`madt_body_smoke_46`), `rsdp_decode_is_total` and `root_entry_is_total`; host tests use QEMU's real MADT and RSDT bytes,
   captured from this kernel's boot, plus a 200 000-mutant deterministic fuzz test.
 - **`hal`.** `hal::acpi` (RSDP + bounded copy-out reader, AC1–AC2),
-  `hal::ioapic` (validated mapping, indirect register access, redirection
-  entries with Kani-proved packing, IO1–IO4), `apic::in_service` /
-  `apic::mask_lint0` (AP8–AP9), `pic::mask_all` (P6). The EOI decision is made
+  `hal::ioapic` (validated mapping, indirect register access under one lock
+  per sequence, redirection entries with Kani-proved packing — unmasked entries
+  are fixed delivery of a vector ≥ 0x20 only, IO1–IO4),
+  `apic::eoi_if_in_service` / `apic::mask_lint0` (AP8–AP9), `pic::mask_all`
+  (P6). Every mapped physical span is checked against `MAXPHYADDR` and for
+  overflow first (`mm::phys_span`, Kani) — page-table leaves are `phys | flags`
+  unmasked, so high bits would otherwise alias a kernel frame. The EOI decision is made
   per interrupt from the LAPIC's in-service register: a LAPIC message (IOAPIC)
   EOIs the LAPIC, a virtual-wire ExtINT EOIs the 8259 — no flag to fall out of
   step.
 - **Policy (`kernel::ioapic`).** PIT (ISA 0 → GSI 2 under QEMU), keyboard (1),
   mouse (12) and the e1000's legacy line (11, level/active-high per the
-  override) are routed fixed/physical to the **BSP**, vectors unchanged. BSP
+  override — a PCI line is routed only when an ISA override declares it level
+  and its GSI is free, else the NIC stays polled) are routed fixed/physical to
+  the **BSP**, vectors unchanged; no GSI carries two routes. BSP
   because the PIT is the wall clock and the input rings/NIC frames are consumed
   by the BSP idle loop; balancing is a product decision. 8259 fully masked,
   LINT0 masked, both read back. If the PIT is not seen ticking through the
   IOAPIC within a bounded spin the switch is rolled back to the virtual wire.
 - **Boot proof** (exact match, TCG and KVM):
   `[ioapic] madt: ioapics=1 overrides=5 gsi-base=0 pins=24 pic=masked lint0=masked routed=pit,kbd,mouse,nic irq0-gsi=2 dest=apic0 pit-live=yes ok`.
-  The boot test then unlocks the lock screen and types `about` over QMP and
-  asserts `[ioapic] kbd: irq1 -> gsi1 vector=33 irqs>=1 pic=masked lint0=masked via=ioapic ok`
+  On the first of its two boots the boot test then unlocks the lock screen and
+  types `about` over QMP and asserts `[ioapic] kbd: irq1 -> gsi1 vector=33 irqs>=1 pic=masked lint0=masked via=ioapic ok`
   and `[shell] ran: about`. The LAPIC-timer calibration now counts
   IOAPIC-routed PIT ticks; every pre-existing line still passes.
 - **Found on the way (by inspection):** `hal::e1000`'s driver lock is taken in

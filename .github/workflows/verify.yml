@@ -163,11 +163,13 @@ jobs:
   # by weakening it — see `kernel::ml::proofs` and `kernel::sched::proofs`.
   #
   # The lesson worth keeping: Kani runs fine locally (`cargo kani -p kernel
-  # -Z unstable-options --ignore-global-asm`: 28 harnesses in ~290 s, measured
-  # 2026-10-03 on a 4-core machine shared with another Kani job — no longer the
-  # ~60 s it was before SentinelFS FS-1a; every harness stays under its 60 s
-  # cap). A harness that has never been discharged locally does not belong in
-  # this gating job. Measure before adding one.
+  # -Z unstable-options --ignore-global-asm`: 41 harnesses in ~10 min, measured
+  # 2026-10-04 with SMP 3b-ii's six `acpi::` harnesses, each under 60 s alone,
+  # on a shared container; 28 in ~290 s on 2026-10-03 before PR-2 and 3b-ii).
+  # Keep every new harness under the 60 s rule — split compositionally rather
+  # than shrink what is proven (3b-ii's MADT harness went 333 s -> four <= 46 s
+  # harnesses). A harness that has never been discharged locally does not
+  # belong in this gating job. Measure before adding one.
   #
   # The step-level cap stays as a hang backstop. It is now redundant with the
   # job-level cap for gate purposes (a gating job holds the gate whether it ends

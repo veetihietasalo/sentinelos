@@ -41,10 +41,10 @@ changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + 
   `kernel::ioapic` routes the PIT (ISA 0 → GSI 2), keyboard, mouse and the e1000's
   line through the IOAPIC to the **BSP** (wall clock + BSP-consumed rings), 8259 and
   LINT0 masked and read back; EOI goes to whichever controller the LAPIC's ISR says
-  delivered. New `hal`: `hal::acpi`, `hal::ioapic` (hal-tcb §2l/§2m, invariant 4.16).
+  delivered. New `hal`: `hal::acpi`, `hal::ioapic` (hal-tcb §2l/§2m, invariant 17).
   `make test` asserts the `[ioapic] madt: … ok` line exactly and types `about` over
-  QMP to prove keystrokes arrive via the IOAPIC (≈20 s of software repaint under
-  TCG; 120 s budget). Fixed on the way, by inspection: a latent IRQ-context
+  QMP on boot 1 to prove keystrokes arrive via the IOAPIC (≈20 s of software
+  repaint under TCG; 120 s budget). Fixed on the way, by inspection: a latent IRQ-context
   self-deadlock in `hal::e1000`'s lock.
 - **Component model PR-1 (native).** `kernel::hash` (SHA-256, framed
   `ComponentId`), `kernel::host`: `ComponentRuntime` trait + `native::NativeRuntime`,
@@ -80,7 +80,7 @@ changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + 
   idle path (`sched::idle_reap`), never in `reschedule`. Zero `hal` code delta (hal-tcb §5e
   and §7 text corrected).
 - **Verification.** Miri (hal + kernel ml/hash/host/cap/bus/blk/sfs) and Kani (hal + kernel,
-  39 kernel harnesses, ~14 min locally since the SMP 3b-ii MADT-body harness) are **gating** CI; every workflow job carries a timeout,
+  41 kernel harnesses, ~10 min locally; every SMP 3b-ii harness < 60 s) are **gating** CI; every workflow job carries a timeout,
   machine-checked. Source guards `check-no-vector`, `check-ata-callers` and
   `check-component-imports` run in Kernel CI. Boot timing harness (`make boot-timing`) is
   informational.
