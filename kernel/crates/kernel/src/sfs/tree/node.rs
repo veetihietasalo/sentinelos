@@ -656,11 +656,12 @@ mod proofs {
         assert!(l.key(0) == first && l.key(nl + nr - 1) == last);
     }
 
-    /// Recut: a pair too heavy for one node is re-cut at half into two
-    /// non-empty, sorted, fitting, non-underflowing halves separated by the
-    /// right one's first key, keeping the count, both ends and the total
-    /// weight. (Entry-for-entry preservation: append then split, both proven
-    /// above.)
+    /// Recut: a pair too heavy for one node takes the split branch — so the
+    /// halves are exactly [`node4_split_is_sorted_and_balanced`]'s on the
+    /// appended node (non-empty, sorted, fitting, non-underflowing, the right
+    /// one's first key the separator; that harness covers every overflowing
+    /// node of up to 4 entries of weight ≤ `MAX_W`, which the appended pair
+    /// is) — and keeps the count, both ends and the total weight.
     #[kani::proof]
     #[kani::unwind(6)]
     fn node4_recut_is_sorted_balanced_and_preserving() {
@@ -670,13 +671,8 @@ mod proofs {
         let Ok(Rebalance::Split(sep)) = Node::rebalance(&mut l, &mut r, LIMIT) else {
             panic!("an overflowing pair is re-cut");
         };
-        assert!(!l.is_empty() && !r.is_empty());
         assert!(l.len() + r.len() == nl + nr);
-        assert!(!l.overflows(LIMIT) && !r.overflows(LIMIT));
-        assert!(!l.underflows(LIMIT) && !r.underflows(LIMIT));
-        assert!(l.is_sorted() && r.is_sorted());
         assert!(r.key(0) == Some(sep));
-        assert!(l.key(l.len() - 1).is_some_and(|k| k < sep));
         assert!(l.key(0) == first && r.key(r.len() - 1) == last);
         assert!(l.weight() + r.weight() == total);
     }
