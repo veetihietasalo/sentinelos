@@ -585,14 +585,16 @@ mod tests {
 mod proofs {
     use super::*;
 
-    /// A block of 72 + 2 × 21 + 14 bytes: room for two empty items or one
-    /// item with up to 35 data bytes.
-    const SMALL: usize = NODE_HDR + 2 * LEAF_SLOT + 14;
+    /// A block of 72 + 2 × 21 + 8 bytes: room for two items with 8 data
+    /// bytes between them, or one with up to 29.
+    const SMALL: usize = NODE_HDR + 2 * LEAF_SLOT + 8;
+    /// Loops run over at most the payload (`SMALL − 72` bytes) plus one.
+    const _: () = assert!(SMALL - NODE_HDR < 52);
 
     /// Decode totality: any bytes in a shrunken leaf-or-internal block decode
     /// to `Ok` or `Err` — no panic, no out-of-bounds read, no unbounded loop.
     #[kani::proof]
-    #[kani::unwind(4)]
+    #[kani::unwind(52)]
     fn node_decode_is_total() {
         let buf: [u8; SMALL] = kani::any();
         let mut leaf: Node<Span, 2> = Node::new(Span::EMPTY);
@@ -605,9 +607,9 @@ mod proofs {
     /// weight fits the shrunken block encodes `Ok`, and decodes back to the
     /// same keys with the same bytes for every item.
     #[kani::proof]
-    #[kani::unwind(4)]
+    #[kani::unwind(52)]
     fn leaf_packing_is_total_and_round_trips() {
-        let src: [u8; 16] = kani::any();
+        let src: [u8; 8] = kani::any();
         let n: usize = kani::any();
         kani::assume(n >= 1 && n <= 2);
         let mut node: Node<Span, 2> = Node::new(Span::EMPTY);

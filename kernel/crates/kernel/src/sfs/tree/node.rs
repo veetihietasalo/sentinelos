@@ -31,14 +31,22 @@
 //! in-order contents), which the host tests check (§5 principle 4 as built;
 //! the FS-1b deviation note in the spec).
 //!
-//! Storage is two boxed slices of exactly `CAP` entries, allocated once by
-//! [`Node::new`] (no multi-kilobyte stack temporaries on a kernel task's
-//! stack); nothing here allocates afterwards, and every loop is bounded by
-//! `CAP`.
+//! Storage is two inline arrays of exactly `CAP` entries — cheap for Kani at
+//! `CAP = 4`. A kernel-sized node is several kilobytes, so the kernel never
+//! builds a group of them on a task stack: [`boxed`] puts them on the heap
+//! one at a time. Nothing here allocates otherwise, and every loop is
+//! bounded by `CAP`.
 
 use crate::sfs::key::Key;
 use alloc::boxed::Box;
-use alloc::vec;
+
+/// `n` empty nodes on the heap, built one at a time (a single node is the
+/// largest stack temporary — never the whole group, which matters on a
+/// kernel task's stack in a debug build).
+#[must_use]
+pub fn boxed<V: Entry, const CAP: usize>(n: usize, fill: V) -> Box<[Node<V, CAP>]> {
+    (0..n).map(|_| Node::new(fill)).collect()
+}
 
 /// A node entry's value: something with an on-disk weight.
 pub trait Entry: Copy {
@@ -78,8 +86,8 @@ pub enum Rebalance {
 #[derive(Clone, Debug)]
 pub struct Node<V: Entry, const CAP: usize> {
     len: usize,
-    keys: Box<[Key]>,
-    vals: Box<[V]>,
+    keys: [Key; CAP],
+    vals: [V; CAP],
 }
 
 impl<V: Entry, const CAP: usize> Node<V, CAP> {
@@ -88,8 +96,8 @@ impl<V: Entry, const CAP: usize> Node<V, CAP> {
     pub fn new(fill: V) -> Self {
         Node {
             len: 0,
-            keys: vec![KEY_ZERO; CAP].into_boxed_slice(),
-            vals: vec![fill; CAP].into_boxed_slice(),
+            keys: [KEY_ZERO; CAP],
+            vals: [fill; CAP],
         }
     }
 
@@ -571,7 +579,9 @@ mod proofs {
     fn node4_merge_is_sorted_balanced_and_preserving() {
         let nl: usize = kani::any();
         let nr: usize = kani::any();
-        kani::assume(nl >= 1 && nr >= 1 && nl + nr <= 4);
+        // Each bounded first, so the sum cannot overflow.
+        kani::assume(nl >= 1 && nl <= 3 && nr >= 1 && nr <= 3);
+        kani::assume(nl + nr <= 4);
         let mut l = any_node(nl);
         let mut r = any_node(nr);
         kani::assume(l.key(nl - 1) < r.key(0));

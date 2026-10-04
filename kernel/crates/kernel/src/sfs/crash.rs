@@ -264,6 +264,8 @@ fn crash_anywhere_in_any_commit_recovers_a_shadow_intact() {
             }
         }
     }
+    extern crate std;
+    std::eprintln!("crash sweep: {total:?}");
     // Both outcomes were reached, so the sweep straddled the superblock.
     assert!(
         total.recovered_old > 0 && total.recovered_new > 0,

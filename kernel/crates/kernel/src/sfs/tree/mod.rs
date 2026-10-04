@@ -267,9 +267,10 @@ enum NewRoot {
 /// 50 KiB): the decoded path, siblings and splits, two leaf copies and the
 /// item being written. Nothing allocates per operation.
 pub struct TreeWs {
-    leaf: [Node<Span, LEAF_CAP>; 2],
-    /// `inner[l - 1][0/1]`: the `a` / `b` node of level `l`.
-    inner: Box<[[Node<Pointer, INNER_CAP>; 2]]>,
+    /// The `a` and `b` leaf.
+    leaf: Box<[Node<Span, LEAF_CAP>]>,
+    /// `inner[2 (l - 1) + b]`: the `a` / `b` node of level `l`.
+    inner: Box<[Node<Pointer, INNER_CAP>]>,
     copies: Blocks,
     item: Box<[u8]>,
     levels: [Level; LEVELS + 1],
@@ -285,10 +286,9 @@ impl TreeWs {
     /// The workspace.
     #[must_use]
     pub fn new() -> TreeWs {
-        let pair = || [Node::new(Pointer::NULL), Node::new(Pointer::NULL)];
         TreeWs {
-            leaf: [Node::new(Span::EMPTY), Node::new(Span::EMPTY)],
-            inner: (0..LEVELS).map(|_| pair()).collect(),
+            leaf: node::boxed(2, Span::EMPTY),
+            inner: node::boxed(2 * LEVELS, Pointer::NULL),
             copies: zeroed_blocks(2),
             item: vec![0u8; ITEM_MAX].into_boxed_slice(),
             levels: [Level::EMPTY; LEVELS + 1],
@@ -304,15 +304,12 @@ impl TreeWs {
     }
 
     fn inner(&self, level: usize, b: bool) -> Option<&Node<Pointer, INNER_CAP>> {
-        self.inner
-            .get(level.checked_sub(1)?)
-            .map(|p| &p[usize::from(b)])
+        self.inner.get(2 * level.checked_sub(1)? + usize::from(b))
     }
 
     fn inner_mut(&mut self, level: usize, b: bool) -> Option<&mut Node<Pointer, INNER_CAP>> {
         self.inner
-            .get_mut(level.checked_sub(1)?)
-            .map(|p| &mut p[usize::from(b)])
+            .get_mut(2 * level.checked_sub(1)? + usize::from(b))
     }
 
     fn level(&self, l: usize) -> Result<Level, TreeError> {
@@ -352,14 +349,14 @@ impl TreeWs {
     /// sibling). Returns whether they merged (the right one is then empty).
     fn rebalance(&mut self, l: usize, b_left: bool) -> Result<bool, TreeError> {
         let out = if l == 0 {
-            let [a, b] = &mut self.leaf;
+            let (a, b) = pair(&mut self.leaf, 0).ok_or(TreeError::Internal)?;
             if b_left {
                 Node::rebalance(b, a, LIMIT)
             } else {
                 Node::rebalance(a, b, LIMIT)
             }
         } else {
-            let [a, b] = self.inner.get_mut(l - 1).ok_or(TreeError::Internal)?;
+            let (a, b) = pair(&mut self.inner, 2 * (l - 1)).ok_or(TreeError::Internal)?;
             if b_left {
                 Node::rebalance(b, a, LIMIT)
             } else {
@@ -372,6 +369,12 @@ impl TreeWs {
             Err(_) => Err(TreeError::Internal),
         }
     }
+}
+
+/// Elements `i` and `i + 1` of `s`, both mutable.
+fn pair<T>(s: &mut [T], i: usize) -> Option<(&mut T, &mut T)> {
+    let (lo, hi) = s.get_mut(i..i.checked_add(2)?)?.split_at_mut(1);
+    Some((lo.first_mut()?, hi.first_mut()?))
 }
 
 /// One CoW B+tree of a mounted volume (FS-1b: the metadata tree, `tree_id
@@ -669,7 +672,7 @@ impl Tree {
             return Ok(NewRoot::At(0, false));
         };
         {
-            let [a, b] = &mut ws.leaf;
+            let (a, b) = pair(&mut ws.leaf, 0).ok_or(TreeError::Internal)?;
             let r = match a.search(&key) {
                 Ok(i) => a.set_val(i, span),
                 Err(i) => a.insert(i, key, span),
@@ -685,7 +688,7 @@ impl Tree {
             let c = ws.level(l)?.c;
             let a_key = ws.first_key(l - 1, false).ok_or(TreeError::Internal)?;
             let b_key = ws.first_key(l - 1, true);
-            let [a, b] = ws.inner.get_mut(l - 1).ok_or(TreeError::Internal)?;
+            let (a, b) = pair(&mut ws.inner, 2 * (l - 1)).ok_or(TreeError::Internal)?;
             a.set_key(c, a_key).map_err(|_| TreeError::Internal)?;
             if below.b.live {
                 let b_key = b_key.ok_or(TreeError::Internal)?;

@@ -146,12 +146,17 @@ fn every_operation_kind_dirties_at_most_13_blocks() {
             worst[kind] = worst[kind].max(fp);
             assert!(fp <= 13, "{op:?} dirtied {fp} blocks (device {blocks})");
         }
+        extern crate std;
+        std::eprintln!(
+            "worst footprint on {blocks} blocks [insert, replace, remove, max-insert]: {worst:?}"
+        );
         assert!(worst.iter().all(|&w| w >= 3), "{worst:?}");
         assert_eq!(fs.scrub().bad, 0);
     }
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn refusals_change_nothing() {
     let mut fs = Fs::fresh(256);
     fs.put(key(1), b"one").unwrap();

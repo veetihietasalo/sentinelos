@@ -177,7 +177,7 @@ pub struct ScrubWs {
     bitmap: Blocks,
     bitmap_group: Option<u32>,
     inner: Box<[Node<Pointer, INNER_CAP>]>,
-    leaf: Node<Span, LEAF_CAP>,
+    leaf: Box<[Node<Span, LEAF_CAP>]>,
     groups: Box<[Pointer]>,
 }
 
@@ -196,8 +196,8 @@ impl ScrubWs {
             data: zeroed_blocks(1),
             bitmap: zeroed_blocks(1),
             bitmap_group: None,
-            inner: (0..LEVELS).map(|_| Node::new(Pointer::NULL)).collect(),
-            leaf: Node::new(Span::EMPTY),
+            inner: super::tree::node::boxed(LEVELS, Pointer::NULL),
+            leaf: super::tree::node::boxed(1, Span::EMPTY),
             groups: vec![Pointer::NULL; MAX_GROUPS as usize].into_boxed_slice(),
         }
     }
@@ -477,14 +477,14 @@ fn visit<D: BlockDevice>(
         }
         return Ok(Some(got));
     }
-    if codec::decode_leaf(buf, 0, &mut ws.leaf).is_err()
-        || first.is_some_and(|k| ws.leaf.key(0) != Some(k))
+    if codec::decode_leaf(buf, 0, &mut ws.leaf[0]).is_err()
+        || first.is_some_and(|k| ws.leaf[0].key(0) != Some(k))
     {
         r.damage(ptr.block, bad_node);
         return Ok(None);
     }
-    for i in 0..ws.leaf.len() {
-        let (Some(key), Some(span)) = (ws.leaf.key(i), ws.leaf.val(i)) else {
+    for i in 0..ws.leaf[0].len() {
+        let (Some(key), Some(span)) = (ws.leaf[0].key(i), ws.leaf[0].val(i)) else {
             continue;
         };
         r.items += 1;

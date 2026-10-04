@@ -2,7 +2,7 @@
 
 One page for a fresh session (or a fresh container) to pick the kernel work back
 up without re-deriving state from git. Update it at the end of any session that
-changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + SentinelFS FS-1a landed; PR-2b next).
+changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + SentinelFS FS-1a landed; FS-1b PR open; PR-2b next).
 
 ## Landed (main)
 
@@ -68,6 +68,19 @@ changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + 
   plus the toy FS's `persistence PROVEN` line. Scheduler: zombies are reaped only on the
   idle path (`sched::idle_reap`), never in `reschedule`. Zero `hal` code delta (hal-tcb §5e
   and §7 text corrected).
+- **SentinelFS FS-1b (CoW tree + transactions + durability) — PR open 2026-10-04.**
+  `kernel::sfs::tree`: `Node<V, CAP>` algebra + separate 4 KiB codec + item encodings;
+  every mutation planned in memory, preflighted against every budget
+  (`Allocator::check_ops`), then applied — refusals change nothing, ≤ 13 dirty blocks per
+  op asserted (worst 9). `sfs::scrub` hashes every reachable block and checks structure and
+  allocation; damage → read-only, objects named. `hal::ata` flush split (row A2,
+  invariant 16; hal review owed). Host: crash-point property test (2 744 crash points,
+  ddmin shrinker), replay/order determinism, counting-allocator heap cap (`test-alloc`
+  crate, 435 636 B on 16 MiB and 1 GiB), threaded race model (found and fixed a stale-miss
+  bug: misses carry a commit epoch). `make test` adds a QEMU torn-commit stage (test-control
+  sector at LBA 1024, cut after 2 writes, `cache=writeback` + SIGKILL, recovery mounts the
+  previous commit exactly): `[sfs] torn-commit: cut-after=2 recovered-gen=3
+  data-intact=yes ok`, `[sfs] scrub: blocks=10 hashed=10 bad=0 ok`.
 - **Verification.** Miri (hal + kernel ml/hash/host/cap/bus/blk/sfs) and Kani (hal + kernel,
   35 kernel harnesses, ~5 min) are **gating** CI; every workflow job carries a timeout,
   machine-checked. Source guards `check-no-vector`, `check-ata-callers` and
@@ -88,12 +101,11 @@ hashes on every pointer, two generation-numbered superblock slots (no journal), 
 content-addressed blobs, logged privileged snapshots/rollback, one 64-block cache slab, an
 `sfs-commit` task that does all I/O (never PIO under the lock), deterministic allocation,
 metadata reserve. **Zero new `hal` rows** (`FLUSH CACHE` already exists; FS-1b splits the
-API). Staging: **FS-1a** (landed, see above) → **FS-1c** (storage-cap lattice type + `⊑` +
+API). Staging: **FS-1a** (landed, see above), **FS-1b** (PR open, see above) → **FS-1c** (storage-cap lattice type + `⊑` +
 Kani never-amplifies, on top of component PR-2's `kernel::cap`; moved out of FS-1a
-2026-10-03 because `kernel::cap` did not exist yet) → **FS-1b** (CoW tree + transactions +
-torn-commit proof + flush split) → **FS-2** (files + facade; `read_file` becomes
+2026-10-03 because `kernel::cap` did not exist yet) → **FS-2** (files + facade; `read_file` becomes
 into-buffer, `Corrupt`/`NoSpace` errors; fuzz lane; persistent orphan list for removes
-beyond `PENDING_MAX`; real entropy for the format seed) → **FS-4** (blobs, snapshots, cap
+beyond `PENDING_MAX`; real entropy for the format seed; A27's older-slot fallback) → **FS-4** (blobs, snapshots, cap
 enforcement) → **identity spec** → **FS-5** (superblock hash signed into the IntegrityLog).
 Follow-ups owned in the spec as A25–A31. Before FS-2 adds callers that block on the commit
 task: one **sched park/unpark** primitive (wake permit + optional mono deadline), designed
