@@ -287,7 +287,16 @@ impl NicLock {
     }
 
     /// Run `f` with exclusive access to the driver state.
+    ///
+    /// Interrupts are masked on the calling core for the whole critical
+    /// section (and restored to their prior state after): [`on_irq`] takes this
+    /// same lock from the NIC's interrupt handler, so a NIC IRQ landing while
+    /// the idle loop held the lock (`poll_frame`, `link_up`, …) would otherwise
+    /// spin forever on its own core. Latent while the line was 8259-routed;
+    /// exposed by the level-triggered IOAPIC route (SMP 3b-ii).
     fn with<R>(&self, f: impl FnOnce(&mut Option<Nic>) -> R) -> R {
+        let restore = crate::cpu::interrupts_enabled();
+        crate::cpu::disable_interrupts();
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -301,6 +310,9 @@ impl NicLock {
         // escape `f`.
         let result = f(unsafe { &mut *self.inner.get() });
         self.locked.store(false, Ordering::Release);
+        if restore {
+            crate::cpu::enable_interrupts();
+        }
         result
     }
 }
@@ -672,9 +684,9 @@ pub fn on_irq() {
             }
         });
     }
-    // EOI the PIC for the NIC's line so further interrupts are delivered.
+    // EOI whichever controller delivered the NIC IRQ (LAPIC once IOAPIC-routed).
     if line != 0xFF {
-        crate::pic::end_of_interrupt(vector_for(line));
+        crate::ioapic::device_eoi(vector_for(line));
     }
 }
 
