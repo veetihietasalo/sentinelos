@@ -148,6 +148,20 @@ pub fn decode_head(buf: &[u8]) -> Result<(u8, usize), CodecError> {
     Ok((level, n))
 }
 
+/// Most entries of `stride` bytes a block of `block_len` bytes can hold.
+const fn max_entries(block_len: usize, stride: usize) -> usize {
+    block_len.saturating_sub(NODE_HDR) / stride
+}
+
+/// Whether `buf[from..to]` is all zero, scanning the payload by position so
+/// the loop's bound is the block length (not the on-disk offsets).
+fn zero_between(buf: &[u8], from: usize, to: usize) -> bool {
+    buf.iter()
+        .enumerate()
+        .skip(NODE_HDR)
+        .all(|(j, &b)| j < from || j >= to || b == 0)
+}
+
 /// The key of entry `i` of a node whose entries are `stride` bytes.
 fn key_at(buf: &[u8], i: usize, stride: usize) -> Result<Key, CodecError> {
     let at = NODE_HDR + i * stride;
@@ -178,7 +192,12 @@ pub fn decode_leaf<const C: usize>(
         .filter(|&end| end <= buf.len())
         .ok_or(CodecError::Corrupt)?;
     let mut cursor = buf.len();
-    for i in 0..n {
+    // The loop bound is the most items the block can hold — a constant of
+    // the block length, never the on-disk count (`n` only ends it early).
+    for i in 0..max_entries(buf.len(), LEAF_SLOT) {
+        if i >= n {
+            break;
+        }
         let slot = NODE_HDR + i * LEAF_SLOT;
         let key = key_at(buf, i, LEAF_SLOT)?;
         let off = u16_at(buf, slot + KEY_LEN).ok_or(CodecError::Corrupt)?;
@@ -194,12 +213,7 @@ pub fn decode_leaf<const C: usize>(
         cursor = start;
     }
     // Canonical: nothing but zeros between the table and the data.
-    if buf
-        .get(table_end..cursor)
-        .ok_or(CodecError::Corrupt)?
-        .iter()
-        .any(|&b| b != 0)
-    {
+    if !zero_between(buf, table_end, cursor) {
         return Err(CodecError::Corrupt);
     }
     Ok(())
@@ -226,7 +240,10 @@ pub fn decode_inner<const C: usize>(
         .and_then(|t| t.checked_add(NODE_HDR))
         .filter(|&end| end <= buf.len())
         .ok_or(CodecError::Corrupt)?;
-    for i in 0..n {
+    for i in 0..max_entries(buf.len(), CHILD_LEN) {
+        if i >= n {
+            break;
+        }
         let key = key_at(buf, i, CHILD_LEN)?;
         let at = NODE_HDR + i * CHILD_LEN + KEY_LEN;
         let ptr = buf
@@ -238,12 +255,7 @@ pub fn decode_inner<const C: usize>(
         }
         out.push(key, ptr)?;
     }
-    if buf
-        .get(end..)
-        .ok_or(CodecError::Corrupt)?
-        .iter()
-        .any(|&b| b != 0)
-    {
+    if !zero_between(buf, end, buf.len()) {
         return Err(CodecError::Corrupt);
     }
     Ok(level)
@@ -589,15 +601,16 @@ mod proofs {
     /// between them, or one with up to 29.
     const SMALL: usize = NODE_HDR + 2 * LEAF_SLOT + 8;
     /// Decode harness blocks: room for exactly one entry of each kind plus a
-    /// few spare bytes, so every loop in the decoders runs a handful of
-    /// times (CBMC's cost is the unwinding, not the logic).
+    /// few spare bytes. Every decoder loop is bounded by the block length (a
+    /// constant here), so the unwind is the block length plus one and CBMC
+    /// never explores a symbolic trip count.
     const LEAF_ONE: usize = NODE_HDR + LEAF_SLOT + 6;
     const INNER_ONE: usize = NODE_HDR + CHILD_LEN + 3;
 
     /// Leaf decode totality: any bytes decode to `Ok` or `Err` — no panic, no
     /// out-of-bounds read, every loop bounded by the block.
     #[kani::proof]
-    #[kani::unwind(10)]
+    #[kani::unwind(100)]
     fn leaf_decode_is_total() {
         let buf: [u8; LEAF_ONE] = kani::any();
         let mut leaf: Node<Span, 2> = Node::new(Span::EMPTY);
@@ -606,7 +619,7 @@ mod proofs {
 
     /// Internal-node decode totality, as above.
     #[kani::proof]
-    #[kani::unwind(8)]
+    #[kani::unwind(141)]
     fn inner_decode_is_total() {
         let buf: [u8; INNER_ONE] = kani::any();
         let mut inner: Node<Pointer, 2> = Node::new(Pointer::NULL);
@@ -617,7 +630,7 @@ mod proofs {
     /// weight fits the shrunken block encodes `Ok`, and decodes back to the
     /// same keys with the same bytes for every item.
     #[kani::proof]
-    #[kani::unwind(32)]
+    #[kani::unwind(123)]
     fn leaf_packing_is_total_and_round_trips() {
         let src: [u8; 8] = kani::any();
         let n: usize = kani::any();
