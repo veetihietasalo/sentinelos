@@ -78,6 +78,11 @@ jobs:
         if: steps.kvm.outputs.available == 'yes'
         uses: actions/cache@v4
         with:
+          # Disk images never ride in the cache. actions/cache archives
+          # `kernel/target` as ONE directory entry, so a `!` path cannot exclude
+          # a file inside it; this job's last step deletes the images instead,
+          # before the post-job save. (The boot tests also recreate their own
+          # image every run; the dev image is `make run`'s.)
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
@@ -118,8 +123,16 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: smp-x2apic-kvm-serial-log
-          path: kernel/target/serial.log
+          path: |
+            kernel/target/serial.log
+            kernel/target/serial-boot2.log
           if-no-files-found: warn
+
+      # Keep disk images out of the cache: the cache's post-job save runs after
+      # this step (see the note on the cache step).
+      - name: Drop disk images before the cache save
+        if: always()
+        run: rm -f kernel/target/sentinelos-disk.img kernel/target/sentinelos-test-disk.img
 
   # NON-GATING timing harness. Boots the SAME image several times on the KVM
   # runner and reports the min/median/max wall-clock to `boot-bringup-ok`, plus
@@ -177,6 +190,11 @@ jobs:
         if: steps.kvm.outputs.available == 'yes'
         uses: actions/cache@v4
         with:
+          # Disk images never ride in the cache. actions/cache archives
+          # `kernel/target` as ONE directory entry, so a `!` path cannot exclude
+          # a file inside it; this job's last step deletes the images instead,
+          # before the post-job save. (The boot tests also recreate their own
+          # image every run; the dev image is `make run`'s.)
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
@@ -210,3 +228,9 @@ jobs:
         working-directory: kernel
         timeout-minutes: 12
         run: make boot-timing RUNS=7
+
+      # Keep disk images out of the cache: the cache's post-job save runs after
+      # this step (see the note on the cache step).
+      - name: Drop disk images before the cache save
+        if: always()
+        run: rm -f kernel/target/sentinelos-disk.img kernel/target/sentinelos-test-disk.img
