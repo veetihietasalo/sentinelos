@@ -582,8 +582,11 @@ pub fn parse_madt_body(table: &[u8]) -> Result<MadtInfo, AcpiError> {
 /// structures exactly tile `[MADT_ENTRIES_OFFSET, table.len())`; a structure
 /// shorter than 2 bytes is [`AcpiError::Malformed`], one running past the
 /// table (or a lone trailing byte) [`AcpiError::Truncated`], and `f`'s first
-/// error stops the walk. Terminates within `len / 2` iterations: each consumes
-/// ≥ 2 bytes. Kani: `madt_walk_is_total_and_tiles`.
+/// error stops the walk (by `?`; host-tested via `parse_madt`'s error cases).
+/// Terminates within `len / 2` iterations: each consumes ≥ 2 bytes. Kani
+/// (`madt_walk_is_total_and_tiles`, with an always-`Ok` closure) proves
+/// totality, the ≥ 2-byte entries and the exact tiling — not the error
+/// propagation.
 ///
 /// # Errors
 ///
@@ -1225,13 +1228,22 @@ mod proofs {
     #[kani::unwind(3)]
     fn madt_body_smoke_46() {
         let buf: [u8; 46] = kani::any();
-        if let Ok(m) = parse_madt_body(&buf) {
+        let r = parse_madt_body(&buf);
+        kani::cover!(r.is_ok());
+        if let Ok(m) = r {
             assert!(m.ioapic_count == 0 && m.cpus_seen == 0);
         }
     }
 
-    /// A single structure of any type, length and content decodes totally, and
-    /// an `Ok` IOAPIC/ISO entry carries exactly the bytes at its fixed offsets.
+    /// A single structure of any type, length and content decodes totally
+    /// **from any reachable accumulator state** — a symbolic `MadtInfo` whose
+    /// counts are anywhere within capacity (and whose override sources are
+    /// arbitrary, so the duplicate check is exercised) — which is what lets
+    /// this harness compose with `madt_walk_is_total_and_tiles` instead of
+    /// covering only the first structure. Afterwards every count is still
+    /// within capacity; `cpus_seen` grows (by exactly one) only for a type-0
+    /// structure of ≥ 8 bytes or a type-9 one of ≥ 16; an `Ok` IOAPIC/ISO is
+    /// appended at the old count carrying exactly the bytes at its fixed offsets.
     #[kani::proof]
     #[kani::unwind(18)]
     fn one_entry_decode_is_total_and_exact() {
@@ -1239,19 +1251,48 @@ mod proofs {
         let len: usize = kani::any();
         kani::assume((2..=16).contains(&len));
         let mut info = MadtInfo::EMPTY;
+        info.cpus_seen = kani::any();
+        info.ioapic_count = kani::any();
+        kani::assume(usize::from(info.ioapic_count) <= MAX_IOAPICS);
+        info.override_count = kani::any();
+        kani::assume(usize::from(info.override_count) <= MAX_OVERRIDES);
+        info.lapic_nmi_count = kani::any();
+        kani::assume(usize::from(info.lapic_nmi_count) <= MAX_LAPIC_NMIS);
+        info.nmi_source_count = kani::any();
+        kani::assume(usize::from(info.nmi_source_count) <= MAX_NMI_SOURCES);
+        for o in &mut info.overrides {
+            o.bus = kani::any();
+            o.source = kani::any();
+        }
+        let before = info;
+
         let r = decode_entry(&entry[..len], &mut info);
+
+        assert!(usize::from(info.ioapic_count) <= MAX_IOAPICS);
+        assert!(usize::from(info.override_count) <= MAX_OVERRIDES);
+        assert!(usize::from(info.lapic_nmi_count) <= MAX_LAPIC_NMIS);
+        assert!(usize::from(info.nmi_source_count) <= MAX_NMI_SOURCES);
+        let cpu_struct = (entry[0] == 0 && len >= 8) || (entry[0] == 9 && len >= 16);
+        if cpu_struct {
+            assert_eq!(info.cpus_seen, before.cpus_seen.saturating_add(1));
+        } else {
+            assert_eq!(info.cpus_seen, before.cpus_seen);
+        }
         if r.is_ok() && entry[0] == 1 {
             assert!(len >= 12);
-            assert_eq!(info.ioapic_count, 1);
-            assert_eq!(info.ioapics[0].id, entry[2]);
+            let i = usize::from(before.ioapic_count);
+            assert_eq!(info.ioapic_count, before.ioapic_count + 1);
+            assert_eq!(info.ioapics[i].id, entry[2]);
             assert_eq!(
-                info.ioapics[0].gsi_base,
+                info.ioapics[i].gsi_base,
                 u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]])
             );
         }
         if r.is_ok() && entry[0] == 2 {
             assert!(len >= 10);
-            assert_eq!(info.overrides[0].source, entry[3]);
+            let i = usize::from(before.override_count);
+            assert_eq!(info.override_count, before.override_count + 1);
+            assert_eq!(info.overrides[i].source, entry[3]);
         }
     }
 

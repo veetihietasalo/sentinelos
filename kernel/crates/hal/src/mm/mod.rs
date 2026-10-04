@@ -63,6 +63,9 @@ pub enum MmioError {
     /// The physical range is empty, overflows, or reaches past `MAXPHYADDR`
     /// ([`phys_span`]).
     BadRange,
+    /// A page of the range lies in memory the kernel owns or may own
+    /// ([`overlaps_kernel_owned`]).
+    OverlapsKernelMemory,
 }
 
 impl From<MapError> for MmioError {
@@ -111,35 +114,67 @@ pub fn map_firmware_ro(phys: PhysAddr, len: usize) -> Result<VirtAddr, MmioError
     map_window(phys, len, PageFlags::kernel_ro())
 }
 
-/// Physical-address width the CPU implements (`MAXPHYADDR`): CPUID
-/// `0x8000_0008` EAX[7:0] where that leaf exists, else the architectural
-/// fallback of 36. Clamped to `[32, 52]` (52 is the architectural maximum a
-/// 4-level/5-level PTE can name).
+/// Usable physical-address width, from the CPUID words that define it:
+///
+/// 1. `MAXPHYADDR` — leaf `0x8000_0008` EAX[7:0] where that leaf exists
+///    (`max_extended_leaf >= 0x8000_0008`), else the architectural fallback 36.
+/// 2. **AMD memory encryption** — where leaf `0x8000_001F` exists and its EAX
+///    bit 0 (SME) is set, the encryption **C-bit** (EBX[5:0]) is an address bit
+///    a mapping must never set, and EBX[11:6] more bits are reserved below
+///    `MAXPHYADDR`: the width becomes `min(bits, c_bit) - reduction`, as Linux
+///    computes it. (Applied whenever the capability is advertised, active or
+///    not — stricter is safe here.)
+///
+/// Clamped to `[32, 52]`. **Residual:** Intel TME-MK (CPUID.7.0:ECX[13]) takes
+/// its KeyID bits from the top of `MAXPHYADDR` only once firmware activates it
+/// (`IA32_TME_ACTIVATE`); this decode does not read that MSR, so on a
+/// TME-MK-active part a span could still name KeyID bits (hal-tcb AC2/IO1).
 #[must_use]
-pub const fn decode_phys_addr_bits(max_extended_leaf: u32, leaf_8008_eax: u32) -> u8 {
-    if max_extended_leaf < 0x8000_0008 {
-        return 36;
+pub const fn decode_phys_addr_bits(
+    max_extended_leaf: u32,
+    leaf_8008_eax: u32,
+    leaf_801f_eax: u32,
+    leaf_801f_ebx: u32,
+) -> u8 {
+    let mut bits: u32 = if max_extended_leaf >= 0x8000_0008 {
+        leaf_8008_eax & 0xFF
+    } else {
+        36
+    };
+    if max_extended_leaf >= 0x8000_001F && leaf_801f_eax & 1 != 0 {
+        let c_bit = leaf_801f_ebx & 0x3F;
+        let reduction = (leaf_801f_ebx >> 6) & 0x3F;
+        if c_bit < bits {
+            bits = c_bit;
+        }
+        bits = bits.saturating_sub(reduction);
     }
-    let bits = (leaf_8008_eax & 0xFF) as u8;
     if bits < 32 {
         32
     } else if bits > 52 {
         52
     } else {
-        bits
+        bits as u8
     }
 }
 
-/// This CPU's `MAXPHYADDR` (see [`decode_phys_addr_bits`]); pure `cpuid`.
+/// This CPU's usable physical-address width (see [`decode_phys_addr_bits`]);
+/// pure `cpuid`.
 #[must_use]
 pub fn phys_addr_bits() -> u8 {
     let max_ext = crate::cpuid::raw(0x8000_0000, 0).eax;
-    let eax = if max_ext >= 0x8000_0008 {
+    let eax_8008 = if max_ext >= 0x8000_0008 {
         crate::cpuid::raw(0x8000_0008, 0).eax
     } else {
         0
     };
-    decode_phys_addr_bits(max_ext, eax)
+    let (eax_801f, ebx_801f) = if max_ext >= 0x8000_001F {
+        let r = crate::cpuid::raw(0x8000_001F, 0);
+        (r.eax, r.ebx)
+    } else {
+        (0, 0)
+    };
+    decode_phys_addr_bits(max_ext, eax_8008, eax_801f, ebx_801f)
 }
 
 /// The page-aligned physical span `map_window` would map for `[phys, phys + len)`,
@@ -174,13 +209,22 @@ pub const fn phys_span(phys: u64, len: u64, phys_bits: u8) -> Option<(u64, u64)>
 }
 
 /// The shared body of [`map_mmio`] / [`map_firmware_ro`]: validate the span
-/// ([`phys_span`] against this CPU's `MAXPHYADDR`), bump-allocate a virtual
+/// ([`phys_span`] against this CPU's usable address width, then
+/// [`overlaps_kernel_owned`] on the page-rounded span), bump-allocate a virtual
 /// span in the MMIO window and map every page of `[phys, phys + len)` with
 /// `flags`.
 fn map_window(phys: PhysAddr, len: usize, flags: PageFlags) -> Result<VirtAddr, MmioError> {
     let hhdm = hhdm_offset().ok_or(MmioError::NotInitialised)?;
     let (phys_base, span) =
         phys_span(phys.as_u64(), len as u64, phys_addr_bits()).ok_or(MmioError::BadRange)?;
+    // Every page this call maps — the page-rounded span, not just the bytes
+    // asked for — must lie outside memory the kernel owns or may own. This is
+    // the one check every caller gets (ACPI tables, the IOAPIC, the e1000 BAR,
+    // the xAPIC page): no MMIO window can alias kernel RAM, and no UC mapping
+    // can share a page with WB kernel memory.
+    if overlaps_kernel_owned(phys_base, span) {
+        return Err(MmioError::OverlapsKernelMemory);
+    }
     let offset_in_page = phys.as_u64() - phys_base;
     let span = usize::try_from(span).map_err(|_| MmioError::BadRange)?;
     let pages = span / PAGE_SIZE as usize;
@@ -576,10 +620,22 @@ mod phys_span_tests {
 
     #[test]
     fn phys_addr_bits_decode() {
-        assert_eq!(decode_phys_addr_bits(0x8000_0007, 0xFF), 36);
-        assert_eq!(decode_phys_addr_bits(0x8000_0008, 0x3027), 39);
-        assert_eq!(decode_phys_addr_bits(0x8000_0008, 0x0010), 32);
-        assert_eq!(decode_phys_addr_bits(0x8000_0008, 0x00FF), 52);
+        assert_eq!(decode_phys_addr_bits(0x8000_0007, 0xFF, 1, 0x2F), 36);
+        assert_eq!(decode_phys_addr_bits(0x8000_0008, 0x3027, 0, 0), 39);
+        assert_eq!(decode_phys_addr_bits(0x8000_0008, 0x0010, 0, 0), 32);
+        assert_eq!(decode_phys_addr_bits(0x8000_0008, 0x00FF, 0, 0), 52);
+        // AMD EPYC with SME: MAXPHYADDR 48, C-bit 47, reduction 1 -> 46.
+        let ebx = 47 | (1 << 6);
+        assert_eq!(decode_phys_addr_bits(0x8000_0020, 0x3030, 1, ebx), 46);
+        // Same CPUID words but SME not advertised: untouched.
+        assert_eq!(decode_phys_addr_bits(0x8000_0020, 0x3030, 0, ebx), 48);
+        // Leaf 0x8000_001F absent (max ext 0x8000_0008): SME words ignored.
+        assert_eq!(decode_phys_addr_bits(0x8000_0008, 0x3030, 1, ebx), 48);
+        // C-bit above MAXPHYADDR: only the reduction applies.
+        assert_eq!(
+            decode_phys_addr_bits(0x8000_0020, 0x3028, 1, 51 | (5 << 6)),
+            35
+        );
     }
 }
 
@@ -608,10 +664,18 @@ mod phys_span_proofs {
         }
     }
 
-    /// The width decode is total and always within `[32, 52]`.
+    /// The width decode is total and always within `[32, 52]`, and with SME
+    /// advertised it never exceeds the C-bit position (unless clamped to 32).
     #[kani::proof]
     fn phys_addr_bits_decode_is_clamped() {
-        let b = decode_phys_addr_bits(kani::any(), kani::any());
+        let max_ext: u32 = kani::any();
+        let eax_801f: u32 = kani::any();
+        let ebx_801f: u32 = kani::any();
+        let b = decode_phys_addr_bits(max_ext, kani::any(), eax_801f, ebx_801f);
         assert!((32..=52).contains(&b));
+        if max_ext >= 0x8000_001F && eax_801f & 1 != 0 {
+            let c_bit = (ebx_801f & 0x3F) as u8;
+            assert!(b <= c_bit.max(32));
+        }
     }
 }

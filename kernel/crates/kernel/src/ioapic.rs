@@ -53,9 +53,11 @@ const MADT_BUF_LEN: usize = 8 * 1024;
 
 /// PIT ticks the post-switch liveness check must observe.
 const PIT_LIVE_TICKS: u64 = 3;
-/// TSC-cycle bound for that check: 2^33 cycles is ~2–4 s at real TSC rates
-/// (and under TCG, whose TSC follows the host clock) — reached only on failure.
-const PIT_LIVE_TSC_LIMIT: u64 = 1 << 33;
+/// TSC-cycle bound for that check: 2^35 cycles is ~10–15 s at real TSC rates
+/// (and under TCG, whose TSC follows the host clock) — generous enough that a
+/// starved TCG host cannot falsely fail the check and roll back to the 8259;
+/// reached only on a real failure.
+const PIT_LIVE_TSC_LIMIT: u64 = 1 << 35;
 
 /// Where one ISA IRQ lands: its GSI and the electrical properties of that pin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

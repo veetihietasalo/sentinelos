@@ -62,6 +62,21 @@ pub const MIN_DEVICE_VECTOR: u8 = 0x20;
 /// Serialises every select/window pair (see the module docs).
 static IOAPIC_LOCK: SpinMutex<()> = SpinMutex::new(());
 
+/// Proof that [`IOAPIC_LOCK`] is held. Only [`lock_ioapic`] constructs one
+/// (private field, private constructor), so a `&IoApicLocked` parameter on
+/// `sel_read`/`sel_write` cannot be satisfied by any other lock's guard: the
+/// select/window pairing is enforced by the type, not by convention.
+struct IoApicLocked<'a> {
+    _guard: SpinGuard<'a, ()>,
+}
+
+/// Acquire [`IOAPIC_LOCK`].
+fn lock_ioapic() -> IoApicLocked<'static> {
+    IoApicLocked {
+        _guard: IOAPIC_LOCK.lock(),
+    }
+}
+
 // ── Pure redirection-entry packing (Kani: `proofs`) ──────────────────────────
 
 /// Delivery mode, bits `[10:8]`.
@@ -268,7 +283,7 @@ impl IoApic {
             max_entry: 0,
         };
         let (ver, id) = {
-            let g = IOAPIC_LOCK.lock();
+            let g = lock_ioapic();
             (dev.sel_read(&g, REG_VER), dev.sel_read(&g, REG_ID))
         };
         if !version_plausible(ver) {
@@ -300,11 +315,11 @@ impl IoApic {
         self.max_entry as u16 + 1
     }
 
-    /// One indirect register read: select `reg`, read the window. Takes the
-    /// held [`IOAPIC_LOCK`] guard, so every select/window pair — and every
+    /// One indirect register read: select `reg`, read the window. Takes an
+    /// [`IoApicLocked`] (only [`IOAPIC_LOCK`] can produce one), so every select/window pair — and every
     /// multi-register sequence a caller builds from these — runs under one
     /// acquisition: the pairing is enforced by the signature.
-    fn sel_read(&self, _held: &SpinGuard<'_, ()>, reg: u32) -> u32 {
+    fn sel_read(&self, _held: &IoApicLocked<'_>, reg: u32) -> u32 {
         // SAFETY: (IO2) `self.base` is the uncached mapping of a 0x20-byte IOAPIC
         // window that `map` validated (aligned, below MAXPHYADDR, not kernel RAM)
         // and mapped; it is never unmapped. `IOREGSEL` (+0) and `IOWIN` (+0x10)
@@ -319,7 +334,7 @@ impl IoApic {
     }
 
     /// One indirect register write: select `reg`, write the window (lock held).
-    fn sel_write(&self, _held: &SpinGuard<'_, ()>, reg: u32, value: u32) {
+    fn sel_write(&self, _held: &IoApicLocked<'_>, reg: u32, value: u32) {
         // SAFETY: (IO2/IO3) as `sel_read` — the validated, mapped window; both
         // accesses are aligned volatile `u32` device-register stores under the
         // held pairing lock. Callers pass only a redirection-table index
@@ -346,7 +361,7 @@ impl IoApic {
         let low = REG_REDTBL + 2 * u32::from(pin);
         // One acquisition for the whole three-write sequence: no other core can
         // interleave a write to the same entry between its halves.
-        let g = IOAPIC_LOCK.lock();
+        let g = lock_ioapic();
         self.sel_write(&g, low, (raw as u32) | (BIT_MASKED as u32));
         self.sel_write(&g, low + 1, (raw >> 32) as u32);
         self.sel_write(&g, low, raw as u32);
@@ -362,7 +377,7 @@ impl IoApic {
         }
         let low = REG_REDTBL + 2 * u32::from(pin);
         let raw = {
-            let g = IOAPIC_LOCK.lock();
+            let g = lock_ioapic();
             u64::from(self.sel_read(&g, low)) | (u64::from(self.sel_read(&g, low + 1)) << 32)
         };
         RedirectionEntry::from_raw(raw)
