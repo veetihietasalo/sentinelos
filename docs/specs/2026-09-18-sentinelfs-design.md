@@ -531,9 +531,13 @@ FS-1 splits in two, and attestation waits for the identity spec.
   written with it released, and published under it again. Between commits the task is
   **parked** (A25, shipped 2026-10-04): until its pacing deadline
   (`sched::park_until(last_commit + COMMIT_INTERVAL)`) while a transaction is dirty, otherwise
-  until unparked (`sched::park`); `request_commit` unparks it, and so does every
-  `with_sfs` section that turns the volume from clean to dirty — structurally, after the
-  lock is released — so no mutation can forget to (`sfs::service::kick`, lock-free). The decision is taken under the
+  until unparked (`sched::park`). Every `with_sfs` section that changes the task's
+  decision (`Sfs::next_step` at one `now`, before vs after) kicks it after the lock is
+  released (`sfs::service::kick`, lock-free), and `request_commit` kicks explicitly — so a
+  wake reason is seen exactly when `next_step` reads it. **For FS-1b:** every new wake reason
+  (`read_req`, `scrub_req`, releasing a hold) must be part of `next_step`'s decision, and
+  `next_step` must return `Park` while a hold is set — otherwise `ParkUntil` with a deadline
+  already past returns at once on every loop, a hot spin. The decision is taken under the
   lock and the park after releasing it; an unpark in between stores the task's wake permit,
   so the park returns at once. It is a normal blocked task: after the boot proof the BSP
   idles (`hlt`), which `[sched] park: … sfs-commit=parked bsp-idles=yes ok` asserts. (Until

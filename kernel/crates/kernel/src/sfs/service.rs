@@ -29,10 +29,12 @@
 //! passed since the last one. Between commits it is **parked** (spec §15
 //! A25): with a dirty transaction until that pacing deadline
 //! (`sched::park_until`), otherwise until something unparks it
-//! (`sched::park`). [`request_commit`] unparks it, and so does every
-//! [`with_sfs`] section that turns the volume from clean to dirty — after the
-//! lock is released, structurally, so no mutation can forget it ([`kick`]);
-//! the decision and the park are race-free
+//! (`sched::park`). Every [`with_sfs`] section that changes the task's
+//! decision ([`Sfs::next_step`] before vs after, at one `now`) kicks it
+//! after the lock is released ([`kick`]) — so a new wake reason needs no
+//! kick of its own, provided `next_step` reflects it (a mutation of state
+//! `next_step` does not read is not seen). [`request_commit`] also kicks
+//! explicitly. The decision and the park are race-free
 //! because an unpark that lands between them stores the task's wake permit,
 //! so the park returns at once and the loop decides again. A parked task is
 //! off its core's ready ring, so the BSP really idles. The deadline is checked
@@ -177,7 +179,8 @@ impl Sfs {
             || (v.is_dirty() && now >= self.last_commit_tick.saturating_add(COMMIT_INTERVAL))
     }
 
-    /// Whether a mounted volume has uncommitted changes.
+    /// Whether a mounted volume has uncommitted changes (host tests).
+    #[cfg(test)]
     fn is_dirty(&self) -> bool {
         self.volume.as_ref().is_some_and(|v| v.is_dirty())
     }
@@ -210,28 +213,34 @@ static COMMIT_TASK: TaskIdCell = TaskIdCell::new();
 /// disabled on this core. `f` must be bounded in-memory work: no device I/O,
 /// no waiting, no allocation.
 ///
-/// If `f` turned the volume from clean to dirty, the commit task is
-/// [`kick`]ed once the lock is released and preemption is back on, so it
-/// arms its pacing deadline: a mutation cannot forget to tell it.
+/// If `f` changed the commit task's decision — [`Sfs::next_step`] at one
+/// `now`, before vs after: the volume became dirty, a request was posted, or
+/// any wake reason FS-1b adds to `next_step` (read requests, scrubs, a
+/// released hold) — the task is [`kick`]ed once the lock is released and
+/// preemption is back on. A wake reason is only seen if `next_step` reads
+/// it; that is the one rule a new one must follow.
 pub fn with_sfs<R>(f: impl FnOnce(&mut Sfs) -> R) -> R {
+    let now = clock::mono_ticks();
     crate::sched::preempt_disable();
-    let (r, became_dirty) = {
+    let (r, decision_changed) = {
         let mut guard = SFS.lock();
-        run_noting_dirty(&mut guard, f)
+        run_noting_wake(&mut guard, now, f)
     };
     crate::sched::preempt_enable();
-    if became_dirty {
+    if decision_changed {
         kick();
     }
     r
 }
 
-/// Run `f` on `s`; also report whether it turned the volume from clean to
-/// dirty (the pure part of [`with_sfs`]).
-fn run_noting_dirty<R>(s: &mut Sfs, f: impl FnOnce(&mut Sfs) -> R) -> (R, bool) {
-    let before = s.is_dirty();
+/// Run `f` on `s`; also report whether it changed the commit task's
+/// decision at `now` (the pure part of [`with_sfs`]). A spurious `true`
+/// (the task's own sections change it too) only costs the task one extra
+/// loop: the kick stores its permit.
+fn run_noting_wake<R>(s: &mut Sfs, now: u64, f: impl FnOnce(&mut Sfs) -> R) -> (R, bool) {
+    let before = s.next_step(now);
     let r = f(s);
-    (r, !before && s.is_dirty())
+    (r, s.next_step(now) != before)
 }
 
 /// Start the `sfs-commit` task, pinned to the BSP (`spawn_on(0, …)`, with a
@@ -264,8 +273,9 @@ pub fn commit_task_id() -> Option<TaskId> {
 }
 
 /// Wake the commit task so it re-decides (arms its pacing deadline, or
-/// serves a request). [`with_sfs`] calls it whenever a section dirtied a
-/// clean volume, and [`request_commit`] after posting a request. Harmless
+/// serves a request). [`with_sfs`] calls it whenever a section changed the
+/// task's decision, and [`request_commit`] after posting a request (also
+/// when the decision was already `Commit`). Harmless
 /// when the task is awake: the unpark then only stores its permit.
 ///
 /// Takes no lock — an atomic load and `sched::unpark` — so it is safe from
@@ -548,7 +558,7 @@ pub fn prove_mount() {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_noting_dirty, Next, Sfs, COMMIT_INTERVAL};
+    use super::{run_noting_wake, Next, Sfs, COMMIT_INTERVAL};
     use crate::blk::allocator::AllocClass;
     use crate::blk::mem::MemDevice;
     use crate::sfs::volume::{format, FormatParams, Volume, Workspace};
@@ -586,27 +596,54 @@ mod tests {
         assert_eq!(s.next_step(due), Next::Commit);
     }
 
-    /// Every `with_sfs` section reports a clean → dirty transition (so it can
-    /// kick the commit task) exactly when it happens: never with no volume,
-    /// never for a read, never for a second change to an already dirty one.
+    /// A `with_sfs` section reports a change of the commit task's decision
+    /// (so it can kick the task) exactly when one happens — whether or not
+    /// the volume's dirtiness changed: a posted request on a clean volume
+    /// (no dirtying) is a change, a first allocation is, a read or a second
+    /// allocation is not.
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn a_section_that_dirties_a_clean_volume_is_noticed() {
+    fn a_section_that_changes_the_decision_is_noticed() {
         let mut s = Sfs::new();
-        assert_eq!(run_noting_dirty(&mut s, |_| ()), ((), false), "no volume");
+        assert_eq!(run_noting_wake(&mut s, 0, |_| ()), ((), false), "no volume");
 
         let mut d = MemDevice::new(256);
         let mut ws = Workspace::new();
         format(&mut d, &mut ws, &FormatParams::from_seed(b"kick", 1)).unwrap();
         s.volume = Some(Volume::mount(&mut d, &mut ws).unwrap());
+        let now = 10;
+
+        // A wake reason that is not dirtiness: a request, volume clean.
+        let request = |s: &mut Sfs| {
+            s.requested += 1;
+            s.is_dirty()
+        };
+        assert_eq!(run_noting_wake(&mut s, now, request), (false, true));
+        assert_eq!(s.next_step(now), Next::Commit);
+        // Served: the decision goes back to Park (a change the task makes).
+        assert_eq!(
+            run_noting_wake(&mut s, now, |s| s.served = s.requested),
+            ((), true)
+        );
+
         let alloc = |s: &mut Sfs| {
             s.volume
                 .as_mut()
                 .map(|v| v.alloc(AllocClass::Normal, None).is_ok())
         };
-        assert_eq!(run_noting_dirty(&mut s, |s| s.is_dirty()), (false, false));
-        assert_eq!(run_noting_dirty(&mut s, alloc), (Some(true), true));
-        assert_eq!(run_noting_dirty(&mut s, alloc), (Some(true), false));
-        assert_eq!(run_noting_dirty(&mut s, |s| s.is_dirty()), (true, false));
+        assert_eq!(
+            run_noting_wake(&mut s, now, |s| s.is_dirty()),
+            (false, false)
+        );
+        assert_eq!(run_noting_wake(&mut s, now, alloc), (Some(true), true));
+        assert_eq!(
+            s.next_step(now),
+            Next::ParkUntil(s.last_commit_tick + COMMIT_INTERVAL)
+        );
+        assert_eq!(run_noting_wake(&mut s, now, alloc), (Some(true), false));
+        assert_eq!(
+            run_noting_wake(&mut s, now, |s| s.is_dirty()),
+            (true, false)
+        );
     }
 }

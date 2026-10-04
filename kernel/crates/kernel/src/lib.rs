@@ -367,8 +367,10 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
     let mut wm: Option<WindowManager> = None;
 
     loop {
-        // Sleep until the next interrupt (a PIT tick or a keystroke).
-        hal::cpu::halt();
+        // Sleep until the next interrupt (a PIT tick or a keystroke). Halt
+        // through `sched::idle_halt`, so a task unparked on this core runs
+        // on the next tick rather than after this idle task's slice.
+        sched::idle_halt();
         // Free the tasks that exited on this core since the last pass — only
         // the idle task reaps (see `sched::idle_reap`).
         sched::idle_reap();

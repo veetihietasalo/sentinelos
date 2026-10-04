@@ -258,12 +258,49 @@ impl ParkTable for TaskTable {
 pub(super) enum ParkStep {
     /// Return to the caller at once with this answer; nothing was switched.
     Return(Woken),
-    /// The park was refused (an idle or unknown caller; nothing else
-    /// runnable or the sleeper set full — both impossible for a non-idle
-    /// task): nothing changed.
-    Refused,
+    /// The park was refused, for this reason: nothing changed.
+    Refused(Refusal),
     /// The caller is now parked; switch to this task.
     Switch(TaskId),
+}
+
+/// Why a park was refused. Every one is a caller bug or a broken invariant,
+/// so [`park`] `debug_assert!`s on it, naming the reason.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Refusal {
+    /// The caller is not in the task table.
+    UnknownCaller,
+    /// The caller is a core's idle task, which must stay runnable.
+    Idle,
+    /// Nothing else is runnable (impossible for a non-idle caller: its
+    /// core's idle is then on `ready`).
+    EmptyReady,
+    /// The sleeper set is full (impossible at capacity `MAX_TASKS`).
+    SleepersFull,
+    /// A switch handle could not be minted (production glue only; checked
+    /// before [`park_step`] runs, so nothing changed).
+    MissingHandle,
+}
+
+impl Refusal {
+    /// Fail a debug build, naming the reason (fmt-free: one literal each).
+    fn debug_fail(self) {
+        match self {
+            Refusal::UnknownCaller => {
+                debug_assert!(false, "park refused: the caller is not in the task table");
+            }
+            Refusal::Idle => debug_assert!(false, "park refused: called by a core's idle task"),
+            Refusal::EmptyReady => {
+                debug_assert!(false, "park refused: the ready ring is empty");
+            }
+            Refusal::SleepersFull => {
+                debug_assert!(false, "park refused: the sleeper set is full");
+            }
+            Refusal::MissingHandle => {
+                debug_assert!(false, "park refused: a switch handle is missing");
+            }
+        }
+    }
 }
 
 /// The pure park decision for the task `*current` at mono time `now`.
@@ -289,10 +326,10 @@ pub(super) fn park_step<Q: ReadyQueue, T: ParkTable, const N: usize>(
     let me = *current;
     {
         let Some(v) = table.view(me) else {
-            return ParkStep::Refused;
+            return ParkStep::Refused(Refusal::UnknownCaller);
         };
         if v.idle {
-            return ParkStep::Refused;
+            return ParkStep::Refused(Refusal::Idle);
         }
         if core::mem::take(v.permit) {
             return ParkStep::Return(Woken::Unparked);
@@ -302,10 +339,10 @@ pub(super) fn park_step<Q: ReadyQueue, T: ParkTable, const N: usize>(
         return ParkStep::Return(Woken::Deadline);
     }
     if deadline.is_some() && sleepers.is_full() {
-        return ParkStep::Refused;
+        return ParkStep::Refused(Refusal::SleepersFull);
     }
     let Some(next) = ready.pop_front() else {
-        return ParkStep::Refused;
+        return ParkStep::Refused(Refusal::EmptyReady);
     };
     if let Some(v) = table.view(me) {
         *v.state = TaskState::Parked;
@@ -413,48 +450,66 @@ fn park_current(deadline: Option<u64>) -> Woken {
     if !preemptible || !interrupts {
         return Woken::Unparked;
     }
+    /// What the locked section decided, carried out after both guards drop.
+    enum Decided {
+        Return(Woken),
+        Refused(Refusal),
+        Switch(TaskId, hal::context::TaskHandle, hal::context::TaskHandle),
+    }
     with_interrupts_disabled(|| {
         let now = crate::clock::mono_ticks();
-        let (me, pair) = {
+        let decided = {
             // Lock order: this core's queue, then the task table.
             let mut queue = CPU_SCHED[cpu].lock();
             let state: &mut CpuSched = &mut queue;
             let mut tasks = TASKS.lock();
             let me = state.current;
-            match park_step(
-                &mut state.ready,
-                &mut state.sleepers,
-                &mut *tasks,
-                &mut state.current,
-                now,
-                deadline,
-            ) {
-                ParkStep::Return(w) => return w,
-                ParkStep::Refused => {
-                    debug_assert!(false, "park refused: called by an idle task");
-                    return Woken::Unparked;
-                }
-                ParkStep::Switch(next) => {
-                    let prev_h = tasks
-                        .get_mut(me)
-                        .map(|t| hal::context::TaskHandle::new(&mut t.ctx));
-                    let next_h = tasks
-                        .get_mut(next)
-                        .map(|t| hal::context::TaskHandle::new(&mut t.ctx));
-                    // Both are in the slab by construction (`me` is this
-                    // core's current, `next` came off its ready ring), so
-                    // the state `park_step` committed is always followed by
-                    // the switch.
-                    let pair = prev_h.zip(next_h);
-                    debug_assert!(pair.is_some(), "park: a switch handle is missing");
-                    (me, pair)
+            // Decide before mutating, glue included: mint both switch
+            // handles — the caller's, and the ready ring's head (the only
+            // task `park_step` can switch to) — before it runs. A handle is
+            // a pointer token, not a borrow, so `park_step` may then take the
+            // table.
+            let head = state.ready.get(0);
+            let prev_h = tasks
+                .get_mut(me)
+                .map(|t| hal::context::TaskHandle::new(&mut t.ctx));
+            let next_h = head
+                .and_then(|h| tasks.get_mut(h))
+                .map(|t| hal::context::TaskHandle::new(&mut t.ctx));
+            if prev_h.is_none() || (head.is_some() && next_h.is_none()) {
+                Decided::Refused(Refusal::MissingHandle)
+            } else {
+                match park_step(
+                    &mut state.ready,
+                    &mut state.sleepers,
+                    &mut *tasks,
+                    &mut state.current,
+                    now,
+                    deadline,
+                ) {
+                    ParkStep::Return(w) => Decided::Return(w),
+                    ParkStep::Refused(r) => Decided::Refused(r),
+                    ParkStep::Switch(next) => match (prev_h, next_h) {
+                        // `next` is the head popped by `park_step`.
+                        (Some(p), Some(n)) if head == Some(next) => Decided::Switch(me, p, n),
+                        // Unreachable: the head was checked above.
+                        _ => Decided::Refused(Refusal::MissingHandle),
+                    },
                 }
             }
         }; // both guards dropped here — never held across `switch`.
-        if let Some((prev_h, next_h)) = pair {
-            PREEMPT[cpu].switches.fetch_add(1, Ordering::Relaxed);
-            hal::context::switch(prev_h, next_h);
-        }
+        let me = match decided {
+            Decided::Return(w) => return w,
+            Decided::Refused(r) => {
+                r.debug_fail();
+                return Woken::Unparked;
+            }
+            Decided::Switch(me, prev_h, next_h) => {
+                PREEMPT[cpu].switches.fetch_add(1, Ordering::Relaxed);
+                hal::context::switch(prev_h, next_h);
+                me
+            }
+        };
         // Resumed on this same core (tasks are pinned), still `IF = 0`: an
         // unpark or this core's tick made us Ready and recorded why.
         TASKS.lock().get(me).map_or(Woken::Unparked, |t| t.woken)
@@ -602,7 +657,7 @@ fn measure_local_wake(bsp: usize) -> Option<u64> {
     while PL_RAN_AT.load(Ordering::Acquire) == u64::MAX
         && crate::clock::mono_ticks().wrapping_sub(t0) < PROOF_TIMEOUT_TICKS
     {
-        hal::cpu::halt();
+        super::idle_halt();
     }
     match PL_RAN_AT.load(Ordering::Acquire) {
         u64::MAX => None,
@@ -717,7 +772,7 @@ pub fn prove_park(sfs_commit: Option<TaskId>) {
         < IDLE_WINDOW_TICKS
         && crate::clock::mono_ticks().wrapping_sub(begin) < PROOF_TIMEOUT_TICKS
     {
-        hal::cpu::halt();
+        super::idle_halt();
         halts += 1;
     }
     let ticks = PREEMPT[bsp]
@@ -787,8 +842,8 @@ pub fn prove_park(sfs_commit: Option<TaskId>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        expire_step, park_step, unpark_step, wants_ipi, ParkStep, ParkTable, ParkView, Sleepers,
-        UnparkOutcome, Woken,
+        expire_step, park_step, unpark_step, wants_ipi, ParkStep, ParkTable, ParkView, Refusal,
+        Sleepers, UnparkOutcome, Woken,
     };
     use crate::sched::{ReadyQueue, ReadyRing, TaskId, TaskState};
 
@@ -985,8 +1040,8 @@ mod tests {
     #[test]
     fn the_idle_never_parks_and_is_never_unparked() {
         let mut c: Core<3> = Core::new();
-        assert_eq!(c.park(0, None), ParkStep::Refused);
-        assert_eq!(c.park(0, Some(5)), ParkStep::Refused);
+        assert_eq!(c.park(0, None), ParkStep::Refused(Refusal::Idle));
+        assert_eq!(c.park(0, Some(5)), ParkStep::Refused(Refusal::Idle));
         assert_eq!(c.current, TaskId(0));
         assert_eq!(c.table.state[0], TaskState::Running);
         assert_eq!(c.sleepers.len(), 0);
@@ -1086,6 +1141,13 @@ mod tests {
 /// Bounded-trace versions (3–4 operations from the boot state) were measured
 /// at 34–76 s each and dropped: the induction subsumes them.
 ///
+/// The clock bounds in [`Model::any_valid`] (`now < 2^32`, deadlines
+/// `< 2^33`) are an order/translation abstraction: production only compares
+/// these values and adds a small offset to one, so the induction is proven
+/// for every state in that range, and any production state with the same
+/// order relations behaves identically; the bounds only rule out overflow
+/// of the model's own `now + k` / `now + 1`.
+///
 /// Bounds (shrunk to keep each harness under 60 s): 3 tasks — 0 is the idle,
 /// which never parks or exits, plus two that can both be parked at once, both
 /// with deadlines — and one id past the table (a dead id); rings and the
@@ -1096,7 +1158,7 @@ mod tests {
 #[cfg(kani)]
 mod proofs {
     use super::{
-        expire_step, park_step, unpark_step, ParkStep, ParkTable, ParkView, Sleepers,
+        expire_step, park_step, unpark_step, ParkStep, ParkTable, ParkView, Refusal, Sleepers,
         UnparkOutcome, Woken,
     };
     use crate::sched::{pick_next_parking_exits, ReadyRing, TaskId, TaskState};
@@ -1246,11 +1308,11 @@ mod proofs {
                         assert!(deadline.is_some_and(|d| self.now >= d));
                     }
                 }
-                ParkStep::Refused => {
+                ParkStep::Refused(r) => {
                     // Only the idle is ever refused: a non-idle task always
                     // finds its core's idle on `ready`.
                     if self.prop == Prop::Places {
-                        assert!(me == 0);
+                        assert!(me == 0 && r == Refusal::Idle);
                     }
                 }
                 ParkStep::Switch(next) => {

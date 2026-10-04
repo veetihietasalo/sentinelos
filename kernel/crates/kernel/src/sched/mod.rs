@@ -557,6 +557,15 @@ struct PreemptState {
     switches: AtomicU64,
     /// Scheduler ticks ([`on_tick`] calls) this core has taken.
     ticks: AtomicU64,
+    /// Set by [`idle_halt`] for exactly the span this core's idle task is
+    /// halted waiting for an interrupt. [`on_tick`] reschedules a current
+    /// idle with a non-empty `ready` only while it is set — never while the
+    /// idle is doing work (kmain runs the whole desktop loop as the BSP's
+    /// idle; a ready task must not preempt it on every tick).
+    in_idle_halt: AtomicBool,
+    /// Switches [`on_tick`] made only because the halted idle had work (a
+    /// local unpark): counted here, not in `events`/`tick_events`.
+    idle_wakes: AtomicU64,
 }
 
 impl PreemptState {
@@ -568,6 +577,8 @@ impl PreemptState {
             tick_events: AtomicU64::new(0),
             switches: AtomicU64::new(0),
             ticks: AtomicU64::new(0),
+            in_idle_halt: AtomicBool::new(false),
+            idle_wakes: AtomicU64::new(0),
         }
     }
 
@@ -668,13 +679,17 @@ pub fn preempt_enable() {
 ///
 /// Then it reschedules — as on a slice expiry, through [`tick_action`] — if
 /// the slice expired, **or** a deadline woke a task, **or** this core's idle
-/// task is current while `ready` is non-empty (a task woken on this core by
-/// an [`unpark`], which sends no IPI to its own core). So deadline and local
+/// task is **halted** ([`idle_halt`]) while `ready` is non-empty (a task woken
+/// on this core by an [`unpark`], which sends no IPI to its own core). An idle
+/// doing work — kmain runs the desktop loop — is not preempted by this rule;
+/// it hands over at its next halt. So deadline and local
 /// unpark wakes **preempt mid-slice**: the round-robin switch happens on this
 /// tick, and the woken task runs on it if it is at the head of `ready` —
 /// otherwise in its turn behind the tasks ahead of it. Only a slice expiry
 /// counts as [`PreemptState::tick_events`] (the AP preemption proof's
-/// evidence).
+/// evidence); a slice expiry or deadline wake counts as
+/// [`PreemptState::events`]; the halted idle making way counts as
+/// [`PreemptState::idle_wakes`].
 ///
 /// # Interrupt-flag discipline
 ///
@@ -689,7 +704,8 @@ pub fn on_tick() {
     let cpu = local_cpu();
     PREEMPT[cpu].ticks.fetch_add(1, Ordering::Relaxed);
     let now = crate::clock::mono_ticks();
-    let (expired, wake) = {
+    let halted = PREEMPT[cpu].in_idle_halt.load(Ordering::Relaxed);
+    let (expired, woke, idle_work) = {
         // Lock order: this core's queue, then the task table.
         let mut queue = CPU_SCHED[cpu].lock();
         let state: &mut CpuSched = &mut queue;
@@ -700,25 +716,34 @@ pub fn on_tick() {
             Some(t) => (tick_slice(&mut t.slice), t.idle),
             None => (false, false),
         };
-        (expired, woke > 0 || (idle && state.ready.len() > 0))
+        (expired, woke > 0, halted && idle && state.ready.len() > 0)
     };
-    // A wake (a deadline here, or an unpark while the idle ran) is handled
-    // like a slice expiry, so the switch happens on this tick rather than at
-    // the end of the current task's quantum.
-    if !expired && !wake {
+    // A wake (a deadline here, or an unpark while the idle sat halted) is
+    // handled like a slice expiry, so the switch happens on this tick rather
+    // than at the end of the current task's quantum.
+    if !expired && !woke && !idle_work {
         return;
     }
+    // A slice expiry or a deadline wake is a real involuntary switch
+    // (`events`); the halted idle making way is not.
+    let involuntary = expired || woke;
 
     match tick_action(
         COOP_PROOF_NO_PREEMPT.load(Ordering::Relaxed),
         PREEMPT[cpu].count.load(Ordering::Relaxed),
     ) {
         TickAction::Suppress => {
-            COOP_PROOF_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            if expired {
+                COOP_PROOF_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         TickAction::Switch => {
             if reschedule_locked_on(cpu, false) {
-                PREEMPT[cpu].events.fetch_add(1, Ordering::Relaxed);
+                if involuntary {
+                    PREEMPT[cpu].events.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    PREEMPT[cpu].idle_wakes.fetch_add(1, Ordering::Relaxed);
+                }
                 if expired {
                     PREEMPT[cpu].tick_events.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1502,10 +1527,28 @@ pub fn idle_reap() {
 /// after [`init_ap`]; the `sti` inside is the AP's first (after its
 /// `simd::enable`, structurally — see `hal::smp`). Never returns.
 pub fn ap_idle_loop() -> ! {
+    let cpu = local_cpu();
     loop {
         idle_reap();
+        PREEMPT[cpu].in_idle_halt.store(true, Ordering::Relaxed);
         hal::cpu::enable_interrupts_and_halt();
+        PREEMPT[cpu].in_idle_halt.store(false, Ordering::Relaxed);
     }
+}
+
+/// A core's idle task waiting for the next interrupt: `hlt`, with this
+/// core's "idle is halted" flag set around it, so [`on_tick`] may switch to a
+/// task woken locally (by an [`unpark`], which sends no IPI to its own core)
+/// on the next tick instead of after the idle's slice. kmain's idle loop
+/// halts through this; [`ap_idle_loop`] sets the same flag around its
+/// `sti; hlt`. Call with interrupts enabled, from a core's idle task only
+/// (from any other task the flag has no effect: the rule needs the idle
+/// current).
+pub fn idle_halt() {
+    let cpu = local_cpu();
+    PREEMPT[cpu].in_idle_halt.store(true, Ordering::Relaxed);
+    hal::cpu::halt();
+    PREEMPT[cpu].in_idle_halt.store(false, Ordering::Relaxed);
 }
 
 // ── PR-A boot proof: cooperative interleave ─────────────────────────────────
