@@ -288,7 +288,11 @@ pub fn encode_leaf<const C: usize>(
     }
     start(out, 0, n)?;
     let mut cursor = out.len();
-    for i in 0..n {
+    // Bounded by the node's capacity (a constant), ended early at `n`.
+    for i in 0..C {
+        if i >= n {
+            break;
+        }
         let (key, span) = (
             node.key(i).ok_or(CodecError::Size)?,
             node.val(i).ok_or(CodecError::Size)?,
@@ -336,7 +340,10 @@ pub fn encode_inner<const C: usize>(
         return Err(CodecError::Size);
     }
     start(out, level, n)?;
-    for i in 0..n {
+    for i in 0..C {
+        if i >= n {
+            break;
+        }
         let (key, ptr) = (
             node.key(i).ok_or(CodecError::Size)?,
             node.val(i).ok_or(CodecError::Size)?,
@@ -637,7 +644,10 @@ mod proofs {
         kani::assume(n >= 1 && n <= 2);
         let mut node: Node<Span, 2> = Node::new(Span::EMPTY);
         let mut prev: Option<Key> = None;
-        for _ in 0..n {
+        for j in 0..2 {
+            if j >= n {
+                break;
+            }
             let obj: u8 = kani::any();
             let key = Key {
                 obj: u64::from(obj),
@@ -668,7 +678,10 @@ mod proofs {
         let mut back: Node<Span, 2> = Node::new(Span::EMPTY);
         assert!(decode_leaf(&blk, 1, &mut back).is_ok());
         assert!(back.len() == n);
-        for i in 0..n {
+        for i in 0..2 {
+            if i >= n {
+                break;
+            }
             assert!(back.key(i) == node.key(i));
             let (a, b) = (node.val(i), back.val(i));
             assert!(a.is_some() && b.is_some());
