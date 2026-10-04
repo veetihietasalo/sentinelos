@@ -193,7 +193,8 @@ What changes in the facade (FS-2), stated now because callers depend on it:
   kernel thread (`spawn_on(0, …)`): a caller's read miss enqueues a request and blocks on a
   completion flag; the task reads with the lock released, then takes the lock to publish.
   Commits (§8) are the task's alone. Nothing about the FS runs in IRQ context — the interval
-  commit is the task waking on `clock::mono_ticks`, never `on_tick`.
+  commit is the task parked until a `clock::mono_ticks` deadline (`sched::park_until`, A25):
+  the scheduler's tick only makes it runnable; no FS code runs in `on_tick`.
 - **`kernel::sfs`** is pure logic over `blk`: never touches ports, never allocates unbounded,
   never panics on disk contents (every parse is `&[u8] -> Result`; every loop driven by an
   on-disk count is bounded by the block size, not by the field).
@@ -527,9 +528,16 @@ FS-1 splits in two, and attestation waits for the identity spec.
   its guard page at boot (a double fault, before the frames were trimmed). It opens the device
   itself and keeps it on its own stack, so no other thread can reach it. The `Sfs` lock is
   taken with preemption disabled for bounded in-memory work only; a commit is sealed under it,
-  written with it released, and published under it again. From the boot proof on, the task
-  stays runnable on the BSP (it polls for requests and the pacing deadline each time it is
-  scheduled): nothing after it in `kmain` may wait for the BSP's ready queue to drain.
+  written with it released, and published under it again. Between commits the task is
+  **parked** (A25, shipped 2026-10-04): until its pacing deadline
+  (`sched::park_until(last_commit + COMMIT_INTERVAL)`) while a transaction is dirty, otherwise
+  until unparked (`sched::park`); `request_commit` unparks it, and so must any future
+  mutation that dirties the volume (`sfs::service::kick`). The decision is taken under the
+  lock and the park after releasing it; an unpark in between stores the task's wake permit,
+  so the park returns at once. It is a normal blocked task: after the boot proof the BSP
+  idles (`hlt`), which `[sched] park: … sfs-commit=parked bsp-idles=yes ok` asserts. (Until
+  A25 it stayed runnable on the BSP, polling, and nothing after it in `kmain` could wait for
+  the BSP's ready queue to drain.)
 - *Failures go read-only.* A commit whose I/O fails, or whose seal needs a committed block
   that cannot be read back intact (an I/O error, or a block that no longer matches its
   pointer's hash), leaves the volume read-only and the task stops committing — it does not
@@ -690,7 +698,7 @@ report). Still open:
 
 | # | Where | Finding | Owner |
 |---|---|---|---|
-| A25 | §6/§8 | `sfs-commit` waits by yield-polling (it stays runnable on the BSP forever). `sched` needs park/unpark with a wake permit and an optional mono-tick deadline, designed together with component PR-2's blocking bus receive, replacing the poll. | sched, before FS-2 |
+| A25 | §6/§8 | ~~`sfs-commit` waits by yield-polling (it stays runnable on the BSP forever). `sched` needs park/unpark with a wake permit and an optional mono-tick deadline, designed together with component PR-2's blocking bus receive, replacing the poll.~~ **Shipped 2026-10-04:** `sched::park` / `park_until` / `unpark` (one permit; deadline on the owning core's tick; IRQ-safe, allocation-free unpark; Kani induction for no lost wakeup, no parked task on a ring, deadline once and never early); the task parks between commits (§11). PR-2 decided run-to-completion dispatch, so the bus has no blocking receive; PR-3's driver can reuse the primitive. Still open for FS-2: callers that block on the commit task need a waiter list the task unparks (today's only waiter, kmain's boot proof, is an idle task and yields). | sched — **shipped** |
 | A26 | §7.1/§10 | The format seed — `fs_uuid` and `dirent_key` — comes from the tick counters: low entropy. It needs a real entropy source before anything writes dirents, since `dirent_key` exists to defeat precomputed collision floods. | before FS-2 |
 | A27 | §7.1/§12 | Mount never falls back to the older slot: if the newer valid superblock's tree turns out damaged, the volume is `Corrupt` though the previous generation may be intact. Decide the fallback policy (and how it interacts with rollback protection). | FS-1b / FS-5 |
 | A28 | §7.3 | The blob key carries 112 bits of the hash (6 bytes in `obj`, 8 in `off`): two blobs in one domain can share a key with different full hashes. FS-4 must chain such collisions or refuse the second blob — never treat an equal key as an equal blob. | FS-4 |

@@ -17,16 +17,25 @@
 //!   seals a commit under it, releases it, writes, and takes it again only to
 //!   copy the next block out or to publish the result.
 //! - **Callers** never block on the device either: they post a request (a
-//!   commit ticket) and wait for the task to serve it, yielding meanwhile —
-//!   the kernel's blocking pattern (`sched` has no sleep queue; a waiter on the
-//!   task's core hands the core straight to the task).
+//!   commit ticket), which unparks the task, and wait for it to serve the
+//!   ticket. Today's only waiter is kmain's boot proof — an idle task, which
+//!   may not park — so it yields meanwhile, handing its core straight to the
+//!   task (FS-2's blocking callers will park on a waiter list instead).
 //!
 //! # Pacing
 //!
 //! The task serves requested commits first, and otherwise commits a dirty
 //! transaction once [`COMMIT_INTERVAL`] ticks of `clock::mono_ticks()` have
-//! passed since the last one, checking each time it is scheduled. Nothing here
-//! runs from `sched::on_tick` or any other IRQ path (A7).
+//! passed since the last one. Between commits it is **parked** (spec §15
+//! A25): with a dirty transaction until that pacing deadline
+//! (`sched::park_until`), otherwise until something unparks it
+//! (`sched::park`). [`request_commit`] unparks it, and so must anything that
+//! makes the volume dirty ([`kick`]); the decision and the park are race-free
+//! because an unpark that lands between them stores the task's wake permit,
+//! so the park returns at once and the loop decides again. A parked task is
+//! off its core's ready ring, so the BSP really idles. The deadline is checked
+//! by the scheduler's tick; nothing *here* runs from `sched::on_tick` or any
+//! other IRQ path (A7).
 //!
 //! # Where on the disk
 //!
@@ -42,7 +51,7 @@ use super::volume::{
 use crate::blk::ata::{AtaDevice, SFS_BASE_LBA};
 use crate::blk::{BlkError, BlockDevice};
 use crate::clock;
-use crate::sched::SpawnError;
+use crate::sched::{SpawnError, TaskId};
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, Ordering};
 use hal::sync::SpinMutex;
@@ -106,6 +115,21 @@ pub struct Sfs {
     served: u64,
     last: Option<Result<CommitInfo, CommitError>>,
     last_commit_tick: u64,
+    /// The `sfs-commit` task, recorded by the task itself before it mounts.
+    commit_task: Option<TaskId>,
+}
+
+/// What the commit task does next (see [`Sfs::next_step`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Next {
+    /// Commit now.
+    Commit,
+    /// Park until this mono tick (the pacing deadline of a dirty transaction)
+    /// or an unpark.
+    ParkUntil(u64),
+    /// Park until unparked: nothing to commit and nothing dirty (or the
+    /// volume is read-only / not mounted).
+    Park,
 }
 
 impl Sfs {
@@ -119,6 +143,7 @@ impl Sfs {
             served: 0,
             last: None,
             last_commit_tick: 0,
+            commit_task: None,
         }
     }
 
@@ -151,6 +176,21 @@ impl Sfs {
         }
         self.requested > self.served
             || (v.is_dirty() && now >= self.last_commit_tick.saturating_add(COMMIT_INTERVAL))
+    }
+
+    /// The commit task's decision at `now`: commit if [`Sfs::commit_due`];
+    /// else, with a dirty writable volume, park until its pacing deadline;
+    /// else park until unparked.
+    fn next_step(&self, now: u64) -> Next {
+        if self.commit_due(now) {
+            return Next::Commit;
+        }
+        match self.volume.as_ref() {
+            Some(v) if !v.is_read_only() && v.is_dirty() => {
+                Next::ParkUntil(self.last_commit_tick.saturating_add(COMMIT_INTERVAL))
+            }
+            _ => Next::Park,
+        }
     }
 }
 
@@ -194,18 +234,38 @@ pub fn start() -> Result<(), SpawnError> {
     }
 }
 
+/// The `sfs-commit` task's id, once it has started (`None` before, and
+/// whenever [`start`] was never called).
+#[must_use]
+pub fn commit_task_id() -> Option<TaskId> {
+    with_sfs(|s| s.commit_task)
+}
+
+/// Wake the commit task so it re-decides: anything that makes the volume
+/// dirty must call this after releasing the `Sfs` lock (FS-1b's mutations),
+/// or a task parked without a deadline would not arm its pacing deadline
+/// until the next request. Harmless when it is already awake: the unpark
+/// then only stores its permit.
+pub fn kick() {
+    if let Some(id) = commit_task_id() {
+        let _outcome = crate::sched::unpark(id);
+    }
+}
+
 /// Ask the task for a commit (even of an empty transaction: the generation
-/// still advances and the slot alternates). Returns a ticket for
-/// [`commit_outcome`], or `None` unless mounted read-write.
+/// still advances and the slot alternates), and unpark it. Returns a ticket
+/// for [`commit_outcome`], or `None` unless mounted read-write.
 pub fn request_commit() -> Option<u64> {
-    with_sfs(|s| {
+    let ticket = with_sfs(|s| {
         let writable = s.volume.as_ref().is_some_and(|v| !v.is_read_only());
         if s.phase != Phase::Mounted || !writable {
             return None;
         }
         s.requested += 1;
         Some(s.requested)
-    })
+    })?;
+    kick();
+    Some(ticket)
 }
 
 /// Once `ticket` has been served: the outcome of the latest commit (the one
@@ -251,6 +311,8 @@ pub fn mount_or_format<D: BlockDevice>(
 
 /// The `sfs-commit` task body. The only code that touches the device.
 fn commit_task() {
+    let me = crate::sched::current_id();
+    with_sfs(|s| s.commit_task = Some(me));
     let mut dev = match AtaDevice::open(SFS_BASE_LBA) {
         Ok(d) => d,
         Err(e) => {
@@ -274,10 +336,15 @@ fn commit_task() {
     }
     loop {
         let now = clock::mono_ticks();
-        if with_sfs(|s| s.commit_due(now)) {
-            run_commit(&mut dev, &mut ws);
+        // Decide under the lock, park with it released. An unpark between the
+        // two stores this task's permit, so the park returns at once.
+        match with_sfs(|s| s.next_step(now)) {
+            Next::Commit => run_commit(&mut dev, &mut ws),
+            Next::ParkUntil(deadline) => {
+                let _woken = crate::sched::park_until(deadline);
+            }
+            Next::Park => crate::sched::park(),
         }
-        crate::sched::yield_now();
     }
 }
 
@@ -328,6 +395,8 @@ fn run_commit(dev: &mut AtaDevice, ws: &mut Workspace) {
 }
 
 /// Wait (yielding) until `poll` yields a value or `timeout` mono ticks pass.
+/// Its only caller is kmain's boot proof, and kmain is the BSP's idle task,
+/// which may not park; a yield hands the BSP straight to the commit task.
 fn wait_for<T>(timeout: u64, mut poll: impl FnMut() -> Option<T>) -> Option<T> {
     let deadline = clock::mono_ticks().saturating_add(timeout);
     loop {
@@ -450,5 +519,46 @@ pub fn prove_mount() {
             write_str(" FAIL\n");
         }
         None => write_str("TIMEOUT FAIL\n"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Next, Sfs, COMMIT_INTERVAL};
+    use crate::blk::allocator::AllocClass;
+    use crate::blk::mem::MemDevice;
+    use crate::sfs::volume::{format, FormatParams, Volume, Workspace};
+
+    /// The commit task parks without a deadline while there is nothing to do,
+    /// parks until the pacing deadline while dirty, and commits once a request
+    /// is pending or the deadline has passed (spec §15 A25).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn the_commit_task_parks_unless_a_commit_is_due() {
+        let mut s = Sfs::new();
+        assert_eq!(s.next_step(0), Next::Park, "nothing mounted");
+        s.requested = 1;
+        assert_eq!(s.next_step(0), Next::Park, "no volume to commit");
+        s.requested = 0;
+
+        let mut d = MemDevice::new(256);
+        let mut ws = Workspace::new();
+        format(&mut d, &mut ws, &FormatParams::from_seed(b"park", 1)).unwrap();
+        let mut v = Volume::mount(&mut d, &mut ws).unwrap();
+        s.last_commit_tick = 100;
+        s.volume = Some(v);
+        assert_eq!(s.next_step(100), Next::Park, "clean: park until unparked");
+        s.requested = 1;
+        assert_eq!(s.next_step(100), Next::Commit, "a request is due at once");
+        s.served = 1;
+
+        v = s.volume.take().unwrap();
+        v.alloc(AllocClass::Normal, None).unwrap();
+        assert!(v.is_dirty());
+        s.volume = Some(v);
+        let due = 100 + COMMIT_INTERVAL;
+        assert_eq!(s.next_step(100), Next::ParkUntil(due));
+        assert_eq!(s.next_step(due - 1), Next::ParkUntil(due));
+        assert_eq!(s.next_step(due), Next::Commit);
     }
 }

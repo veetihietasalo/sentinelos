@@ -263,10 +263,11 @@ pub fn kmain() -> ! {
     // timeouts tick off `clock::mono_ticks`, so this runs after `prove_mono`.
     // Keep it ahead of SentinelFS's `sfs::prove_mount`, for two reasons. Its
     // §18.4 measurement round-trips kmain against one short BSP task, which
-    // an always-runnable BSP task (`sfs-commit`) would dilute. And spawning
-    // that task allocates with kmain at IF = 0, which is allowed only while
-    // no other BSP task can be suspended inside the allocator — true before
-    // `sfs-commit` exists, not after (hal-tcb §5e as amended by FS-1a).
+    // another BSP task waking mid-measurement would dilute. And spawning that
+    // task allocates with kmain at IF = 0, which is allowed only while no
+    // other BSP task can be suspended inside the allocator (hal-tcb §5e as
+    // amended by FS-1a) — trivially true before `sfs-commit` exists; after,
+    // only while it is parked, which it is unless it has work.
     bus::proof::prove_caps();
 
     // SentinelFS FS-1a boot proof (docs/specs/2026-09-18-sentinelfs-design.md
@@ -274,11 +275,17 @@ pub fn kmain() -> ! {
     // that touches the device — which mounts the SentinelFS window of the IDE
     // disk past the old `kernel::fs` image (formatting it only if it is blank,
     // never over a disk that carries the magic), then commits once so the
-    // superblock slot alternates on every boot. Runs after every proof that
-    // drains this core's ready queue: from here on the task stays runnable on
-    // the BSP (it polls for commit requests), so nothing below may wait for
-    // that queue to empty.
+    // superblock slot alternates on every boot. From here on the task is a
+    // normal blocked task on the BSP: parked while it has no work, woken by
+    // `request_commit` or by its pacing deadline (spec §15 A25).
     sfs::prove_mount();
+
+    // Park/unpark boot proof (scheduler design doc, "Park / unpark"): a task
+    // on an AP parks and the BSP unparks it, an unpark before a park makes
+    // that park return at once, a `park_until` wakes by its deadline, a dead
+    // id is refused — and, with `sfs-commit` parked, the BSP halts through a
+    // window of its own ticks without a single switch.
+    sched::prove_park(sfs::service::commit_task_id());
 
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");

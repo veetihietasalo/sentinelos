@@ -482,6 +482,23 @@ const TIMER_LAPIC_EVERY_CORE: &str = "scheduler tick on every core";
 /// like the BSP line: `gemm-exact=yes`, both iteration counts `> 0`,
 /// `tick-preempted >= 1`, trailing `ok`.
 const SCHED_AP_PREEMPTIVE_PREFIX: &str = "[sched] ap-preemptive: ";
+/// Prefix of the **park/unpark** verdict line written by
+/// `kernel::sched::prove_park` (SentinelFS spec §15 A25). Asserted exactly:
+/// [`SCHED_PARK_OK`]. (The informational `[sched] park: target=…` line before
+/// it carries the counts and is not asserted.)
+const SCHED_PARK_PREFIX: &str = "[sched] park: cross-core=";
+/// The whole park/unpark verdict line: a task on an AP parked and the BSP
+/// unparked it across cores; an unpark before a park made that park return at
+/// once; a `park_until` woke by its deadline, not early; the exited task's id
+/// was refused; the `sfs-commit` task is parked; and the BSP took a window of
+/// its own ticks (two slice expiries) halted, with zero switches.
+const SCHED_PARK_OK: &str = "[sched] park: cross-core=ok permit-before-park=ok deadline=ok \
+                             dead-unpark=refused sfs-commit=parked bsp-idles=yes ok";
+
+/// Whether `line` is exactly [`SCHED_PARK_OK`] (trailing whitespace aside).
+fn sched_park_passed(line: &str) -> bool {
+    line.trim_end() == SCHED_PARK_OK
+}
 
 /// Component model PR-1 (`docs/specs/2026-09-18-component-model-design.md`
 /// §14): the host verified the embedded `hello` component's framed SHA-256 id,
@@ -2050,6 +2067,23 @@ fn check_boot_log(kvm: bool, log: &str, found: bool) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Park/unpark (A25): the exact verdict line, on every boot.
+    let Some(park_line) = log.lines().find(|l| l.contains(SCHED_PARK_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: park/unpark proof line '{}…' missing (did \
+             `kernel::sched::prove_park` run?).",
+            SCHED_PARK_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    if !sched_park_passed(park_line) {
+        eprintln!(
+            "TEST FAILED: the park/unpark proof did not pass (expected exactly '{}'): '{}'",
+            SCHED_PARK_OK, park_line
+        );
+        return ExitCode::FAILURE;
+    }
+
     // SMP phase 3b-i: the monotonic clock must keep running while the BSP is
     // stalled with interrupts off (only another core can have advanced it), at
     // least two cores must be feeding it, and it must track the PIT's rate.
@@ -2791,6 +2825,31 @@ ffffffff80105000 <isr_common>:\n\
                      preempted=0 FAIL";
         assert_eq!(parse_u64_after(line, "preempted="), Some(0));
         assert_eq!(parse_u64_after(line, "nope="), None);
+    }
+
+    #[test]
+    fn sched_park_passed_accepts_only_the_exact_line() {
+        use super::{sched_park_passed, SCHED_PARK_OK, SCHED_PARK_PREFIX};
+        assert!(sched_park_passed(SCHED_PARK_OK));
+        assert!(sched_park_passed(&format!("{SCHED_PARK_OK}\r")));
+        assert!(SCHED_PARK_OK.starts_with(SCHED_PARK_PREFIX));
+        for (good, bad) in [
+            ("cross-core=ok", "cross-core=FAIL"),
+            ("permit-before-park=ok", "permit-before-park=FAIL"),
+            ("deadline=ok", "deadline=FAIL"),
+            ("dead-unpark=refused", "dead-unpark=ACCEPTED"),
+            ("sfs-commit=parked", "sfs-commit=runnable"),
+            ("sfs-commit=parked", "sfs-commit=none"),
+            ("bsp-idles=yes", "bsp-idles=no"),
+            (" ok", " FAIL"),
+        ] {
+            let line = SCHED_PARK_OK.replace(good, bad);
+            assert!(!sched_park_passed(&line), "{line}");
+        }
+        assert!(!sched_park_passed(&format!("{SCHED_PARK_OK} x")));
+        assert!(!sched_park_passed(
+            "[sched] park: target=cpu1 deadline-waited=5/5 bsp-window ticks=25 halts=25 switches=0"
+        ));
     }
 
     #[test]
