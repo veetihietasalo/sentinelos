@@ -631,8 +631,11 @@ mod proofs {
         fits: bool,
         left: Option<bool>,
     ) -> (Node<W, 4>, Node<W, 4>, usize, usize) {
-        let nl: usize = kani::any();
-        let nr: usize = kani::any();
+        // A node below a quarter of LIMIT = 8 weighs 1: one entry of weight
+        // 1. So when `left` names the underflowing side, that side has
+        // exactly one entry (stated, not left for the solver to find).
+        let nl: usize = if left == Some(true) { 1 } else { kani::any() };
+        let nr: usize = if left == Some(false) { 1 } else { kani::any() };
         // Each bounded first, so the sum cannot overflow.
         kani::assume(nl >= 1 && nl <= 3 && nr >= 1 && nr <= 3);
         kani::assume(nl + nr <= 4);

@@ -403,6 +403,22 @@ pub(crate) unsafe fn xrstor(area: *const u8, mask: u64) {
     }
 }
 
+/// Read the time-stamp counter (`rdtsc`).
+///
+/// Monotonic per core and never calibrated here: callers use it only for
+/// generous deadlines measured in cycles (the ATA status waits), never to
+/// tell the time. The same primitive is proposed by the IOAPIC PR (#41, TCB
+/// row C16); whichever lands second keeps one definition.
+#[must_use]
+pub fn rdtsc() -> u64 {
+    // SAFETY: `rdtsc` reads the 64-bit time-stamp counter into EDX:EAX. It
+    // touches no memory and no flags, cannot fault in ring 0 (CR4.TSD only
+    // restricts ring 3, and user mode on the host build allows it), and has
+    // no side effects. The intrinsic is `unsafe` only because it is an
+    // architecture intrinsic; nothing about its inputs can be invalid.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
 /// Halt the CPU until the next interrupt (`hlt`) — executed exactly once.
 ///
 /// If interrupts are disabled this parks the core until an NMI or reset.

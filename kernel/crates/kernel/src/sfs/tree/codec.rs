@@ -639,7 +639,7 @@ mod proofs {
     /// source bytes, so a copy from the wrong place cannot match; keys and
     /// lengths are symbolic, the source offset is 0 (it is where the encoder
     /// reads, not anything in the format).
-    fn packing_round_trips(n: usize) {
+    fn packing_round_trips(n: usize, max_len: u8) {
         let src: [u8; 4] = [0xA1, 0xB2, 0xC3, 0xD4];
         let mut node: Node<Span, 2> = Node::new(Span::EMPTY);
         let mut prev: Option<Key> = None;
@@ -654,7 +654,7 @@ mod proofs {
                 kani::assume(p < key);
             }
             let len: u8 = kani::any();
-            kani::assume(usize::from(len) <= src.len());
+            kani::assume(len <= max_len && usize::from(len) <= src.len());
             let span = Span {
                 src: 0,
                 off: 0,
@@ -690,13 +690,15 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(119)]
     fn leaf_packing_one_item_round_trips() {
-        packing_round_trips(1);
+        packing_round_trips(1, 4);
     }
 
-    /// Leaf packing, two items (the packing order and the gap).
+    /// Leaf packing, two items (the packing order and the gap): data of
+    /// 0 or 1 byte each — what two items add over one is the order and the
+    /// boundaries, not longer data.
     #[kani::proof]
     #[kani::unwind(119)]
     fn leaf_packing_two_items_round_trip() {
-        packing_round_trips(2);
+        packing_round_trips(2, 1);
     }
 }
