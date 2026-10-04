@@ -246,9 +246,12 @@ blocks nothing and touches none of PR-2b/PR-3's files).
   per sequence, redirection entries with Kani-proved packing — unmasked entries
   are fixed delivery of a vector ≥ 0x20 only, IO1–IO4),
   `apic::eoi_if_in_service` / `apic::mask_lint0` (AP8–AP9), `pic::mask_all`
-  (P6). Every mapped physical span is checked against `MAXPHYADDR` and for
-  overflow first (`mm::phys_span`, Kani) — page-table leaves are `phys | flags`
-  unmasked, so high bits would otherwise alias a kernel frame. The EOI decision is made
+  (P6). Every mapped physical span is checked first, for every caller: no
+  overflow, below the usable address width (`MAXPHYADDR`, minus the AMD SME
+  C-bit/reduction; TME-MK KeyID bits are a documented residual) — page-table
+  leaves are `phys | flags` unmasked, so high bits would otherwise alias a
+  kernel frame — and, page-rounded, outside kernel-owned memory
+  (`mm::phys_span` + `overlaps_kernel_owned` in `map_window`, Kani). The EOI decision is made
   per interrupt from the LAPIC's in-service register: a LAPIC message (IOAPIC)
   EOIs the LAPIC, a virtual-wire ExtINT EOIs the 8259 — no flag to fall out of
   step.
