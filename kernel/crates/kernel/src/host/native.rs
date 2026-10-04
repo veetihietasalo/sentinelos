@@ -4,9 +4,9 @@
 //! component is Rust compiled into the kernel image and registered by a
 //! **descriptor** — the bytes the host hashes as the component's `code`
 //! (spec §6). The runtime maps a descriptor to its exports and its message
-//! handler; the host has already verified that
-//! `ComponentId::derive(descriptor, params)` is the id the requester asked for
-//! before this runtime ever sees the bytes.
+//! handler; the host has already verified that the v2 id of `(descriptor,
+//! params, declarations)` is the id the requester asked for before this
+//! runtime ever sees the bytes.
 //!
 //! What this boundary is and is not (spec §16 → `docs/security/threat-model.md`
 //! §2, amendment A4): a native component runs in ring 0 in the kernel address
@@ -31,7 +31,7 @@ use super::{
     MAX_INSTANCES,
 };
 use crate::bus::Ctx;
-use crate::cap::{CapIndex, Policy};
+use crate::cap::{service_literal, Policy, ServiceName};
 use crate::hash::digest_from_hex;
 
 /// A native export, called by the kernel: `(ctx, request payload, reply
@@ -73,7 +73,8 @@ pub struct NativeExport {
 /// and its message handler.
 pub struct NativeComponent {
     /// The `code` bytes of spec §6 for this component. Hashed (framed with the
-    /// params) into its [`ComponentId`]; matched byte-for-byte at instantiation.
+    /// params and the declarations) into its [`ComponentId`]; matched
+    /// byte-for-byte at instantiation.
     pub descriptor: &'static [u8],
     /// Kernel-callable exports.
     pub exports: &'static [NativeExport],
@@ -181,11 +182,20 @@ pub static HELLO: NativeComponent = NativeComponent {
 /// the three first-party probe components of the PR-2 capability proof.
 pub const REGISTRY: &[&NativeComponent] = &[&HELLO, &probe::ALICE, &probe::BOB, &probe::CAROL];
 
-/// The kernel-wide grant policy until the PolicyAgent (spec §9, PR-5): an
-/// allow-list, deny by default. `hello` holds nothing.
+/// The kernel-wide grant policy until the PolicyAgent (spec §9, PR-5): routes
+/// (service → provider id) and an allow-list, deny by default. `hello` holds
+/// nothing and nothing is routed to it.
 pub const BOOT_POLICY: Policy = Policy {
+    routes: probe::POLICY_ROUTES,
     rules: probe::POLICY_RULES,
 };
+
+// One provider per service: a duplicated route does not build (and would
+// route nowhere at run time anyway — `Policy::route` fails closed).
+const _: () = assert!(BOOT_POLICY.routes_are_unique());
+
+/// The service `hello` answers on the bus (`hello, <payload>`).
+pub const HELLO_SERVICE: ServiceName = service_literal("sentinel.hello/1");
 
 /// The id `kmain` asks the host for. A **literal**, not a value computed from
 /// the embedded bytes at boot: the requester names what it wants, the host
@@ -196,10 +206,12 @@ pub const HELLO_MANIFEST: Manifest = Manifest {
     params: b"",
     id: id_literal(HELLO_ID_HEX),
     caps: &[],
+    provides: &[HELLO_SERVICE],
 };
 
-/// `ComponentId::derive(HELLO_DESCRIPTOR, b"")` as hex.
-const HELLO_ID_HEX: &str = "9c1877d2681476cc7bc48e716d7f38d88d3f2db3fcbba868fc924018595ab7fa";
+/// `ComponentId::derive(HELLO_DESCRIPTOR, b"", &[], &[HELLO_SERVICE])` (v2)
+/// as hex.
+const HELLO_ID_HEX: &str = "f8ca98cb0c5ddbcef4c17eaf20e4df3ea6c6ca02974fc659ace182352501e97f";
 
 /// A [`ComponentId`] from a 64-digit hex literal, checked at compile time.
 pub(crate) const fn id_literal(hex: &str) -> ComponentId {
@@ -230,10 +242,10 @@ fn greet(
 /// `hello` on the bus: answer each request with the greeting (if it fits);
 /// events are delivered and ignored.
 fn hello_on_message(ctx: &Ctx<'_, NativeRuntime>, env: &Envelope) {
-    if let Kind::Request { reply_tag } = env.kind {
+    if let Kind::Request { reply } = env.kind {
         let mut buf = [0u8; super::codec::MAX_PAYLOAD];
         if let Ok(n) = greet_into(env.payload.as_slice(), &mut buf) {
-            let _ = ctx.reply(CapIndex(reply_tag), &buf[..n]);
+            let _ = ctx.reply(reply, &buf[..n]);
         }
     }
 }
@@ -242,30 +254,58 @@ fn hello_on_message(ctx: &Ctx<'_, NativeRuntime>, env: &Envelope) {
 mod tests {
     use super::*;
 
+    fn hex(id: &ComponentId) -> alloc::string::String {
+        id.0.iter().map(|b| alloc::format!("{b:02x}")).collect()
+    }
+
+    /// Every manifest the image carries: `hello` and each of
+    /// [`probe::MANIFESTS`]. A manifest added to the image without a place
+    /// here fails `every_registered_component_has_a_checked_manifest`.
+    fn all_manifests() -> alloc::vec::Vec<(&'static str, Manifest)> {
+        let mut v = alloc::vec![("hello", HELLO_MANIFEST)];
+        v.extend_from_slice(probe::MANIFESTS);
+        v
+    }
+
     #[test]
     fn manifest_id_literals_match_the_framed_hash() {
-        for (m, name) in [
-            (HELLO_MANIFEST, "hello"),
-            (probe::ALICE_MANIFEST, "alice"),
-            (probe::BOB_MANIFEST, "bob"),
-            (probe::CAROL_MANIFEST, "carol"),
-        ] {
-            let derived = ComponentId::derive(m.code, m.params);
+        for (name, m) in all_manifests() {
+            let derived = m.derived_id();
             assert_eq!(
-                derived, m.id,
-                "{name}: id literal is stale; derived id is {:02x?}",
-                derived.0
+                derived,
+                m.id,
+                "{name}: id literal is stale; the v2 id is {}",
+                hex(&derived)
             );
+            assert!(m.verify().is_ok(), "{name} verifies");
+        }
+    }
+
+    #[test]
+    fn every_registered_component_has_a_checked_manifest() {
+        let all = all_manifests();
+        for c in REGISTRY {
+            assert!(
+                all.iter().any(|(_, m)| m.code == c.descriptor),
+                "a registered component has no manifest in the literal test"
+            );
+        }
+        // Distinct declarations, distinct ids.
+        for (i, (a, ma)) in all.iter().enumerate() {
+            for (b, mb) in &all[i + 1..] {
+                assert_ne!(ma.id, mb.id, "{a} and {b} share an id");
+            }
         }
     }
 
     #[test]
     fn hello_manifest_id_matches_the_framed_hash() {
-        let derived = ComponentId::derive(HELLO_DESCRIPTOR, b"");
+        let derived = ComponentId::derive(HELLO_DESCRIPTOR, b"", &[], &[HELLO_SERVICE]);
         assert_eq!(
-            derived, HELLO_MANIFEST.id,
-            "HELLO_ID_HEX is stale; derived id is {:02x?}",
-            derived.0
+            derived,
+            HELLO_MANIFEST.id,
+            "HELLO_ID_HEX is stale; the v2 id is {}",
+            hex(&derived)
         );
     }
 

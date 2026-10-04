@@ -27,9 +27,10 @@
 //!   inbox is `Busy`; nothing is dropped, nothing grows.
 //! - [`Ctx::request`] does the same with `Request`, and mints the target a
 //!   **one-shot reply capability** in *its* table, expiring at the requester's
-//!   timeout; the target sees that capability's index as the request's
-//!   `reply_tag`. [`Ctx::reply`] spends it. The host never fabricates a reply:
-//!   **silence is denial**.
+//!   timeout; the target is handed that capability's index as the request's
+//!   `Request { reply }`, and the requester gets back a [`ReplyTag`] — a
+//!   distinct type, not an index (spec §19 R10). [`Ctx::reply`] spends the
+//!   capability. The host never fabricates a reply: **silence is denial**.
 //! - [`Ctx::delegate`] passes an attenuated (or equal) copy of a capability to
 //!   the instance another capability (`via`, holding `Send`) reaches — you can
 //!   hand authority only to someone you can already reach. The recipient is
@@ -89,7 +90,8 @@ pub mod proof;
 use crate::cap::deny::Action;
 use crate::cap::table::MAX_PENDING_REPLIES;
 use crate::cap::{
-    Access, Attenuation, CapError, CapIndex, Capability, DenyReason, Op, OpSet, Target, Tick,
+    Access, Attenuation, CapError, CapIndex, Capability, DenyReason, Op, OpSet, ReplyTag, Target,
+    Tick,
 };
 use crate::host::codec::{Envelope, Kind, Payload, Sender, Wire, MAX_PAYLOAD};
 use crate::host::native::{self, NativeRuntime};
@@ -198,16 +200,23 @@ impl<'h, R: ComponentRuntime> Ctx<'h, R> {
     }
 
     /// Post a `Request` over `cap`; the answer, if any, arrives in this
-    /// instance's inbox as `Reply { reply_tag }` with the returned tag. The
+    /// instance's inbox as `Reply { tag }` with the returned tag. The
     /// responder's right to answer expires after `timeout` ticks (clamped to
-    /// `1..=MAX_REPLY_TIMEOUT_TICKS`).
-    pub fn request(&self, cap: CapIndex, payload: &[u8], timeout: Tick) -> Result<u32, BusError> {
+    /// `1..=MAX_REPLY_TIMEOUT_TICKS`). The tag is a [`ReplyTag`], not a
+    /// [`CapIndex`]: it names nothing in any table (spec §19 R10).
+    pub fn request(
+        &self,
+        cap: CapIndex,
+        payload: &[u8],
+        timeout: Tick,
+    ) -> Result<ReplyTag, BusError> {
         locked(self.cell, |h| {
             h.request_from(self.me, cap, payload, timeout, now())
         })
     }
 
-    /// Answer the request whose `reply_tag` was `reply` — once.
+    /// Answer the request that was delivered as `Request { reply }` — once.
+    /// `reply` is the one-shot reply capability in this instance's own table.
     pub fn reply(&self, reply: CapIndex, payload: &[u8]) -> Result<(), BusError> {
         locked(self.cell, |h| h.reply_from(self.me, reply, payload, now()))
     }
@@ -314,14 +323,14 @@ impl<R: ComponentRuntime> Host<R> {
         }
     }
 
-    fn next_reply_tag(&mut self, slot: usize) -> u32 {
+    fn next_reply_tag(&mut self, slot: usize) -> ReplyTag {
         match self.instances.get_mut(slot).and_then(Option::as_mut) {
             Some(i) => {
                 let tag = i.next_reply_tag;
                 i.next_reply_tag = tag.wrapping_add(1).max(1);
-                tag
+                ReplyTag(tag)
             }
-            None => 0,
+            None => ReplyTag(0),
         }
     }
 
@@ -386,7 +395,7 @@ impl<R: ComponentRuntime> Host<R> {
         payload: &[u8],
         timeout: Tick,
         now: Tick,
-    ) -> Result<u32, BusError> {
+    ) -> Result<ReplyTag, BusError> {
         let actor = self.acting(me, cap, Action::Request, now)?;
         let access = Access::Message {
             op: Op::Request,
@@ -429,7 +438,7 @@ impl<R: ComponentRuntime> Host<R> {
             from: actor.1,
             to,
             cap,
-            kind: Kind::Request { reply_tag: reply.0 },
+            kind: Kind::Request { reply },
             payload,
         };
         if let Err(e) = self.enqueue(t, &env) {
@@ -506,7 +515,7 @@ impl<R: ComponentRuntime> Host<R> {
                 from: actor.1,
                 to,
                 cap: reply,
-                kind: Kind::Reply { reply_tag: tag },
+                kind: Kind::Reply { tag },
                 payload,
             },
         )?;
@@ -696,7 +705,7 @@ impl<R: ComponentRuntime> Host<R> {
     pub(crate) fn prepare_kernel_call(
         &mut self,
         inst: InstanceId,
-    ) -> Result<(R::Entry, ComponentId, u32), CallError> {
+    ) -> Result<(R::Entry, ComponentId, u64), CallError> {
         let slot = self.slot_of(inst).ok_or(CallError::NoSuchInstance)?;
         let i = self.instances[slot]
             .as_mut()
@@ -791,21 +800,27 @@ pub(crate) fn call_envelope<R: ComponentRuntime>(
 fn run_export<R: ComponentRuntime>(
     cell: &SpinMutex<Host<R>>,
     inst: InstanceId,
-    (entry, component, tag): (R::Entry, ComponentId, u32),
+    (entry, component, tag): (R::Entry, ComponentId, u64),
     export: &str,
     payload: Payload,
 ) -> Result<Envelope, CallError> {
+    // The export answers by returning, not over a capability: the request
+    // carries no reply right (`CapIndex::KERNEL` is valid in no table), and
+    // the kernel's own tag goes on the reply.
     let request = Envelope {
         from: Sender::KERNEL,
         to: inst,
         cap: CapIndex::KERNEL,
-        kind: Kind::Request { reply_tag: tag },
+        kind: Kind::Request {
+            reply: CapIndex::KERNEL,
+        },
         payload,
     };
     let delivered = Wire::encode(&request).decode().map_err(CallError::Wire)?;
-    let Kind::Request { reply_tag } = delivered.kind else {
+    if delivered.kind != request.kind {
         return Err(CallError::ReplyMismatch);
-    };
+    }
+    let reply_tag = ReplyTag(tag);
 
     let ctx = Ctx { cell, me: inst };
     let mut buf = [0u8; MAX_PAYLOAD];
@@ -822,11 +837,11 @@ fn run_export<R: ComponentRuntime>(
         },
         to: delivered.from.instance,
         cap: delivered.cap,
-        kind: Kind::Reply { reply_tag },
+        kind: Kind::Reply { tag: reply_tag },
         payload: reply_payload,
     };
     let back = Wire::encode(&reply).decode().map_err(CallError::Wire)?;
-    if back.kind != (Kind::Reply { reply_tag: tag })
+    if back.kind != (Kind::Reply { tag: reply_tag })
         || back.to != InstanceId::KERNEL
         || back.from.instance != inst
     {

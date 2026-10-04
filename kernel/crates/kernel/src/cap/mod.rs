@@ -3,7 +3,7 @@
 //! threat entries T-CAP-* in `docs/security/threat-model.md`).
 //!
 //! A capability is a kernel-held value `(target, ops, attenuation, expires)`.
-//! Components never hold one: they hold a [`CapIndex`], an opaque `u32` that
+//! Components never hold one: they hold a [`CapIndex`], an opaque `u64` that
 //! is meaningful only in **their own** table, which lives here, in the kernel.
 //! Absence of a capability is denial; nothing is granted implicitly.
 //!
@@ -57,18 +57,152 @@ pub mod table;
 use crate::host::codec::MAX_PAYLOAD;
 use crate::host::{ComponentId, InstanceId};
 
-/// A component's name for one of **its own** capabilities: an opaque `u32`
+/// A component's name for one of **its own** capabilities: an opaque `u64`
 /// that means something only in the holder's table, where the kernel checks
-/// it on every use ([`table`] documents the encoding). A component can write
-/// any number here; the number confers nothing — forging one is refused for
-/// the same reason a stolen one is (threat T-CAP-2).
+/// it on every use ([`table`] documents the encoding, `generation:48 ‖
+/// table:8 ‖ slot:8` since PR-2b, amendment A13). A component can write any
+/// number here; the number confers nothing — forging one is refused for the
+/// same reason a stolen one is (threat T-CAP-2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct CapIndex(pub u32);
+pub struct CapIndex(pub u64);
 
 impl CapIndex {
     /// The kernel needs no capability to address an instance it hosts; this
     /// index (generation 0) is never issued in any table.
     pub const KERNEL: CapIndex = CapIndex(0);
+}
+
+/// A requester's correlation tag: what `bus::Ctx::request` returns and what
+/// the answer's `Reply { tag }` carries back. Chosen by the kernel per
+/// requesting instance; never 0 for a bus request.
+///
+/// Deliberately **not** a [`CapIndex`] (spec §19 R10): the responder answers
+/// with the reply *capability* it was handed (`Request { reply }`, an index in
+/// its own table); the requester only ever sees this tag, which is not an
+/// index in any table and confers nothing. Distinct types keep the two from
+/// being swapped at the `Ctx` API.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReplyTag(pub u64);
+
+/// Bytes in a [`ServiceName`]'s canonical encoding.
+pub const SERVICE_NAME_LEN: usize = 32;
+
+/// The canonical name of a service a component provides and another requests
+/// (spec §6/§8, amendment A12): 1 to 32 ASCII bytes from `[a-z0-9._/-]`,
+/// NUL-padded to 32, the version part of the name (`sentinel.keyagent/1`).
+///
+/// The bytes are private and every constructor checks them, so a value of
+/// this type is canonical by construction: one name has exactly one
+/// encoding, which is what the v2 id frame hashes (`service[32]`). Upper case,
+/// spaces, a NUL before the end of the name, an empty name or one longer than
+/// 32 bytes are refused. The order (`Ord`) is the byte order of the encoding —
+/// the one a manifest's `provides` list must ascend in.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct ServiceName([u8; SERVICE_NAME_LEN]);
+
+/// Why a byte string is not a canonical [`ServiceName`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ServiceNameError {
+    /// No bytes before the padding.
+    Empty,
+    /// More than [`SERVICE_NAME_LEN`] bytes.
+    TooLong,
+    /// A byte outside `[a-z0-9._/-]` (a NUL inside the name, or a non-NUL
+    /// byte in the padding, included).
+    BadByte,
+}
+
+impl ServiceName {
+    /// Whether `b` may appear in a service name.
+    const fn allowed(b: u8) -> bool {
+        matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'/' | b'-')
+    }
+
+    /// The canonical name for `name`, or why it has none.
+    pub const fn new(name: &str) -> Result<ServiceName, ServiceNameError> {
+        let b = name.as_bytes();
+        if b.is_empty() {
+            return Err(ServiceNameError::Empty);
+        }
+        if b.len() > SERVICE_NAME_LEN {
+            return Err(ServiceNameError::TooLong);
+        }
+        let mut out = [0u8; SERVICE_NAME_LEN];
+        let mut i = 0;
+        while i < b.len() {
+            if !Self::allowed(b[i]) {
+                return Err(ServiceNameError::BadByte);
+            }
+            out[i] = b[i];
+            i += 1;
+        }
+        Ok(ServiceName(out))
+    }
+
+    /// Parse the 32-byte encoding: a non-empty run of allowed bytes, then
+    /// NULs to the end. Anything else is refused, so `from_bytes` accepts
+    /// exactly what [`Self::as_bytes`] produces.
+    pub const fn from_bytes(
+        bytes: &[u8; SERVICE_NAME_LEN],
+    ) -> Result<ServiceName, ServiceNameError> {
+        let mut len = 0;
+        while len < SERVICE_NAME_LEN && bytes[len] != 0 {
+            if !Self::allowed(bytes[len]) {
+                return Err(ServiceNameError::BadByte);
+            }
+            len += 1;
+        }
+        if len == 0 {
+            return Err(ServiceNameError::Empty);
+        }
+        let mut i = len;
+        while i < SERVICE_NAME_LEN {
+            if bytes[i] != 0 {
+                return Err(ServiceNameError::BadByte);
+            }
+            i += 1;
+        }
+        Ok(ServiceName(*bytes))
+    }
+
+    /// The canonical 32-byte encoding (what the id frame hashes).
+    pub const fn as_bytes(&self) -> &[u8; SERVICE_NAME_LEN] {
+        &self.0
+    }
+
+    /// The name without its padding (ASCII by construction).
+    pub fn as_str(&self) -> &str {
+        let len = self
+            .0
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(SERVICE_NAME_LEN);
+        core::str::from_utf8(&self.0[..len]).unwrap_or("")
+    }
+
+    /// Any 32 bytes, canonical or not — for the Kani framing harness only,
+    /// whose injectivity claim is the stronger for holding over every byte
+    /// string.
+    #[cfg(kani)]
+    pub(crate) fn any_bytes() -> ServiceName {
+        ServiceName(kani::any())
+    }
+
+    /// These 32 bytes, unchecked — for the Kani framing harness's decoder
+    /// only (it must reconstruct whatever `any_bytes` produced).
+    #[cfg(kani)]
+    pub(crate) const fn from_raw(bytes: [u8; SERVICE_NAME_LEN]) -> ServiceName {
+        ServiceName(bytes)
+    }
+}
+
+/// A [`ServiceName`] from a literal, checked at compile time: a non-canonical
+/// literal does not build (like `host::native::id_literal`).
+pub const fn service_literal(name: &str) -> ServiceName {
+    match ServiceName::new(name) {
+        Ok(s) => s,
+        Err(_) => panic!("service name literal is not canonical"),
+    }
 }
 
 /// A tick of `crate::clock::mono_ticks()` — the only clock authority decisions
@@ -174,7 +308,7 @@ pub enum Target {
         /// The requester the answer goes to.
         to: InstanceId,
         /// The requester's own correlation tag, restored on the answer.
-        tag: u32,
+        tag: ReplyTag,
     },
 }
 
@@ -197,6 +331,9 @@ impl Target {
         }
     }
 }
+
+/// Longest canonical attenuation encoding ([`Attenuation::id_encoding`]).
+pub const ATTENUATION_ENCODING_MAX: usize = 2;
 
 /// How a capability is narrowed beyond its target and ops.
 ///
@@ -243,6 +380,18 @@ impl Attenuation {
             (Attenuation::Message { max_len }, Target::Instance(_) | Target::Reply { .. }) => {
                 usize::from(*max_len) <= MAX_PAYLOAD
             }
+        }
+    }
+
+    /// The canonical encoding the v2 component id frames for a request's
+    /// attenuation (spec §6, A12): `(kind, bytes)`, `bytes` of length
+    /// `len`. Kind 0 is `Message`, `le16(max_len)`. Every variant has exactly
+    /// one encoding and no two values share one, so the frame stays
+    /// injective; FS-1c's storage attenuation is kind 1 with its own
+    /// canonical bytes (and grows [`ATTENUATION_ENCODING_MAX`]) — additive.
+    pub const fn id_encoding(&self) -> (u8, [u8; ATTENUATION_ENCODING_MAX], usize) {
+        match self {
+            Attenuation::Message { max_len } => (0, max_len.to_le_bytes(), 2),
         }
     }
 
@@ -368,7 +517,7 @@ impl Capability {
 impl Capability {
     /// The one-shot right to answer request `tag` of instance `to`, valid
     /// until `expires` — what the bus mints per request (spec §7).
-    pub fn reply_right(to: InstanceId, tag: u32, expires: Tick) -> Capability {
+    pub fn reply_right(to: InstanceId, tag: ReplyTag, expires: Tick) -> Capability {
         Capability {
             target: Target::Reply { to, tag },
             ops: OpSet::of(&[Op::Reply]),
@@ -457,6 +606,14 @@ pub enum DenyReason {
     /// The destination table has no usable slot: every slot is occupied, or
     /// retired after its generations ran out (threat T-CAP-2's residual).
     TableFull,
+    /// The policy routes the requested service to no provider — or, failing
+    /// closed, to more than one (a route table names each service once).
+    NoRoute,
+    /// The service is routed, but no instance of the routed provider is live.
+    NoProvider,
+    /// The routed provider's own id-bound manifest does not provide the
+    /// service: the route is not honoured (threat T-ROUTE-1).
+    NotProvided,
 }
 
 impl DenyReason {
@@ -478,6 +635,9 @@ impl DenyReason {
             DenyReason::MissingRequired => "missing-required",
             DenyReason::NoSuchSender => "no-such-sender",
             DenyReason::TableFull => "table-full",
+            DenyReason::NoRoute => "no-route",
+            DenyReason::NoProvider => "no-provider",
+            DenyReason::NotProvided => "not-provided",
         }
     }
 }
@@ -502,12 +662,25 @@ pub enum CapNeed {
     Optional,
 }
 
-/// One capability a manifest asks for: authority over a live instance of
-/// component `target` (the host binds the id to an instance, spec §6).
+impl CapNeed {
+    /// The byte the v2 id frame carries: 0 = `Required`, 1 = `Optional`.
+    pub const fn id_byte(self) -> u8 {
+        match self {
+            CapNeed::Required => 0,
+            CapNeed::Optional => 1,
+        }
+    }
+}
+
+/// One capability a manifest asks for: authority over the live provider of
+/// service `target`. Records name **services**, never a component id (spec
+/// §6, A12): the policy routes the service to a provider id and the host
+/// binds that id to its oldest live instance (§8). Every field is part of the
+/// asking component's id (the v2 frame), in manifest order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CapRequest {
-    /// The component whose instance it designates.
-    pub target: ComponentId,
+    /// The service whose provider it designates.
+    pub target: ServiceName,
     /// Operations asked for.
     pub ops: OpSet,
     /// Attenuation asked for (the top of its lattice for "no restriction").
@@ -516,14 +689,25 @@ pub struct CapRequest {
     pub need: CapNeed,
 }
 
+/// One route: requests for `service` go to instances of component
+/// `provider` — honoured only while the provider's own id-bound manifest
+/// provides `service` (threat T-ROUTE-1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Route {
+    /// The service.
+    pub service: ServiceName,
+    /// The one component that answers it.
+    pub provider: ComponentId,
+}
+
 /// One allow-list entry: instances of component `holder` may hold up to
-/// `(ops, attenuation, ttl)` over instances of component `target`.
+/// `(ops, attenuation, ttl)` over the provider of `service`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PolicyRule {
     /// Who may hold it.
     pub holder: ComponentId,
-    /// Over what.
-    pub target: ComponentId,
+    /// Over which service's provider.
+    pub service: ServiceName,
     /// The most operations granted.
     pub ops: OpSet,
     /// The loosest attenuation granted.
@@ -532,42 +716,99 @@ pub struct PolicyRule {
     pub ttl: Option<Tick>,
 }
 
-/// The grant policy: an allow-list, **deny by default** — no rule, no grant.
-/// A static first-party table until the PolicyAgent delegate (spec §9, PR-5).
+/// The grant policy (spec §8, A12): **routes** — which component provides
+/// each service, one provider per service — and the **allow-list** — who may
+/// hold what over a service's provider. **Deny by default**: no route, no
+/// rule, no grant. A static first-party table until the PolicyAgent delegate
+/// (spec §9, PR-5).
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
-    /// The allow-list. The first rule matching `(holder, target)` applies.
+    /// Service → provider id. Each service appears at most once; a service
+    /// named twice routes nowhere (fail closed, [`Self::route`]).
+    pub routes: &'static [Route],
+    /// The allow-list. The first rule matching `(holder, service)` applies.
     pub rules: &'static [PolicyRule],
 }
 
 impl Policy {
-    /// The empty policy: nothing is ever granted.
-    pub const DENY_ALL: Policy = Policy { rules: &[] };
+    /// The empty policy: nothing is ever routed or granted.
+    pub const DENY_ALL: Policy = Policy {
+        routes: &[],
+        rules: &[],
+    };
 
-    /// The rule for `(holder, target)`, if any.
-    pub fn rule(&self, holder: &ComponentId, target: &ComponentId) -> Option<&PolicyRule> {
+    /// The provider `service` is routed to: `Some` only when exactly one
+    /// route names it. Two routes for one service are a policy error and
+    /// route nowhere — failing closed rather than letting table order pick a
+    /// provider.
+    pub fn route(&self, service: &ServiceName) -> Option<ComponentId> {
+        let mut found = None;
+        for r in self.routes.iter().filter(|r| r.service == *service) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(r.provider);
+        }
+        found
+    }
+
+    /// Whether every service is routed at most once — asserted at build time
+    /// on the boot policy; [`Self::route`] fails closed regardless.
+    pub const fn routes_are_unique(&self) -> bool {
+        let mut i = 0;
+        while i < self.routes.len() {
+            let mut j = i + 1;
+            while j < self.routes.len() {
+                if bytes_eq(
+                    self.routes[i].service.as_bytes(),
+                    self.routes[j].service.as_bytes(),
+                ) {
+                    return false;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// The rule for `(holder, service)`, if any.
+    pub fn rule(&self, holder: &ComponentId, service: &ServiceName) -> Option<&PolicyRule> {
         self.rules
             .iter()
-            .find(|r| r.holder == *holder && r.target == *target)
+            .find(|r| r.holder == *holder && r.service == *service)
     }
 
     /// The bound the policy places on `holder`'s capability over instance
-    /// `target_inst` of `target`, at tick `now`; `None` = deny.
+    /// `provider_inst`, the provider of `service`, at tick `now`; `None` =
+    /// deny.
     pub fn bound(
         &self,
         holder: &ComponentId,
-        target: &ComponentId,
-        target_inst: InstanceId,
+        service: &ServiceName,
+        provider_inst: InstanceId,
         now: Tick,
     ) -> Option<Capability> {
-        let rule = self.rule(holder, target)?;
+        let rule = self.rule(holder, service)?;
         Some(Capability {
-            target: Target::Instance(target_inst),
+            target: Target::Instance(provider_inst),
             ops: rule.ops,
             attenuation: rule.attenuation,
             expires: rule.ttl.map(|t| now.saturating_add(t)),
         })
     }
+}
+
+/// `a == b` in a `const fn`.
+const fn bytes_eq(a: &[u8; SERVICE_NAME_LEN], b: &[u8; SERVICE_NAME_LEN]) -> bool {
+    let mut i = 0;
+    while i < SERVICE_NAME_LEN {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -627,7 +868,7 @@ mod tests {
         );
         let reply = Target::Reply {
             to: InstanceId(2),
-            tag: 7,
+            tag: ReplyTag(7),
         };
         assert!(cap(reply, &[Op::Reply], 16, Some(9)).is_well_formed());
         assert!(
@@ -685,28 +926,116 @@ mod tests {
     #[test]
     fn policy_is_deny_by_default() {
         let a = ComponentId([1; 32]);
-        let b = ComponentId([2; 32]);
+        let s = service_literal("test.b/1");
+        let other = service_literal("test.a/1");
         static RULES: [PolicyRule; 1] = [PolicyRule {
             holder: ComponentId([1; 32]),
-            target: ComponentId([2; 32]),
+            service: service_literal("test.b/1"),
             ops: OpSet::of(&[Op::Send]),
             attenuation: Attenuation::Message { max_len: 8 },
             ttl: Some(5),
         }];
-        let p = Policy { rules: &RULES };
-        assert!(Policy::DENY_ALL.bound(&a, &b, InstanceId(3), 0).is_none());
+        let p = Policy {
+            routes: &[],
+            rules: &RULES,
+        };
+        assert!(Policy::DENY_ALL.bound(&a, &s, InstanceId(3), 0).is_none());
         assert!(
-            p.bound(&b, &a, InstanceId(3), 0).is_none(),
-            "rules are directional"
+            p.bound(&ComponentId([2; 32]), &s, InstanceId(3), 0)
+                .is_none(),
+            "rules name their holder"
         );
-        let bound = p.bound(&a, &b, InstanceId(3), 10).unwrap();
+        assert!(
+            p.bound(&a, &other, InstanceId(3), 0).is_none(),
+            "rules name their service"
+        );
+        let bound = p.bound(&a, &s, InstanceId(3), 10).unwrap();
         assert_eq!(bound.target, Target::Instance(InstanceId(3)));
         assert_eq!(bound.expires, Some(15));
         assert_eq!(
-            p.bound(&a, &b, InstanceId(3), u64::MAX).unwrap().expires,
+            p.bound(&a, &s, InstanceId(3), u64::MAX).unwrap().expires,
             Some(u64::MAX),
             "ttl saturates"
         );
+    }
+
+    #[test]
+    fn routes_name_one_provider_or_none() {
+        let s = service_literal("test.s/1");
+        static ONE: [Route; 1] = [Route {
+            service: service_literal("test.s/1"),
+            provider: ComponentId([7; 32]),
+        }];
+        static TWO: [Route; 2] = [
+            Route {
+                service: service_literal("test.s/1"),
+                provider: ComponentId([7; 32]),
+            },
+            Route {
+                service: service_literal("test.s/1"),
+                provider: ComponentId([8; 32]),
+            },
+        ];
+        let one = Policy {
+            routes: &ONE,
+            rules: &[],
+        };
+        let two = Policy {
+            routes: &TWO,
+            rules: &[],
+        };
+        assert_eq!(one.route(&s), Some(ComponentId([7; 32])));
+        assert_eq!(one.route(&service_literal("test.t/1")), None);
+        assert!(one.routes_are_unique());
+        assert_eq!(two.route(&s), None, "a service routed twice fails closed");
+        assert!(!two.routes_are_unique());
+        assert_eq!(Policy::DENY_ALL.route(&s), None);
+    }
+
+    #[test]
+    fn service_names_are_canonical_by_construction() {
+        let k = ServiceName::new("sentinel.keyagent/1").unwrap();
+        assert_eq!(k.as_str(), "sentinel.keyagent/1");
+        assert_eq!(&k.as_bytes()[..19], b"sentinel.keyagent/1");
+        assert!(k.as_bytes()[19..].iter().all(|&b| b == 0));
+        assert_eq!(ServiceName::from_bytes(k.as_bytes()), Ok(k));
+        assert!(ServiceName::new("a-b_c.d/0-9").is_ok());
+        let full = "abcdefghijklmnopqrstuvwxyz012345";
+        assert_eq!(full.len(), SERVICE_NAME_LEN);
+        assert_eq!(ServiceName::new(full).unwrap().as_str(), full);
+
+        assert_eq!(ServiceName::new(""), Err(ServiceNameError::Empty));
+        assert_eq!(
+            ServiceName::new("abcdefghijklmnopqrstuvwxyz0123456"),
+            Err(ServiceNameError::TooLong)
+        );
+        for bad in ["Upper/1", "sp ace", "nul\0in", "uml\u{e4}ut", "a:b", "a\\b"] {
+            assert_eq!(
+                ServiceName::new(bad),
+                Err(ServiceNameError::BadByte),
+                "{bad:?}"
+            );
+        }
+        // The 32-byte form: a run of allowed bytes, then NULs only.
+        let mut raw = *k.as_bytes();
+        raw[25] = b'x';
+        assert_eq!(
+            ServiceName::from_bytes(&raw),
+            Err(ServiceNameError::BadByte)
+        );
+        assert_eq!(
+            ServiceName::from_bytes(&[0; SERVICE_NAME_LEN]),
+            Err(ServiceNameError::Empty)
+        );
+        let mut raw = *k.as_bytes();
+        raw[0] = b'A';
+        assert_eq!(
+            ServiceName::from_bytes(&raw),
+            Err(ServiceNameError::BadByte)
+        );
+        // The order is the byte order (what `provides` ascends in).
+        assert!(service_literal("a/1") < service_literal("a/2"));
+        assert!(service_literal("a") < service_literal("a/1"));
     }
 
     #[test]
@@ -714,6 +1043,9 @@ mod tests {
         assert_eq!(DenyReason::Foreign.label(), "foreign");
         assert_eq!(DenyReason::MissingRequired.label(), "missing-required");
         assert_eq!(DenyReason::TableFull.label(), "table-full");
+        assert_eq!(DenyReason::NoRoute.label(), "no-route");
+        assert_eq!(DenyReason::NoProvider.label(), "no-provider");
+        assert_eq!(DenyReason::NotProvided.label(), "not-provided");
     }
 }
 
@@ -729,7 +1061,7 @@ pub(crate) mod proofs {
         } else {
             Target::Reply {
                 to: InstanceId(kani::any()),
-                tag: kani::any(),
+                tag: ReplyTag(kani::any()),
             }
         }
     }

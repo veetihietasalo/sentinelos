@@ -2,22 +2,30 @@
 //!
 //! Spec §7: every message between the kernel and a component, or between two
 //! components, is an [`Envelope`] whose `from` field is written by the kernel
-//! and never by the sender. On the wire an envelope is a fixed 60-byte header
-//! followed by at most [`MAX_PAYLOAD`] payload bytes, little-endian throughout:
+//! and never by the sender. On the wire an envelope is a fixed 68-byte header
+//! followed by at most [`MAX_PAYLOAD`] payload bytes, little-endian throughout
+//! (version 2, PR-2b: the tag and index fields widened to `u64` with the
+//! capability index, amendment A13):
 //!
 //! ```text
 //! off  len  field
-//!  0    1   WIRE_VERSION (= 1)
+//!  0    1   WIRE_VERSION (= 2)
 //!  1    1   kind          0 = Event, 1 = Request, 2 = Reply, 3 = Grant
-//!  2    4   reply_tag     u32; MUST be 0 for Event (canonical form);
-//!                         for Grant, the granted CapIndex
-//!  6    8   from.instance u64
-//! 14   32   from.component (ComponentId)
-//! 46    8   to            u64 (InstanceId)
-//! 54    4   cap           u32 (CapIndex the sender used)
-//! 58    2   payload_len   u16 ≤ MAX_PAYLOAD
-//! 60    n   payload
+//!  2    8   reply_tag     u64; MUST be 0 for Event (canonical form);
+//!                         Request: the responder's reply CapIndex;
+//!                         Reply: the requester's ReplyTag;
+//!                         Grant: the granted CapIndex
+//! 10    8   from.instance u64
+//! 18   32   from.component (ComponentId)
+//! 50    8   to            u64 (InstanceId)
+//! 58    8   cap           u64 (CapIndex the sender used)
+//! 66    2   payload_len   u16 ≤ MAX_PAYLOAD
+//! 68    n   payload
 //! ```
+//!
+//! Version 1 (60-byte header, `u32` tag and index) is refused
+//! ([`DecodeError::Version`]): nothing persists an envelope, so there is
+//! nothing to migrate.
 //!
 //! [`decode`] is total (a `Result`, never a panic) and accepts exactly the
 //! canonical encodings, so `decode(encode(e)) == e` for every envelope and
@@ -33,27 +41,30 @@
 use super::{ComponentId, InstanceId};
 
 /// Wire format version byte.
-pub const WIRE_VERSION: u8 = 1;
+pub const WIRE_VERSION: u8 = 2;
 /// Largest payload one envelope carries. Larger transfers go through a
 /// shared-buffer capability (later PR).
 pub const MAX_PAYLOAD: usize = 256;
 /// Fixed header length.
-pub const HEADER_LEN: usize = 60;
+pub const HEADER_LEN: usize = 68;
 /// Largest encoded envelope.
 pub const MAX_ENVELOPE: usize = HEADER_LEN + MAX_PAYLOAD;
 
 const OFF_VERSION: usize = 0;
 const OFF_KIND: usize = 1;
 const OFF_REPLY_TAG: usize = 2;
-const OFF_FROM_INSTANCE: usize = 6;
-const OFF_FROM_COMPONENT: usize = 14;
-const OFF_TO: usize = 46;
-const OFF_CAP: usize = 54;
-const OFF_PAYLOAD_LEN: usize = 58;
+const OFF_FROM_INSTANCE: usize = 10;
+const OFF_FROM_COMPONENT: usize = 18;
+const OFF_TO: usize = 50;
+const OFF_CAP: usize = 58;
+const OFF_PAYLOAD_LEN: usize = 66;
 
 /// Index into the sender's capability table that authorised a send — defined
 /// with its meaning in `kernel::cap` (PR-2), carried verbatim on the wire.
 pub use crate::cap::CapIndex;
+/// A requester's correlation tag — defined in `kernel::cap` (PR-2b, R10),
+/// carried verbatim on the wire.
+pub use crate::cap::ReplyTag;
 
 /// Who sent an envelope — both the *which* (instance) and the *what*
 /// (component), stamped by the kernel (spec §7, amendment A2).
@@ -73,27 +84,32 @@ impl Sender {
     };
 }
 
-/// Message kind. `reply_tag` pairs a `Reply` with its `Request`.
+/// Message kind.
 ///
-/// On the bus (PR-2) the two ends see different tags, both chosen by the
-/// kernel: the responder's `Request { reply_tag }` is the [`CapIndex`] of the
-/// one-shot reply capability the host minted in **its** table for this request
-/// (it answers with `bus::Ctx::reply(CapIndex(reply_tag), …)`); the
-/// requester's `Reply { reply_tag }` is the correlation tag its own
-/// `bus::Ctx::request` returned.
+/// The two ends of a request see different values, both chosen by the kernel
+/// and, since PR-2b (spec §19 R10), of different types: the responder's
+/// `Request { reply }` is the [`CapIndex`] of the one-shot reply capability
+/// the host minted in **its** table for this request (it answers with
+/// `bus::Ctx::reply(reply, …)`); the requester's `Reply { tag }` is the
+/// [`ReplyTag`] its own `bus::Ctx::request` returned. Both travel in the
+/// wire's `reply_tag` field.
+///
+/// A kernel call (`bus::call`) is answered by the export's return value, not
+/// over a capability: its `Request` carries [`CapIndex::KERNEL`], valid in no
+/// table, and its `Reply` the kernel's own tag.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     /// One-way message.
     Event,
     /// A request expecting at most one answer.
     Request {
-        /// See the type docs.
-        reply_tag: u32,
+        /// The responder's one-shot right to answer it (see the type docs).
+        reply: CapIndex,
     },
     /// The answer to a request.
     Reply {
-        /// See the type docs.
-        reply_tag: u32,
+        /// The requester's correlation tag (see the type docs).
+        tag: ReplyTag,
     },
     /// A delegation notice: the sender delegated a capability to the
     /// recipient, now installed at `granted` in the recipient's own table.
@@ -111,21 +127,23 @@ impl Kind {
     const REPLY: u8 = 2;
     const GRANT: u8 = 3;
 
-    fn to_wire(self) -> (u8, u32) {
+    fn to_wire(self) -> (u8, u64) {
         match self {
             Kind::Event => (Self::EVENT, 0),
-            Kind::Request { reply_tag } => (Self::REQUEST, reply_tag),
-            Kind::Reply { reply_tag } => (Self::REPLY, reply_tag),
+            Kind::Request { reply } => (Self::REQUEST, reply.0),
+            Kind::Reply { tag } => (Self::REPLY, tag.0),
             Kind::Grant { granted } => (Self::GRANT, granted.0),
         }
     }
 
-    fn from_wire(code: u8, reply_tag: u32) -> Result<Kind, DecodeError> {
+    fn from_wire(code: u8, reply_tag: u64) -> Result<Kind, DecodeError> {
         match (code, reply_tag) {
             (Self::EVENT, 0) => Ok(Kind::Event),
             (Self::EVENT, _) => Err(DecodeError::Kind),
-            (Self::REQUEST, tag) => Ok(Kind::Request { reply_tag: tag }),
-            (Self::REPLY, tag) => Ok(Kind::Reply { reply_tag: tag }),
+            (Self::REQUEST, idx) => Ok(Kind::Request {
+                reply: CapIndex(idx),
+            }),
+            (Self::REPLY, tag) => Ok(Kind::Reply { tag: ReplyTag(tag) }),
             (Self::GRANT, idx) => Ok(Kind::Grant {
                 granted: CapIndex(idx),
             }),
@@ -245,12 +263,12 @@ pub fn encode(env: &Envelope, out: &mut [u8]) -> Result<usize, BufferTooSmall> {
     let (kind, reply_tag) = env.kind.to_wire();
     out[OFF_VERSION] = WIRE_VERSION;
     out[OFF_KIND] = kind;
-    out[OFF_REPLY_TAG..OFF_REPLY_TAG + 4].copy_from_slice(&reply_tag.to_le_bytes());
+    out[OFF_REPLY_TAG..OFF_REPLY_TAG + 8].copy_from_slice(&reply_tag.to_le_bytes());
     out[OFF_FROM_INSTANCE..OFF_FROM_INSTANCE + 8]
         .copy_from_slice(&env.from.instance.0.to_le_bytes());
     out[OFF_FROM_COMPONENT..OFF_FROM_COMPONENT + 32].copy_from_slice(&env.from.component.0);
     out[OFF_TO..OFF_TO + 8].copy_from_slice(&env.to.0.to_le_bytes());
-    out[OFF_CAP..OFF_CAP + 4].copy_from_slice(&env.cap.0.to_le_bytes());
+    out[OFF_CAP..OFF_CAP + 8].copy_from_slice(&env.cap.0.to_le_bytes());
     out[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 2]
         .copy_from_slice(&(env.payload.len() as u16).to_le_bytes());
     out[HEADER_LEN..total].copy_from_slice(env.payload.as_slice());
@@ -266,7 +284,7 @@ pub fn decode(bytes: &[u8]) -> Result<Envelope, DecodeError> {
     if header[OFF_VERSION] != WIRE_VERSION {
         return Err(DecodeError::Version);
     }
-    let kind = Kind::from_wire(header[OFF_KIND], u32_at(header, OFF_REPLY_TAG))?;
+    let kind = Kind::from_wire(header[OFF_KIND], u64_at(header, OFF_REPLY_TAG))?;
     let payload_len = usize::from(u16::from_le_bytes([
         header[OFF_PAYLOAD_LEN],
         header[OFF_PAYLOAD_LEN + 1],
@@ -288,15 +306,11 @@ pub fn decode(bytes: &[u8]) -> Result<Envelope, DecodeError> {
             component: ComponentId(component),
         },
         to: InstanceId(u64_at(header, OFF_TO)),
-        cap: CapIndex(u32_at(header, OFF_CAP)),
+        cap: CapIndex(u64_at(header, OFF_CAP)),
         kind,
         // Cannot fail: `payload_len <= MAX_PAYLOAD` was checked above.
         payload: Payload::new(payload_bytes).map_err(|_| DecodeError::PayloadLength)?,
     })
-}
-
-fn u32_at(h: &[u8; HEADER_LEN], off: usize) -> u32 {
-    u32::from_le_bytes([h[off], h[off + 1], h[off + 2], h[off + 3]])
 }
 
 fn u64_at(h: &[u8; HEADER_LEN], off: usize) -> u64 {
@@ -366,11 +380,14 @@ mod tests {
         for kind in [
             Kind::Event,
             Kind::Request {
-                reply_tag: 0xDEAD_BEEF,
+                reply: CapIndex(0xDEAD_BEEF_0BAD_F00D),
             },
-            Kind::Reply { reply_tag: 1 },
+            Kind::Reply { tag: ReplyTag(1) },
+            Kind::Reply {
+                tag: ReplyTag(u64::MAX),
+            },
             Kind::Grant {
-                granted: CapIndex(0x0102_0304),
+                granted: CapIndex(0x0102_0304_0506_0708),
             },
         ] {
             let env = sample(kind, b"hello");
@@ -395,14 +412,21 @@ mod tests {
 
     #[test]
     fn rejects_short_wrong_version_trailing_and_bad_kind() {
-        let env = sample(Kind::Request { reply_tag: 4 }, b"xy");
+        let env = sample(Kind::Request { reply: CapIndex(4) }, b"xy");
         let mut buf = [0u8; MAX_ENVELOPE];
         let n = encode(&env, &mut buf).unwrap();
         assert_eq!(decode(&buf[..HEADER_LEN - 1]), Err(DecodeError::Short));
         assert_eq!(decode(&buf[..n - 1]), Err(DecodeError::Short));
         assert_eq!(decode(&buf[..n + 1]), Err(DecodeError::Trailing));
         let mut bad = buf;
-        bad[OFF_VERSION] = 2;
+        bad[OFF_VERSION] = 1;
+        assert_eq!(
+            decode(&bad[..n]),
+            Err(DecodeError::Version),
+            "the v1 (u32) format is refused"
+        );
+        let mut bad = buf;
+        bad[OFF_VERSION] = 3;
         assert_eq!(decode(&bad[..n]), Err(DecodeError::Version));
         let mut bad = buf;
         bad[OFF_KIND] = 9;
@@ -427,6 +451,36 @@ mod tests {
     }
 
     #[test]
+    fn the_v2_header_layout_is_exact() {
+        assert_eq!(WIRE_VERSION, 2);
+        assert_eq!(HEADER_LEN, 68);
+        let env = Envelope {
+            from: Sender {
+                instance: InstanceId(0x1111_2222_3333_4444),
+                component: ComponentId([0xC0; 32]),
+            },
+            to: InstanceId(0x5555_6666_7777_8888),
+            cap: CapIndex(0x0102_0304_0506_0708),
+            kind: Kind::Reply {
+                tag: ReplyTag(0x99AA_BBCC_DDEE_FF00),
+            },
+            payload: Payload::new(b"z").unwrap(),
+        };
+        let mut buf = [0u8; MAX_ENVELOPE];
+        let n = encode(&env, &mut buf).unwrap();
+        assert_eq!(n, 69);
+        assert_eq!(buf[0], 2);
+        assert_eq!(buf[1], 2, "reply");
+        assert_eq!(&buf[2..10], &0x99AA_BBCC_DDEE_FF00u64.to_le_bytes());
+        assert_eq!(&buf[10..18], &0x1111_2222_3333_4444u64.to_le_bytes());
+        assert_eq!(&buf[18..50], &[0xC0; 32]);
+        assert_eq!(&buf[50..58], &0x5555_6666_7777_8888u64.to_le_bytes());
+        assert_eq!(&buf[58..66], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(&buf[66..68], &1u16.to_le_bytes());
+        assert_eq!(buf[68], b'z');
+    }
+
+    #[test]
     fn encode_reports_a_small_buffer() {
         let env = sample(Kind::Event, b"abc");
         let mut buf = [0u8; HEADER_LEN + 2];
@@ -441,16 +495,26 @@ mod proofs {
 
     /// `decode(encode(e)) == e` for a symbolic header and a bounded symbolic
     /// payload — every field, every kind, every payload length up to the bound.
+    ///
+    /// Solver: minisat (PR-2b). The v2 header's wider tag and index fields
+    /// took this harness from ~82 s to 113 s locally under the default
+    /// (cadical), unchanged with the payload bound cut to 3; minisat discharges
+    /// it in ~35 s at the original bound of 4 (spec §19 R16).
     #[kani::proof]
+    #[kani::solver(minisat)]
     fn envelope_codec_round_trips_bounded() {
         const MAX: usize = 4;
         let code: u8 = kani::any();
         kani::assume(code <= 3);
-        let reply_tag: u32 = kani::any();
+        let reply_tag: u64 = kani::any();
         let kind = match code {
             0 => Kind::Event,
-            1 => Kind::Request { reply_tag },
-            2 => Kind::Reply { reply_tag },
+            1 => Kind::Request {
+                reply: CapIndex(reply_tag),
+            },
+            2 => Kind::Reply {
+                tag: ReplyTag(reply_tag),
+            },
             _ => Kind::Grant {
                 granted: CapIndex(reply_tag),
             },

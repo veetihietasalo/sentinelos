@@ -6,7 +6,8 @@ use super::*;
 use crate::cap::deny::{Action, DenyRecord};
 use crate::cap::table::{GEN_MAX, MAX_CAPS};
 use crate::cap::{
-    Attenuation, CapIndex, CapNeed, CapRequest, Capability, DenyReason, Op, OpSet, Target,
+    Attenuation, CapIndex, CapNeed, CapRequest, Capability, DenyReason, Op, OpSet, Policy,
+    PolicyRule, ReplyTag, Route, Target,
 };
 use crate::host::codec::{Envelope, Kind, Sender};
 use crate::host::native::{NativeRuntime, BOOT_POLICY, REGISTRY};
@@ -18,6 +19,22 @@ type Cell = SpinMutex<Host<NativeRuntime>>;
 
 fn fresh() -> Cell {
     SpinMutex::new(Host::new(NativeRuntime::new(REGISTRY), BOOT_POLICY))
+}
+
+/// A host granting under `routes` and `rules`.
+fn with_policy(routes: &'static [Route], rules: &'static [PolicyRule]) -> Cell {
+    SpinMutex::new(Host::new(
+        NativeRuntime::new(REGISTRY),
+        Policy { routes, rules },
+    ))
+}
+
+/// `m` with the id its code, params and declarations hash to.
+fn honest(m: Manifest) -> Manifest {
+    Manifest {
+        id: m.derived_id(),
+        ..m
+    }
 }
 
 /// bob (no caps), carol (asked for bob, refused), alice (bob + carol).
@@ -126,18 +143,17 @@ fn from_is_stamped_by_the_host_on_every_kind() {
     let tag = h.request_from(w.alice, w.a_bob, b"ping", 50, 0).unwrap();
     let rq = pop(h, w.bob).unwrap();
     assert_eq!(rq.from, alice);
-    let Kind::Request { reply_tag } = rq.kind else {
+    let Kind::Request { reply } = rq.kind else {
         panic!("not a request: {:?}", rq.kind)
     };
-    let right = h.caps().get(slot(h, w.bob), CapIndex(reply_tag)).unwrap();
+    let right = h.caps().get(slot(h, w.bob), reply).unwrap();
     assert_eq!(right.cap.target, Target::Reply { to: w.alice, tag });
     assert_eq!(right.cap.expires, Some(50));
 
     // Reply: stamped from bob, carrying alice's own tag.
-    h.reply_from(w.bob, CapIndex(reply_tag), b"pong", 1)
-        .unwrap();
+    h.reply_from(w.bob, reply, b"pong", 1).unwrap();
     let rp = pop(h, w.alice).unwrap();
-    assert_eq!((rp.from, rp.kind), (bob, Kind::Reply { reply_tag: tag }));
+    assert_eq!((rp.from, rp.kind), (bob, Kind::Reply { tag }));
     assert_eq!(rp.payload.as_slice(), b"pong");
 
     // Delegation notice: stamped from alice, the index is carol's own.
@@ -318,12 +334,12 @@ fn replies_are_one_shot_time_out_and_are_never_fabricated() {
     let bs = slot(h, w.bob);
 
     h.request_from(w.alice, w.a_bob, b"q", 100, 0).unwrap();
-    let Kind::Request { reply_tag } = pop(h, w.bob).unwrap().kind else {
+    let Kind::Request { reply } = pop(h, w.bob).unwrap().kind else {
         panic!()
     };
-    assert!(h.reply_from(w.bob, CapIndex(reply_tag), b"a", 1).is_ok());
+    assert!(h.reply_from(w.bob, reply, b"a", 1).is_ok());
     assert_eq!(
-        h.reply_from(w.bob, CapIndex(reply_tag), b"again", 1),
+        h.reply_from(w.bob, reply, b"again", 1),
         Err(BusError::Denied)
     );
     assert_eq!(last_deny(h).reason, DenyReason::Stale, "one shot");
@@ -332,11 +348,11 @@ fn replies_are_one_shot_time_out_and_are_never_fabricated() {
 
     // Timeout: the right expires at now + timeout; nothing arrives.
     h.request_from(w.alice, w.a_bob, b"q", 3, 100).unwrap();
-    let Kind::Request { reply_tag } = pop(h, w.bob).unwrap().kind else {
+    let Kind::Request { reply } = pop(h, w.bob).unwrap().kind else {
         panic!()
     };
     assert_eq!(
-        h.reply_from(w.bob, CapIndex(reply_tag), b"late", 103),
+        h.reply_from(w.bob, reply, b"late", 103),
         Err(BusError::Denied)
     );
     assert_eq!(last_deny(h).reason, DenyReason::Expired);
@@ -352,17 +368,17 @@ fn replies_are_one_shot_time_out_and_are_never_fabricated() {
 
     // Timeouts are clamped to 1..=MAX_REPLY_TIMEOUT_TICKS.
     h.request_from(w.alice, w.a_bob, b"q", 0, 200).unwrap();
-    let Kind::Request { reply_tag } = pop(h, w.bob).unwrap().kind else {
+    let Kind::Request { reply } = pop(h, w.bob).unwrap().kind else {
         panic!()
     };
-    let e = h.caps().get(bs, CapIndex(reply_tag)).unwrap();
+    let e = h.caps().get(bs, reply).unwrap();
     assert_eq!(e.cap.expires, Some(201));
     h.request_from(w.alice, w.a_bob, b"q", u64::MAX, 200)
         .unwrap();
-    let Kind::Request { reply_tag } = pop(h, w.bob).unwrap().kind else {
+    let Kind::Request { reply } = pop(h, w.bob).unwrap().kind else {
         panic!()
     };
-    let e = h.caps().get(bs, CapIndex(reply_tag)).unwrap();
+    let e = h.caps().get(bs, reply).unwrap();
     assert_eq!(e.cap.expires, Some(200 + MAX_REPLY_TIMEOUT_TICKS));
 }
 
@@ -383,10 +399,10 @@ fn pending_replies_are_capped_per_responder() {
     let bs = slot(h, w.bob);
     assert_eq!(h.caps().pending_replies(bs), MAX_PENDING_REPLIES);
     // Answering one frees its right, and the next request fits again.
-    let Kind::Request { reply_tag } = pop(h, w.bob).unwrap().kind else {
+    let Kind::Request { reply } = pop(h, w.bob).unwrap().kind else {
         panic!()
     };
-    h.reply_from(w.bob, CapIndex(reply_tag), b"a", 1).unwrap();
+    h.reply_from(w.bob, reply, b"a", 1).unwrap();
     assert!(h.request_from(w.alice, w.a_bob, b"q", 100, 1).is_ok());
 }
 
@@ -437,15 +453,15 @@ fn an_expired_capability_offered_as_a_reply_right_is_refused_and_kept() {
     );
     // An expired reply right, by contrast, is reclaimed by the late answer.
     h.request_from(w.alice, w.a_bob, b"q", 2, 0).unwrap();
-    let Kind::Request { reply_tag } = pop(h, w.bob).unwrap().kind else {
+    let Kind::Request { reply } = pop(h, w.bob).unwrap().kind else {
         panic!()
     };
     let bs = slot(h, w.bob);
     assert_eq!(
-        h.reply_from(w.bob, CapIndex(reply_tag), b"late", 2),
+        h.reply_from(w.bob, reply, b"late", 2),
         Err(BusError::Denied)
     );
-    assert!(h.caps().get(bs, CapIndex(reply_tag)).is_err());
+    assert!(h.caps().get(bs, reply).is_err());
 }
 
 #[test]
@@ -569,7 +585,7 @@ fn a_delegation_into_a_full_inbox_spends_no_generation() {
         .unwrap();
     }
     let gens = |h: &Host<NativeRuntime>| {
-        let mut out = [0u32; MAX_CAPS];
+        let mut out = [0u64; MAX_CAPS];
         for (s, g) in out.iter_mut().enumerate() {
             *g = h.caps.gen_for_test(cs, s);
         }
@@ -626,7 +642,7 @@ fn one_instance_never_runs_twice_at_once() {
         assert!(matches!(h.prepare_kernel_call(w.bob), Err(CallError::Busy)));
         assert_eq!(h.inbox_len(w.bob), Some(1));
     }
-    let mut out = [0u8; 8];
+    let mut out = [0u8; probe::ANSWER_LEN];
     assert_eq!(
         call(&w.cell, w.bob, "act", Args::granted(0).as_slice(), &mut out),
         Err(CallError::Busy)
@@ -701,26 +717,37 @@ fn grants_that_do_not_fit_are_refused_before_anything_changes() {
 
 #[test]
 fn required_grants_get_the_room_before_optional_ones() {
-    // alice's two requests, the optional one listed first.
-    static OPTIONAL_FIRST: [CapRequest; 2] = [
-        CapRequest {
-            target: CAROL_ID,
-            ops: OpSet::of(&[Op::Send]),
-            attenuation: Attenuation::UNRESTRICTED_MESSAGE,
-            need: CapNeed::Optional,
+    // alice's two requests, the optional one listed first. Since PR-2b the
+    // order is part of the id: this is another component (its own honest
+    // id), which the test policy allows what the boot policy allows alice.
+    static OPTIONAL_FIRST: [CapRequest; 2] =
+        [probe::ALICE_ASKS_FOR_CAROL, probe::ALICE_ASKS_FOR_BOB];
+    const REORDERED_ID: crate::host::ComponentId = crate::host::native::id_literal(
+        "4c9d65a46cfa156b65a74e212b93ffe2bf2a7e70ff6f40636b90894723847843",
+    );
+    static RULES: [PolicyRule; 2] = [
+        PolicyRule {
+            holder: REORDERED_ID,
+            ..probe::POLICY_RULES[0]
         },
-        CapRequest {
-            target: BOB_ID,
-            ops: OpSet::of(&[Op::Send, Op::Request, Op::Delegate]),
-            attenuation: Attenuation::UNRESTRICTED_MESSAGE,
-            need: CapNeed::Required,
+        PolicyRule {
+            holder: REORDERED_ID,
+            ..probe::POLICY_RULES[1]
         },
     ];
     let reordered = Manifest {
         caps: &OPTIONAL_FIRST,
+        id: REORDERED_ID,
         ..probe::ALICE_MANIFEST
     };
-    let cell = fresh();
+    assert_eq!(
+        honest(reordered).id,
+        REORDERED_ID,
+        "REORDERED_ID is stale: {:02x?}",
+        honest(reordered).id.0
+    );
+    assert_ne!(reordered.id, ALICE_ID, "the order is in the id");
+    let cell = with_policy(probe::POLICY_ROUTES, &RULES);
     let bob = instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
     let _carol = instantiate(&cell, &probe::CAROL_MANIFEST).unwrap();
     // One usable slot: it goes to the required request, not the first one.
@@ -741,7 +768,7 @@ fn required_grants_get_the_room_before_optional_ones() {
         Target::Instance(bob)
     );
     let r = last_deny(&h);
-    assert_eq!(r.holder, who(alice, ALICE_ID));
+    assert_eq!(r.holder, who(alice, reordered.id));
     assert_eq!((r.action, r.reason), (Action::Grant, DenyReason::TableFull));
 }
 
@@ -811,17 +838,11 @@ fn delegation_through_the_bus_never_amplifies() {
     assert_eq!(last_deny(h).reason, DenyReason::NotDelegable);
     // `via` must reach someone: a reply right is not a way in.
     h.request_from(w.alice, w.a_bob, b"q", 50, 0).unwrap();
-    let Kind::Request { reply_tag } = pop(h, w.bob).unwrap().kind else {
+    let Kind::Request { reply } = pop(h, w.bob).unwrap().kind else {
         panic!()
     };
     assert_eq!(
-        h.delegate_from(
-            w.bob,
-            b_bob,
-            CapIndex(reply_tag),
-            &delegation(&[Op::Send], 8, None),
-            0
-        ),
+        h.delegate_from(w.bob, b_bob, reply, &delegation(&[Op::Send], 8, None), 0),
         Err(BusError::Denied)
     );
     assert_eq!(last_deny(h).reason, DenyReason::OpNotAllowed);
@@ -928,7 +949,7 @@ fn required_caps_refuse_to_start_and_optional_refusals_are_logged() {
         assert_eq!(h.cap_count(alice), 1);
         assert!(h.granted(alice, 0).is_some());
         assert_eq!(h.granted(alice, 1), None);
-        assert_eq!(last_deny(&h).reason, DenyReason::TargetGone);
+        assert_eq!(last_deny(&h).reason, DenyReason::NoProvider);
         assert_eq!(h.cap_count(bob), 0);
     }
     // carol marking her request required: refused, nothing instantiated.
@@ -940,7 +961,7 @@ fn required_caps_refuse_to_start_and_optional_refusals_are_logged() {
     assert_eq!(cell.lock().instance_count(), n);
     assert_eq!(
         last_deny(&cell.lock()).holder,
-        who(InstanceId::KERNEL, CAROL_ID)
+        who(InstanceId::KERNEL, probe::CAROL_STRICT_ID)
     );
 }
 
@@ -989,7 +1010,7 @@ fn the_denial_log_is_rate_limited_per_holder() {
 fn handlers_and_exports_act_as_their_own_instance() {
     let w = world();
     // alice's own code sends through her Ctx.
-    let mut out = [0u8; 8];
+    let mut out = [0u8; probe::ANSWER_LEN];
     let n = call(
         &w.cell,
         w.alice,
@@ -1008,14 +1029,16 @@ fn handlers_and_exports_act_as_their_own_instance() {
         &mut out,
     )
     .unwrap();
-    assert_eq!((n, out[0]), (5, probe::code::OK));
-    let tag = u32::from_le_bytes([out[1], out[2], out[3], out[4]]);
+    assert_eq!((n, out[0]), (probe::ANSWER_LEN, probe::code::OK));
+    let mut le = [0u8; 8];
+    le.copy_from_slice(&out[1..9]);
+    let tag = ReplyTag(u64::from_le_bytes(le));
     assert_eq!(dispatch(&w.cell, w.bob, MAX_INBOX), Ok(2));
     assert_eq!(dispatch(&w.cell, w.bob, MAX_INBOX), Ok(0));
     let mut g = w.cell.lock();
     let reply = pop(&mut g, w.alice).unwrap();
     assert_eq!(reply.from, who(w.bob, BOB_ID));
-    assert_eq!(reply.kind, Kind::Reply { reply_tag: tag });
+    assert_eq!(reply.kind, Kind::Reply { tag });
     assert_eq!(reply.payload.as_slice(), b"ack");
     drop(g);
     // carol's code holds nothing and is refused as carol.
@@ -1044,11 +1067,11 @@ fn kernel_calls_are_not_starved_by_a_full_inbox() {
             g.send_from(w.alice, w.a_bob, b"flood", 0).unwrap();
         }
     }
-    let mut out = [0u8; 8];
+    let mut out = [0u8; probe::ANSWER_LEN];
     let n = call(&w.cell, w.bob, "act", Args::granted(0).as_slice(), &mut out).unwrap();
     assert_eq!(
         (n, out[0]),
-        (5, probe::code::NONE),
+        (probe::ANSWER_LEN, probe::code::NONE),
         "bob was granted nothing"
     );
     assert_eq!(w.cell.lock().inbox_len(w.bob), Some(MAX_INBOX), "untouched");
@@ -1065,7 +1088,7 @@ fn ctx_operations_go_through_the_cell() {
     assert_eq!(ctx.granted(0), Some(w.a_bob));
     assert!(ctx.send(w.a_bob, b"x").is_ok());
     let tag = ctx.request(w.a_bob, b"y", 10).unwrap();
-    assert!(tag >= 1);
+    assert!(tag.0 >= 1);
     assert!(ctx
         .delegate(w.a_bob, w.a_carol, &delegation(&[Op::Send], 8, None))
         .is_ok());
@@ -1078,4 +1101,193 @@ fn ctx_operations_go_through_the_cell() {
     };
     assert_eq!(ghost.send(w.a_bob, b"x"), Err(BusError::Denied));
     assert_eq!(BusError::Busy.label(), "busy");
+}
+
+// ── Routing (PR-2b, A12): service → route → provider id → oldest instance ──
+
+/// bob and carol live, then alice, on `cell`.
+fn alice_under(cell: Cell) -> (Cell, InstanceId) {
+    instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    instantiate(&cell, &probe::CAROL_MANIFEST).unwrap();
+    let alice = instantiate(&cell, &probe::ALICE_MANIFEST).unwrap();
+    (cell, alice)
+}
+
+#[test]
+fn a_request_resolves_service_route_provider_and_oldest_instance() {
+    let cell = fresh();
+    let bob = instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    let _younger_bob = instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    instantiate(&cell, &probe::CAROL_MANIFEST).unwrap();
+    let alice = instantiate(&cell, &probe::ALICE_MANIFEST).unwrap();
+    let h = cell.lock();
+    let to_bob = h.granted(alice, 0).unwrap();
+    assert_eq!(
+        h.caps().get(slot(&h, alice), to_bob).unwrap().cap.target,
+        Target::Instance(bob),
+        "the oldest live instance of the routed provider"
+    );
+}
+
+#[test]
+fn an_unrouted_service_is_refused_as_no_route() {
+    // carol's code asking, optionally, for a service nothing routes.
+    static ASKS: [CapRequest; 1] = [CapRequest {
+        target: crate::cap::service_literal("sentinel.probe.nobody/1"),
+        ..probe::ALICE_ASKS_FOR_CAROL
+    }];
+    let m = honest(Manifest {
+        caps: &ASKS,
+        ..probe::CAROL_MANIFEST
+    });
+    let cell = fresh();
+    instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    let c = instantiate(&cell, &m).unwrap();
+    let h = cell.lock();
+    assert_eq!(h.cap_count(c), 0);
+    let r = last_deny(&h);
+    assert_eq!(r.holder, who(c, m.id));
+    assert_eq!((r.action, r.reason), (Action::Grant, DenyReason::NoRoute));
+}
+
+#[test]
+fn a_route_with_no_live_provider_is_refused_as_no_provider() {
+    let cell = fresh();
+    instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    let alice = instantiate(&cell, &probe::ALICE_MANIFEST).unwrap();
+    let h = cell.lock();
+    assert_eq!(h.granted(alice, 1), None, "carol is not running");
+    let r = last_deny(&h);
+    assert_eq!(r.holder, who(alice, ALICE_ID));
+    assert_eq!(r.reason, DenyReason::NoProvider);
+}
+
+#[test]
+fn a_route_to_a_provider_that_does_not_provide_the_service_is_not_honoured() {
+    // Misrouted: carol's service to bob, whose id-bound manifest provides
+    // only his own (threat T-ROUTE-1).
+    static MISROUTED: [Route; 2] = [
+        Route {
+            service: probe::BOB_SERVICE,
+            provider: BOB_ID,
+        },
+        Route {
+            service: probe::CAROL_SERVICE,
+            provider: BOB_ID,
+        },
+    ];
+    let (cell, alice) = alice_under(with_policy(&MISROUTED, probe::POLICY_RULES));
+    let h = cell.lock();
+    assert!(
+        h.granted(alice, 0).is_some(),
+        "bob's own service still routes"
+    );
+    assert_eq!(h.granted(alice, 1), None);
+    assert_eq!(h.cap_count(alice), 1);
+    let r = last_deny(&h);
+    assert_eq!(r.holder, who(alice, ALICE_ID));
+    assert_eq!(r.reason, DenyReason::NotProvided);
+}
+
+#[test]
+fn a_service_routed_twice_routes_nowhere() {
+    static TWICE: [Route; 3] = [
+        Route {
+            service: probe::BOB_SERVICE,
+            provider: BOB_ID,
+        },
+        Route {
+            service: probe::CAROL_SERVICE,
+            provider: CAROL_ID,
+        },
+        Route {
+            service: probe::CAROL_SERVICE,
+            provider: BOB_ID,
+        },
+    ];
+    let (cell, alice) = alice_under(with_policy(&TWICE, probe::POLICY_RULES));
+    let h = cell.lock();
+    assert_eq!(h.granted(alice, 1), None);
+    assert_eq!(last_deny(&h).reason, DenyReason::NoRoute);
+}
+
+#[test]
+fn a_service_the_holders_rules_do_not_name_is_refused_as_policy_refused() {
+    // Routed, provider live and providing — but alice's only rule is for bob.
+    static ONLY_BOB: [PolicyRule; 1] = [probe::POLICY_RULES[0]];
+    let (cell, alice) = alice_under(with_policy(probe::POLICY_ROUTES, &ONLY_BOB));
+    let h = cell.lock();
+    assert_eq!(h.granted(alice, 1), None);
+    let r = last_deny(&h);
+    assert_eq!(r.holder, who(alice, ALICE_ID));
+    assert_eq!(r.reason, DenyReason::PolicyRefused);
+}
+
+#[test]
+fn claiming_a_service_does_not_capture_its_route() {
+    // bob's code, claiming carol's service as well: another id, and the route
+    // names carol's id — so the squatter is never her service's provider.
+    static SQUAT: [crate::cap::ServiceName; 2] = [probe::BOB_SERVICE, probe::CAROL_SERVICE];
+    let squatter = honest(Manifest {
+        provides: &SQUAT,
+        ..probe::BOB_MANIFEST
+    });
+    assert_ne!(squatter.id, BOB_ID);
+    let cell = fresh();
+    instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    let sq = instantiate(&cell, &squatter).unwrap();
+    let alice = instantiate(&cell, &probe::ALICE_MANIFEST).unwrap();
+    let h = cell.lock();
+    assert_eq!(h.granted(alice, 1), None);
+    assert_eq!(last_deny(&h).reason, DenyReason::NoProvider);
+    let a = slot(&h, alice);
+    assert!(
+        (0..MAX_CAPS).all(|s| h
+            .caps()
+            .entry_at(a, s)
+            .is_none_or(|(e, _)| !e.cap.target.names(sq))),
+        "nothing alice holds reaches the squatter"
+    );
+}
+
+#[test]
+fn an_edited_manifest_is_refused_before_anything_runs() {
+    // alice's id with each declaration edit the boot proof makes.
+    static STRIPPED: [CapRequest; 2] = [
+        CapRequest {
+            need: CapNeed::Optional,
+            ..probe::ALICE_ASKS_FOR_BOB
+        },
+        probe::ALICE_ASKS_FOR_CAROL,
+    ];
+    static SWAPPED: [CapRequest; 2] = [probe::ALICE_ASKS_FOR_CAROL, probe::ALICE_ASKS_FOR_BOB];
+    static OP_ADDED: [CapRequest; 2] = [
+        probe::ALICE_ASKS_FOR_BOB,
+        CapRequest {
+            ops: OpSet::of(&[Op::Send, Op::Request]),
+            ..probe::ALICE_ASKS_FOR_CAROL
+        },
+    ];
+    static DROPPED: [CapRequest; 1] = [probe::ALICE_ASKS_FOR_BOB];
+    let cell = fresh();
+    instantiate(&cell, &probe::BOB_MANIFEST).unwrap();
+    instantiate(&cell, &probe::CAROL_MANIFEST).unwrap();
+    let before = {
+        let h = cell.lock();
+        (h.instance_count(), h.deny_totals().total)
+    };
+    for caps in [&STRIPPED[..], &SWAPPED[..], &OP_ADDED[..], &DROPPED[..]] {
+        let m = Manifest {
+            caps,
+            ..probe::ALICE_MANIFEST
+        };
+        assert_eq!(m.verify().err(), Some(InstantiateError::IdMismatch));
+        assert_eq!(instantiate(&cell, &m), Err(InstantiateError::IdMismatch));
+    }
+    let h = cell.lock();
+    assert_eq!(
+        (h.instance_count(), h.deny_totals().total),
+        before,
+        "no instance, and no grant was even planned"
+    );
 }
