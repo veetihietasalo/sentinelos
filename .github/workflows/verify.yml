@@ -67,14 +67,19 @@ jobs:
         run: "cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu ml::"
 
       # Component model (docs/specs/2026-09-18-component-model-design.md §15,
-      # "pure code first"): `hash::` (SHA-256 + framed ids) and `host::` (envelope
-      # codec, inbox ring, native runtime, the host itself) are small pure
-      # `no_std` suites — ~80 s under Miri locally. Same scoping rule as above.
-      - name: "cargo +nightly miri test -p kernel hash:: host::"
+      # "pure code first"): `hash::` (SHA-256 + framed ids), `host::` (envelope
+      # codec, inbox ring, native runtime, the host itself), and since PR-2
+      # `cap::` (capability tables, lattice, denial log) and `bus::` (attested
+      # send/request/reply/delegate/revoke on local host cells) are small pure
+      # `no_std` suites — 75 tests, ~73 s of test run under Miri locally (the
+      # cap property test drops to 200 steps under `cfg(miri)`, and the
+      # production-size 256-deep revocation chain — 19 s under Miri, safe code
+      # only — runs natively only). Same scoping rule as above.
+      - name: "cargo +nightly miri test -p kernel hash:: host:: cap:: bus::"
         working-directory: kernel
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
-        run: "cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu -- hash:: host::"
+        run: "cargo +nightly miri test -p kernel --lib --target x86_64-unknown-linux-gnu -- hash:: host:: cap:: bus::"
 
       # SentinelFS FS-1a (docs/specs/2026-09-18-sentinelfs-design.md §11): the
       # block layer (`blk::` — header/pointer codec, bitmaps, extents, the

@@ -22,6 +22,9 @@
 #                    #   interrupt handler can clobber an in-flight GEMM.
 #   make check-ata-callers # assert only kernel::blk::ata names hal::ata, so every
 #                    #   ATA command holds the IDE channel lock.
+#   make check-component-imports # scan the component modules: they may name
+#                    #   only bus::{Ctx, BusError, Delegation} — never the host
+#                    #   or the capability tables (threat T-NAT-1).
 #   make screenshot  # build ISO + capture a framebuffer PNG via QMP
 #
 # Requires: qemu-system-x86_64, xorriso, and kernel/limine (see README).
@@ -29,7 +32,7 @@
 HOST := $(shell rustc -vV | sed -n 's/^host: //p')
 XTASK := cargo run --manifest-path xtask/Cargo.toml --target $(HOST) --target-dir target/xtask --
 
-.PHONY: build run test test-kvm check-no-vector check-ata-callers screenshot boot-timing
+.PHONY: build run test test-kvm check-no-vector check-ata-callers check-component-imports screenshot boot-timing
 build:
 	$(XTASK) build
 run:
@@ -42,6 +45,9 @@ check-no-vector:
 	$(XTASK) check-no-vector
 check-ata-callers:
 	$(XTASK) check-ata-callers
+
+check-component-imports:
+	$(XTASK) check-component-imports
 screenshot:
 	$(XTASK) screenshot
 

@@ -21,6 +21,8 @@ extern crate alloc;
 
 pub mod app;
 pub mod blk;
+pub mod bus;
+pub mod cap;
 pub mod clock;
 pub mod fs;
 pub mod hash;
@@ -251,6 +253,21 @@ pub fn kmain() -> ! {
     // before the banner: it sits on the heap and the console only, touches no
     // hardware and no clock (zero time-dependent semantics, spec §19).
     host::prove_hello();
+
+    // Component model PR-2 boot proof (component-model design doc §14): the
+    // bus and capabilities on the kernel-wide host. Three first-party probe
+    // components act through their own code: alice holds a capability to bob,
+    // carol holds none. `from` is kernel-stamped on every delivery, carol is
+    // denied by default, and forged indices (never issued, another instance's,
+    // revoked, expired) are refused and logged, rate-limited. Expiry and reply
+    // timeouts tick off `clock::mono_ticks`, so this runs after `prove_mono`.
+    // Keep it ahead of SentinelFS's `sfs::prove_mount`, for two reasons. Its
+    // §18.4 measurement round-trips kmain against one short BSP task, which
+    // an always-runnable BSP task (`sfs-commit`) would dilute. And spawning
+    // that task allocates with kmain at IF = 0, which is allowed only while
+    // no other BSP task can be suspended inside the allocator — true before
+    // `sfs-commit` exists, not after (hal-tcb §5e as amended by FS-1a).
+    bus::proof::prove_caps();
 
     // SentinelFS FS-1a boot proof (docs/specs/2026-09-18-sentinelfs-design.md
     // §11): start the `sfs-commit` task — pinned to this core, the only code

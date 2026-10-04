@@ -8,8 +8,9 @@
 //! ```text
 //! off  len  field
 //!  0    1   WIRE_VERSION (= 1)
-//!  1    1   kind          0 = Event, 1 = Request, 2 = Reply
-//!  2    4   reply_tag     u32; MUST be 0 for Event (canonical form)
+//!  1    1   kind          0 = Event, 1 = Request, 2 = Reply, 3 = Grant
+//!  2    4   reply_tag     u32; MUST be 0 for Event (canonical form);
+//!                         for Grant, the granted CapIndex
 //!  6    8   from.instance u64
 //! 14   32   from.component (ComponentId)
 //! 46    8   to            u64 (InstanceId)
@@ -21,8 +22,10 @@
 //! [`decode`] is total (a `Result`, never a panic) and accepts exactly the
 //! canonical encodings, so `decode(encode(e)) == e` for every envelope and
 //! `encode(decode(b)) == b` for every accepted byte string. Both are proven
-//! bounded by Kani (`proofs`), and the boot proof drives a real request and
-//! reply through this codec via an inbox ring ([`super::Host::call`]).
+//! bounded by Kani (`proofs`). Every bus delivery is encoded into the
+//! recipient's inbox ring and decoded on dispatch (`crate::bus`), and the
+//! kernel's own calls round-trip request and reply through it
+//! (`crate::bus::call`); both boot proofs exercise both paths.
 //!
 //! Sizes are fixed on purpose: an inbox ring holds [`Wire`] values, so nothing
 //! grows and nothing allocates on the delivery path (spec §7, "nothing grows").
@@ -48,21 +51,17 @@ const OFF_TO: usize = 46;
 const OFF_CAP: usize = 54;
 const OFF_PAYLOAD_LEN: usize = 58;
 
-/// Index into the sender's capability table that authorised a send. PR-2
-/// gives it meaning; PR-1 only carries [`CapIndex::KERNEL`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct CapIndex(pub u32);
-
-impl CapIndex {
-    /// The kernel needs no capability to address an instance it hosts.
-    pub const KERNEL: CapIndex = CapIndex(0);
-}
+/// Index into the sender's capability table that authorised a send — defined
+/// with its meaning in `kernel::cap` (PR-2), carried verbatim on the wire.
+pub use crate::cap::CapIndex;
 
 /// Who sent an envelope — both the *which* (instance) and the *what*
 /// (component), stamped by the kernel (spec §7, amendment A2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Sender {
+    /// *Which* instance sent it.
     pub instance: InstanceId,
+    /// *What* sent it: the component id the host verified.
     pub component: ComponentId,
 }
 
@@ -75,23 +74,49 @@ impl Sender {
 }
 
 /// Message kind. `reply_tag` pairs a `Reply` with its `Request`.
+///
+/// On the bus (PR-2) the two ends see different tags, both chosen by the
+/// kernel: the responder's `Request { reply_tag }` is the [`CapIndex`] of the
+/// one-shot reply capability the host minted in **its** table for this request
+/// (it answers with `bus::Ctx::reply(CapIndex(reply_tag), …)`); the
+/// requester's `Reply { reply_tag }` is the correlation tag its own
+/// `bus::Ctx::request` returned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
+    /// One-way message.
     Event,
-    Request { reply_tag: u32 },
-    Reply { reply_tag: u32 },
+    /// A request expecting at most one answer.
+    Request {
+        /// See the type docs.
+        reply_tag: u32,
+    },
+    /// The answer to a request.
+    Reply {
+        /// See the type docs.
+        reply_tag: u32,
+    },
+    /// A delegation notice: the sender delegated a capability to the
+    /// recipient, now installed at `granted` in the recipient's own table.
+    /// The kernel writes it, so the recipient learns the index from the
+    /// kernel, never from the delegator's payload (no confused deputy).
+    Grant {
+        /// The new capability's index in the recipient's table.
+        granted: CapIndex,
+    },
 }
 
 impl Kind {
     const EVENT: u8 = 0;
     const REQUEST: u8 = 1;
     const REPLY: u8 = 2;
+    const GRANT: u8 = 3;
 
     fn to_wire(self) -> (u8, u32) {
         match self {
             Kind::Event => (Self::EVENT, 0),
             Kind::Request { reply_tag } => (Self::REQUEST, reply_tag),
             Kind::Reply { reply_tag } => (Self::REPLY, reply_tag),
+            Kind::Grant { granted } => (Self::GRANT, granted.0),
         }
     }
 
@@ -101,6 +126,9 @@ impl Kind {
             (Self::EVENT, _) => Err(DecodeError::Kind),
             (Self::REQUEST, tag) => Ok(Kind::Request { reply_tag: tag }),
             (Self::REPLY, tag) => Ok(Kind::Reply { reply_tag: tag }),
+            (Self::GRANT, idx) => Ok(Kind::Grant {
+                granted: CapIndex(idx),
+            }),
             _ => Err(DecodeError::Kind),
         }
     }
@@ -167,7 +195,9 @@ pub struct Envelope {
     pub to: InstanceId,
     /// The sender's capability that authorised this send.
     pub cap: CapIndex,
+    /// Event, request, reply, or delegation notice.
     pub kind: Kind,
+    /// The message body (at most [`MAX_PAYLOAD`] bytes).
     pub payload: Payload,
 }
 
@@ -339,6 +369,9 @@ mod tests {
                 reply_tag: 0xDEAD_BEEF,
             },
             Kind::Reply { reply_tag: 1 },
+            Kind::Grant {
+                granted: CapIndex(0x0102_0304),
+            },
         ] {
             let env = sample(kind, b"hello");
             let mut buf = [0u8; MAX_ENVELOPE];
@@ -412,12 +445,15 @@ mod proofs {
     fn envelope_codec_round_trips_bounded() {
         const MAX: usize = 4;
         let code: u8 = kani::any();
-        kani::assume(code <= 2);
+        kani::assume(code <= 3);
         let reply_tag: u32 = kani::any();
         let kind = match code {
             0 => Kind::Event,
             1 => Kind::Request { reply_tag },
-            _ => Kind::Reply { reply_tag },
+            2 => Kind::Reply { reply_tag },
+            _ => Kind::Grant {
+                granted: CapIndex(reply_tag),
+            },
         };
         let len: usize = kani::any();
         kani::assume(len <= MAX);

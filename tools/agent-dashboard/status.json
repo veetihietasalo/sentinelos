@@ -1,6 +1,6 @@
 {
   "project": "SentinelOS",
-  "updated": "2026-09-18",
+  "updated": "2026-10-03",
   "pipeline": [
     "spec",
     "architect",
@@ -16,7 +16,7 @@
       "role": "Subsystem design & framekernel decomposition",
       "model": "opus",
       "status": "done",
-      "task": "SentinelFS spec review (architect seat): layering ok, staging + \u00a77 hash coverage objections",
+      "task": "T-MAN-1: bind declarations naming services (A12, PR-2b); CapIndex u64 (A13, PR-2b)",
       "history": [
         {
           "ts": "2026-09-18T16:27:47",
@@ -41,6 +41,30 @@
           "kind": "status",
           "status": "done",
           "task": "SentinelFS spec review (architect seat): layering ok, staging + \u00a77 hash coverage objections"
+        },
+        {
+          "ts": "2026-10-03T16:46:37",
+          "kind": "status",
+          "status": "working",
+          "task": "T-MAN-1: bind manifest declarations into ComponentId? + CapIndex generation exhaustion"
+        },
+        {
+          "ts": "2026-10-03T16:46:51",
+          "kind": "status",
+          "status": "working",
+          "task": "T-MAN-1 identity verdict + CapIndex generation-exhaustion design (PR-2 fix round)"
+        },
+        {
+          "ts": "2026-10-03T17:04:53",
+          "kind": "status",
+          "status": "done",
+          "task": "T-MAN-1: defer to PR-2b (before PR-3) with service-named v2 framing; CapIndex: widen to u64 (gen:48|table:8|slot:8) in PR-2b; verdict + amendment text handed back"
+        },
+        {
+          "ts": "2026-10-03T17:22:12",
+          "kind": "status",
+          "status": "done",
+          "task": "T-MAN-1: bind declarations naming services (A12, PR-2b); CapIndex u64 (A13, PR-2b)"
         }
       ]
     },
@@ -56,7 +80,21 @@
       "role": "Safe-Rust kernel implementation",
       "model": "sonnet",
       "status": "done",
-      "task": "Exception handlers (#BP/#PF/#DF/#GP) registered; init wired into kmain"
+      "task": "SentinelFS FS-1a: PR #38 approved (2 review rounds), CI green",
+      "history": [
+        {
+          "ts": "2026-10-03T12:18:31",
+          "kind": "status",
+          "status": "working",
+          "task": "SentinelFS FS-1a: blk + verified cache + superblocks + sfs-commit (cap lattice deferred to FS-1c)"
+        },
+        {
+          "ts": "2026-10-03T16:07:37",
+          "kind": "status",
+          "status": "done",
+          "task": "SentinelFS FS-1a: PR #38 approved (2 review rounds), CI green"
+        }
+      ]
     },
     {
       "name": "verification-engineer",
@@ -109,8 +147,8 @@
       "name": "kernel-reviewer",
       "role": "Adversarial review / human-gate",
       "model": "opus",
-      "status": "done",
-      "task": "SentinelFS design review: 6 blocking items (hal row miscount, extent hash granularity, mid-mutation commit, lock hold time)",
+      "status": "working",
+      "task": "Re-review component PR-2 round-1 fixes",
       "history": [
         {
           "ts": "2026-09-18T16:27:57",
@@ -135,6 +173,48 @@
           "kind": "status",
           "status": "done",
           "task": "SentinelFS design review: 6 blocking items (hal row miscount, extent hash granularity, mid-mutation commit, lock hold time)"
+        },
+        {
+          "ts": "2026-10-03T13:37:14",
+          "kind": "status",
+          "status": "working",
+          "task": "Adversarial review of SentinelFS FS-1a (c75f2cd)"
+        },
+        {
+          "ts": "2026-10-03T14:02:18",
+          "kind": "status",
+          "status": "done",
+          "task": "FS-1a review: BLOCKED on 1 CI item (cached disk image); code approval-quality, notes filed"
+        },
+        {
+          "ts": "2026-10-03T15:05:43",
+          "kind": "status",
+          "status": "working",
+          "task": "Re-review FS-1a round 2 (d6ee131 + 08edb05)"
+        },
+        {
+          "ts": "2026-10-03T15:18:48",
+          "kind": "status",
+          "status": "done",
+          "task": "FS-1a round 2: APPROVED WITH NOTES (fix no-op cache exclusions before leaving draft)"
+        },
+        {
+          "ts": "2026-10-03T16:07:05",
+          "kind": "status",
+          "status": "working",
+          "task": "Adversarial review of component-model PR-2 (bus + capabilities)"
+        },
+        {
+          "ts": "2026-10-03T16:43:00",
+          "kind": "status",
+          "status": "done",
+          "task": "PR-2 review: BLOCKED (3 small fixes: reply-right lockout, FS-1a pong wait, prod-size sweep test)"
+        },
+        {
+          "ts": "2026-10-03T17:22:12",
+          "kind": "status",
+          "status": "working",
+          "task": "Re-review component PR-2 round-1 fixes"
         }
       ]
     },
@@ -164,7 +244,7 @@
       "role": "sentinel-core integration, capabilities, sandbox",
       "model": "opus",
       "status": "done",
-      "task": "Security-seat review of SentinelFS design (attestation record, threat-model gaps, encryption placement)",
+      "task": "PR-2 review round 1 fixed (5f272dc, ab4886f); awaiting re-review",
       "history": [
         {
           "ts": "2026-09-18T16:28:41",
@@ -189,6 +269,30 @@
           "kind": "status",
           "status": "done",
           "task": "Security-seat review of SentinelFS design (attestation record, threat-model gaps, encryption placement)"
+        },
+        {
+          "ts": "2026-10-03T12:18:31",
+          "kind": "status",
+          "status": "working",
+          "task": "component PR-2: kernel::cap + kernel::bus, attested from, deny by default"
+        },
+        {
+          "ts": "2026-10-03T16:07:38",
+          "kind": "status",
+          "status": "done",
+          "task": "component PR-2: bus + capabilities committed (e130631), PR #37 under review"
+        },
+        {
+          "ts": "2026-10-03T16:46:37",
+          "kind": "status",
+          "status": "working",
+          "task": "PR-2 review round 1 fixes: silent-responder lockout, pong exit flag, full-slab sweep test, T-NAT-1 guard"
+        },
+        {
+          "ts": "2026-10-03T17:22:12",
+          "kind": "status",
+          "status": "done",
+          "task": "PR-2 review round 1 fixed (5f272dc, ab4886f); awaiting re-review"
         }
       ]
     },
@@ -214,5 +318,5 @@
       "task": "\u2014"
     }
   ],
-  "updatedAt": "2026-09-18T17:25:17"
+  "updatedAt": "2026-10-03T17:22:12"
 }
