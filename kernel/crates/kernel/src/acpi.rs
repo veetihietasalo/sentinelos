@@ -573,6 +573,25 @@ pub fn parse_madt_body(table: &[u8]) -> Result<MadtInfo, AcpiError> {
     let mut info = MadtInfo::EMPTY;
     info.lapic_addr = read_u32(table, SDT_HEADER_LEN).ok_or(AcpiError::Truncated)?;
     info.flags = read_u32(table, SDT_HEADER_LEN + 4).ok_or(AcpiError::Truncated)?;
+    for_each_entry(table, |entry| decode_entry(entry, &mut info))?;
+    Ok(info)
+}
+
+/// Walk the interrupt-controller structures of a sized MADT, handing each one
+/// (exactly its declared bytes, ≥ 2 long) to `f` in table order. On `Ok` the
+/// structures exactly tile `[MADT_ENTRIES_OFFSET, table.len())`; a structure
+/// shorter than 2 bytes is [`AcpiError::Malformed`], one running past the
+/// table (or a lone trailing byte) [`AcpiError::Truncated`], and `f`'s first
+/// error stops the walk. Terminates within `len / 2` iterations: each consumes
+/// ≥ 2 bytes. Kani: `madt_walk_is_total_and_tiles`.
+///
+/// # Errors
+///
+/// As above.
+pub fn for_each_entry(
+    table: &[u8],
+    mut f: impl FnMut(&[u8]) -> Result<(), AcpiError>,
+) -> Result<(), AcpiError> {
     let mut offset = MADT_ENTRIES_OFFSET;
     while offset < table.len() {
         let header = table.get(offset..offset + 2).ok_or(AcpiError::Truncated)?;
@@ -582,10 +601,10 @@ pub fn parse_madt_body(table: &[u8]) -> Result<MadtInfo, AcpiError> {
         }
         let end = offset.checked_add(entry_len).ok_or(AcpiError::Truncated)?;
         let entry = table.get(offset..end).ok_or(AcpiError::Truncated)?;
-        decode_entry(entry, &mut info)?;
+        f(entry)?;
         offset = end;
     }
-    Ok(info)
+    Ok(())
 }
 
 /// Parse a complete MADT: validate the SDT (signature, length, checksum) and
@@ -1150,21 +1169,64 @@ pub(crate) mod tests {
 mod proofs {
     use super::*;
 
-    /// `parse_madt_body` is total over **every** 56-byte buffer and every
-    /// declared length ≤ 56 (so every prefix of every structure sequence fits):
-    /// it returns without panicking, and an `Ok` never reports more entries
-    /// than the fixed arrays hold. 12 bytes of structures ⇒ ≤ 6 iterations.
+    /// The structure walk is total over every 56-byte buffer and every length
+    /// ≤ 56, never hands out a structure shorter than 2 bytes, and on `Ok` the
+    /// structures handed out exactly tile `[44, len)` — contiguous, in order,
+    /// nothing skipped, nothing past the end. With [`one_entry_decode_is_total_and_exact`]
+    /// (each structure decodes totally) and [`push_respects_capacity`] (no
+    /// array overflows) this composes into "`parse_madt_body` is total and
+    /// bounded" without model-checking the decoder inside the loop.
     #[kani::proof]
     #[kani::unwind(8)]
-    fn madt_body_decode_is_total_and_bounded() {
+    fn madt_walk_is_total_and_tiles() {
         let buf: [u8; 56] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= buf.len());
-        if let Ok(m) = parse_madt_body(&buf[..len]) {
-            assert!(len >= MADT_ENTRIES_OFFSET);
-            assert!(usize::from(m.ioapic_count) <= MAX_IOAPICS);
-            assert!(usize::from(m.override_count) <= MAX_OVERRIDES);
-            assert!(m.cpus_seen as usize <= (len - MADT_ENTRIES_OFFSET) / 8);
+        let table = &buf[..len];
+        let mut next = MADT_ENTRIES_OFFSET;
+        let mut ok_shape = true;
+        let r = for_each_entry(table, |e| {
+            assert!(e.len() >= 2);
+            // Each entry starts where the previous one ended.
+            let start = e.as_ptr() as usize - table.as_ptr() as usize;
+            ok_shape &= start == next;
+            next = start + e.len();
+            Ok(())
+        });
+        if r.is_ok() {
+            assert!(ok_shape);
+            assert!(next == len.max(MADT_ENTRIES_OFFSET));
+        }
+    }
+
+    /// `push` never writes past a fixed array and fails exactly at capacity.
+    #[kani::proof]
+    fn push_respects_capacity() {
+        let mut arr = [0u8; 4];
+        let mut count: u8 = kani::any();
+        kani::assume(count <= 5);
+        let before = count;
+        let r = push(&mut arr, &mut count, 7);
+        if before < 4 {
+            assert!(r.is_ok());
+            assert_eq!(count, before + 1);
+            assert_eq!(arr[usize::from(before)], 7);
+        } else {
+            assert_eq!(r, Err(AcpiError::Capacity));
+            assert_eq!(count, before);
+        }
+    }
+
+    /// Composed smoke check: the real `parse_madt_body` — header reads, walk
+    /// and decoder together — on any 46-byte buffer (one structure slot)
+    /// returns without panicking. 48 bytes measured 68 s, over the 60 s rule;
+    /// the walk and decode properties are carried by the harnesses above.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn madt_body_smoke_46() {
+        let buf: [u8; 46] = kani::any();
+        if let Ok(m) = parse_madt_body(&buf) {
+            assert!(m.ioapic_count == 0 && m.cpus_seen == 0);
         }
     }
 
