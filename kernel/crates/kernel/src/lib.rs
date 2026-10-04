@@ -19,6 +19,7 @@
 // types available to the safe kernel logic.
 extern crate alloc;
 
+pub mod acpi;
 pub mod app;
 pub mod blk;
 pub mod bus;
