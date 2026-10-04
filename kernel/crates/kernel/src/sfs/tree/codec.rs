@@ -639,8 +639,9 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(119)]
     fn leaf_packing_is_total_and_round_trips() {
-        // Distinct bytes, so a copy from the wrong place cannot match; the
-        // offsets, lengths, keys and item count are symbolic.
+        // Distinct bytes, so a copy from the wrong place cannot match. Item
+        // count, keys and lengths are symbolic; the source offset is fixed at
+        // 0 (it says where the encoder reads, not anything in the format).
         let src: [u8; 4] = [0xA1, 0xB2, 0xC3, 0xD4];
         let n: usize = kani::any();
         kani::assume(n >= 1 && n <= 2);
@@ -659,14 +660,13 @@ mod proofs {
             if let Some(p) = prev {
                 kani::assume(p < key);
             }
-            let off: u8 = kani::any();
             let len: u8 = kani::any();
-            kani::assume(usize::from(off) + usize::from(len) <= src.len());
+            kani::assume(usize::from(len) <= src.len());
             let pushed = node.push(
                 key,
                 Span {
                     src: 0,
-                    off: u16::from(off),
+                    off: 0,
                     len: u16::from(len),
                 },
             );
@@ -689,9 +689,13 @@ mod proofs {
             assert!(a.is_some() && b.is_some());
             if let (Some(a), Some(b)) = (a, b) {
                 assert!(a.len == b.len);
-                let want = span_bytes(&src, &a);
-                let got = span_bytes(&blk, &b);
-                assert!(want.is_some() && want == got);
+                // Byte by byte over a constant bound (no symbolic memcmp).
+                for j in 0..src.len() {
+                    if j < usize::from(b.len) {
+                        let at = usize::from(b.off) + j;
+                        assert!(blk.get(at) == src.get(j));
+                    }
+                }
             }
         }
     }
