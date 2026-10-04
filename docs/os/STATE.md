@@ -74,7 +74,8 @@ changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + 
   (`Allocator::check_ops`), then applied — refusals change nothing, ≤ 13 dirty blocks per
   op asserted (worst 9). `sfs::scrub` hashes every reachable block and checks structure and
   allocation; damage → read-only, objects named. `hal::ata` flush split (row A2,
-  invariant 16; hal review owed). Host: crash-point property test (2 744 crash points,
+  invariant 16) and time-bounded ATA waits (TSC deadline, `hal::cpu::rdtsc` row C16, SRST
+  channel reset after a timeout — the FS-1c CI flake); hal review owed. Host: crash-point property test (2 744 crash points,
   ddmin shrinker), replay/order determinism, counting-allocator heap cap (`test-alloc`
   crate, 435 636 B on 16 MiB and 1 GiB), threaded race model (found and fixed a stale-miss
   bug: misses carry a commit epoch). `make test` adds a QEMU torn-commit stage (test-control

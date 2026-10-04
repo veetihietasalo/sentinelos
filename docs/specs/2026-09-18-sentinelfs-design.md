@@ -625,11 +625,20 @@ FS-1 splits in two, and attestation waits for the identity spec.
   ~10 s of CI.
 - *`flush` on ATA, now.* `hal::ata::write_sectors` is unflushed and `flush()` waits for BSY
   before `FLUSH CACHE` (row A2 amended, invariant 16); `AtaDevice::flush` is the real barrier
-  and the toy `kernel::fs` flushes once per save through `blk::ata`.
-- *Kani (A19).* `Node<4>` split and merge, node-decode totality and leaf-packing totality over a
-  122-byte block; times in the PR. A `Node<6>` harness was not attempted: `Node<4>` split is
-  already the slowest kernel harness (see the PR's table), so the real fan-out bound is not
-  earned yet (§15 "minds change on").
+  and the toy `kernel::fs` flushes once per save through `blk::ata`. Status waits end at a TSC
+  deadline (not a count of reads, which QEMU's asynchronous completion under host write
+  pressure outlasted), and a timed-out command resets the channel before `Timeout` returns.
+- *Kani (A19), each measured alone.* `Node<4>`: split occupancy/order/separator 37.3 s, split
+  key-set preservation 17.7 s, append preservation 24.7 s, merge 44.0 s, re-cut 39.3 s / 41.2 s
+  (left / right underflow); codec over shrunken blocks: leaf decode totality 7.0 s, internal
+  decode totality 18.8 s, one-item leaf packing round trip 45.8 s. Getting there changed code,
+  not only harnesses: `Node` stores entries in inline arrays and every node and codec loop runs
+  over a constant bound (the capacity, or the block length) and stops early at the count — the
+  first versions sat in CBMC for minutes or ran out of 16 GB on symbolic-length moves. **Not
+  gating:** the two-item packing harness verifies but takes ~195 s; it is behind
+  `cfg(kani_slow)` and the host round-trip tests cover multi-item packing. `Node<6>` was not
+  attempted (the `Node<4>` harnesses already needed splitting to fit), so the real fan-out
+  bound is not earned yet (§15 "minds change on").
 - *Not done here.* A27 (fall back to the older slot when the newer tree is damaged) stays open:
   the scrub now names the damage and goes read-only, but mount still takes the newer valid slot.
   A30 is bounded, not measured: an operation hashes nothing under the lock; a seal hashes its

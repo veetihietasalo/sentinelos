@@ -814,7 +814,18 @@ walk all live in `kernel::fs` under `#![forbid(unsafe_code)]`, **not** the TCB.
 > `persistence PROVEN` line now depends on its explicit `flush()`), and the
 > torn-commit stage (QEMU `cache=writeback`, the kernel halted after the
 > k-th block write of a commit, QEMU SIGKILLed, the next boot mounts
-> generation N−1 intact).
+> generation N−1 intact). As built: `[sfs] torn-commit: cut-after=2
+> recovered-gen=3 data-intact=yes ok` with exactly the 2 cut blocks changed on
+> disk and both superblock slots untouched.
+>
+> **FS-1b time-bounded waits (rows A2 and C16).** The status waits end at a TSC
+> deadline instead of after 100 000 reads, and a timed-out command resets the
+> channel (SRST) before returning. Evidence: host tests of the pure wait loop
+> (`hal::ata::wait_tests`, also under Miri), Kani `poll_until_is_a_deadline`
+> (0.4 s: a timeout is always a passed deadline or the backstop, a ready drive is
+> never reported as one), and `make test` green, also under concurrent host
+> `dd … conv=fdatasync` load — the condition that made the read-count bound fail
+> in FS-1c's CI (one run here; the reported rate was 1/18 on main).
 
 ## 8. `hal::cpuid` — CPU identification (hardware report)
 
