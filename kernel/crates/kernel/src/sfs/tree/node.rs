@@ -623,46 +623,61 @@ mod proofs {
         }
     }
 
-    /// Merge / rebalance: an adjacent pair where one side underflows ends
-    /// either merged into one node that fits, or re-cut into two non-empty,
-    /// non-underflowing, fitting, sorted halves separated by the right one's
-    /// first key — and no entry is lost or invented (counts; the entries
-    /// themselves by [`node4_append_preserves_entries_in_order`] and
-    /// [`node4_split_preserves_entries`], since rebalance is
-    /// append-then-split).
-    #[kani::proof]
-    #[kani::unwind(6)]
-    fn node4_merge_is_sorted_balanced_and_preserving() {
+    /// An adjacent pair where one side underflows: both fit, keys ordered
+    /// across them. `fits`: whether the pair's total weight fits one node.
+    fn any_underflowing_pair(fits: bool) -> (Node<W, 4>, Node<W, 4>, usize, usize) {
         let nl: usize = kani::any();
         let nr: usize = kani::any();
         // Each bounded first, so the sum cannot overflow.
         kani::assume(nl >= 1 && nl <= 3 && nr >= 1 && nr <= 3);
         kani::assume(nl + nr <= 4);
-        let mut l = any_node(nl);
-        let mut r = any_node(nr);
+        let l = any_node(nl);
+        let r = any_node(nr);
         kani::assume(l.key(nl - 1) < r.key(0));
         kani::assume(!l.overflows(LIMIT) && !r.overflows(LIMIT));
         kani::assume(l.underflows(LIMIT) || r.underflows(LIMIT));
+        kani::assume((l.weight() + r.weight() <= u64::from(LIMIT)) == fits);
+        (l, r, nl, nr)
+    }
+
+    /// Merge: a pair that fits one node merges into the left one — every
+    /// entry there (count, both ends), still sorted and fitting, the right
+    /// one empty. (Entry-for-entry preservation:
+    /// [`node4_append_preserves_entries_in_order`]; a merge is an append.)
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn node4_merge_is_sorted_balanced_and_preserving() {
+        let (mut l, mut r, nl, nr) = any_underflowing_pair(true);
+        let (first, last) = (l.key(0), r.key(nr - 1));
+        let out = Node::rebalance(&mut l, &mut r, LIMIT);
+        assert!(out == Ok(Rebalance::Merged));
+        assert!(r.is_empty() && l.len() == nl + nr);
+        assert!(!l.overflows(LIMIT) && l.is_sorted());
+        assert!(l.key(0) == first && l.key(nl + nr - 1) == last);
+    }
+
+    /// Recut: a pair too heavy for one node is re-cut at half into two
+    /// non-empty, sorted, fitting, non-underflowing halves separated by the
+    /// right one's first key, keeping the count, both ends and the total
+    /// weight. (Entry-for-entry preservation: append then split, both proven
+    /// above.)
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn node4_recut_is_sorted_balanced_and_preserving() {
+        let (mut l, mut r, nl, nr) = any_underflowing_pair(false);
         let (first, last) = (l.key(0), r.key(nr - 1));
         let total = l.weight() + r.weight();
-        match Node::rebalance(&mut l, &mut r, LIMIT) {
-            Ok(Rebalance::Merged) => {
-                assert!(r.is_empty() && l.len() == nl + nr);
-                assert!(!l.overflows(LIMIT));
-                assert!(l.key(0) == first && l.key(nl + nr - 1) == last);
-            }
-            Ok(Rebalance::Split(sep)) => {
-                assert!(!l.is_empty() && !r.is_empty());
-                assert!(l.len() + r.len() == nl + nr);
-                assert!(!l.overflows(LIMIT) && !r.overflows(LIMIT));
-                assert!(!l.underflows(LIMIT) && !r.underflows(LIMIT));
-                assert!(r.key(0) == Some(sep));
-                assert!(l.key(l.len() - 1).is_some_and(|k| k < sep));
-                assert!(l.key(0) == first && r.key(r.len() - 1) == last);
-            }
-            Err(_) => panic!("a fitting pair never fails to rebalance at CAP 4"),
-        }
-        assert!(l.weight() + r.weight() == total);
+        let Ok(Rebalance::Split(sep)) = Node::rebalance(&mut l, &mut r, LIMIT) else {
+            panic!("an overflowing pair is re-cut");
+        };
+        assert!(!l.is_empty() && !r.is_empty());
+        assert!(l.len() + r.len() == nl + nr);
+        assert!(!l.overflows(LIMIT) && !r.overflows(LIMIT));
+        assert!(!l.underflows(LIMIT) && !r.underflows(LIMIT));
         assert!(l.is_sorted() && r.is_sorted());
+        assert!(r.key(0) == Some(sep));
+        assert!(l.key(l.len() - 1).is_some_and(|k| k < sep));
+        assert!(l.key(0) == first && r.key(r.len() - 1) == last);
+        assert!(l.weight() + r.weight() == total);
     }
 }
