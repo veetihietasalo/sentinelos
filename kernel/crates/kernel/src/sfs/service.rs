@@ -29,8 +29,10 @@
 //! passed since the last one. Between commits it is **parked** (spec §15
 //! A25): with a dirty transaction until that pacing deadline
 //! (`sched::park_until`), otherwise until something unparks it
-//! (`sched::park`). [`request_commit`] unparks it, and so must anything that
-//! makes the volume dirty ([`kick`]); the decision and the park are race-free
+//! (`sched::park`). [`request_commit`] unparks it, and so does every
+//! [`with_sfs`] section that turns the volume from clean to dirty — after the
+//! lock is released, structurally, so no mutation can forget it ([`kick`]);
+//! the decision and the park are race-free
 //! because an unpark that lands between them stores the task's wake permit,
 //! so the park returns at once and the loop decides again. A parked task is
 //! off its core's ready ring, so the BSP really idles. The deadline is checked
@@ -51,7 +53,7 @@ use super::volume::{
 use crate::blk::ata::{AtaDevice, SFS_BASE_LBA};
 use crate::blk::{BlkError, BlockDevice};
 use crate::clock;
-use crate::sched::{SpawnError, TaskId};
+use crate::sched::{SpawnError, TaskId, TaskIdCell};
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, Ordering};
 use hal::sync::SpinMutex;
@@ -115,8 +117,6 @@ pub struct Sfs {
     served: u64,
     last: Option<Result<CommitInfo, CommitError>>,
     last_commit_tick: u64,
-    /// The `sfs-commit` task, recorded by the task itself before it mounts.
-    commit_task: Option<TaskId>,
 }
 
 /// What the commit task does next (see [`Sfs::next_step`]).
@@ -143,7 +143,6 @@ impl Sfs {
             served: 0,
             last: None,
             last_commit_tick: 0,
-            commit_task: None,
         }
     }
 
@@ -178,6 +177,11 @@ impl Sfs {
             || (v.is_dirty() && now >= self.last_commit_tick.saturating_add(COMMIT_INTERVAL))
     }
 
+    /// Whether a mounted volume has uncommitted changes.
+    fn is_dirty(&self) -> bool {
+        self.volume.as_ref().is_some_and(|v| v.is_dirty())
+    }
+
     /// The commit task's decision at `now`: commit if [`Sfs::commit_due`];
     /// else, with a dirty writable volume, park until its pacing deadline;
     /// else park until unparked.
@@ -198,18 +202,36 @@ impl Sfs {
 static SFS: SpinMutex<Sfs> = SpinMutex::new(Sfs::new());
 /// Set once the task has been spawned.
 static STARTED: AtomicBool = AtomicBool::new(false);
+/// The `sfs-commit` task's id, recorded by the task itself before it mounts.
+/// Lock-free, so [`kick`] takes no lock.
+static COMMIT_TASK: TaskIdCell = TaskIdCell::new();
 
 /// Run `f` on the filesystem state with the lock held and preemption
 /// disabled on this core. `f` must be bounded in-memory work: no device I/O,
 /// no waiting, no allocation.
+///
+/// If `f` turned the volume from clean to dirty, the commit task is
+/// [`kick`]ed once the lock is released and preemption is back on, so it
+/// arms its pacing deadline: a mutation cannot forget to tell it.
 pub fn with_sfs<R>(f: impl FnOnce(&mut Sfs) -> R) -> R {
     crate::sched::preempt_disable();
-    let r = {
+    let (r, became_dirty) = {
         let mut guard = SFS.lock();
-        f(&mut guard)
+        run_noting_dirty(&mut guard, f)
     };
     crate::sched::preempt_enable();
+    if became_dirty {
+        kick();
+    }
     r
+}
+
+/// Run `f` on `s`; also report whether it turned the volume from clean to
+/// dirty (the pure part of [`with_sfs`]).
+fn run_noting_dirty<R>(s: &mut Sfs, f: impl FnOnce(&mut Sfs) -> R) -> (R, bool) {
+    let before = s.is_dirty();
+    let r = f(s);
+    (r, !before && s.is_dirty())
 }
 
 /// Start the `sfs-commit` task, pinned to the BSP (`spawn_on(0, …)`, with a
@@ -235,17 +257,20 @@ pub fn start() -> Result<(), SpawnError> {
 }
 
 /// The `sfs-commit` task's id, once it has started (`None` before, and
-/// whenever [`start`] was never called).
+/// whenever [`start`] was never called). Lock-free.
 #[must_use]
 pub fn commit_task_id() -> Option<TaskId> {
-    with_sfs(|s| s.commit_task)
+    COMMIT_TASK.get()
 }
 
-/// Wake the commit task so it re-decides: anything that makes the volume
-/// dirty must call this after releasing the `Sfs` lock (FS-1b's mutations),
-/// or a task parked without a deadline would not arm its pacing deadline
-/// until the next request. Harmless when it is already awake: the unpark
-/// then only stores its permit.
+/// Wake the commit task so it re-decides (arms its pacing deadline, or
+/// serves a request). [`with_sfs`] calls it whenever a section dirtied a
+/// clean volume, and [`request_commit`] after posting a request. Harmless
+/// when the task is awake: the unpark then only stores its permit.
+///
+/// Takes no lock — an atomic load and `sched::unpark` — so it is safe from
+/// any context, including inside a [`with_sfs`] section and from IRQ
+/// context.
 pub fn kick() {
     if let Some(id) = commit_task_id() {
         let _outcome = crate::sched::unpark(id);
@@ -311,8 +336,7 @@ pub fn mount_or_format<D: BlockDevice>(
 
 /// The `sfs-commit` task body. The only code that touches the device.
 fn commit_task() {
-    let me = crate::sched::current_id();
-    with_sfs(|s| s.commit_task = Some(me));
+    COMMIT_TASK.set(crate::sched::current_id());
     let mut dev = match AtaDevice::open(SFS_BASE_LBA) {
         Ok(d) => d,
         Err(e) => {
@@ -524,7 +548,7 @@ pub fn prove_mount() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Next, Sfs, COMMIT_INTERVAL};
+    use super::{run_noting_dirty, Next, Sfs, COMMIT_INTERVAL};
     use crate::blk::allocator::AllocClass;
     use crate::blk::mem::MemDevice;
     use crate::sfs::volume::{format, FormatParams, Volume, Workspace};
@@ -560,5 +584,29 @@ mod tests {
         assert_eq!(s.next_step(100), Next::ParkUntil(due));
         assert_eq!(s.next_step(due - 1), Next::ParkUntil(due));
         assert_eq!(s.next_step(due), Next::Commit);
+    }
+
+    /// Every `with_sfs` section reports a clean → dirty transition (so it can
+    /// kick the commit task) exactly when it happens: never with no volume,
+    /// never for a read, never for a second change to an already dirty one.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_section_that_dirties_a_clean_volume_is_noticed() {
+        let mut s = Sfs::new();
+        assert_eq!(run_noting_dirty(&mut s, |_| ()), ((), false), "no volume");
+
+        let mut d = MemDevice::new(256);
+        let mut ws = Workspace::new();
+        format(&mut d, &mut ws, &FormatParams::from_seed(b"kick", 1)).unwrap();
+        s.volume = Some(Volume::mount(&mut d, &mut ws).unwrap());
+        let alloc = |s: &mut Sfs| {
+            s.volume
+                .as_mut()
+                .map(|v| v.alloc(AllocClass::Normal, None).is_ok())
+        };
+        assert_eq!(run_noting_dirty(&mut s, |s| s.is_dirty()), (false, false));
+        assert_eq!(run_noting_dirty(&mut s, alloc), (Some(true), true));
+        assert_eq!(run_noting_dirty(&mut s, alloc), (Some(true), false));
+        assert_eq!(run_noting_dirty(&mut s, |s| s.is_dirty()), (true, false));
     }
 }

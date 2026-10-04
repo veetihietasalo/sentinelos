@@ -13,12 +13,19 @@
 //!   ids are never reused within a boot (`NEXT_TASK_ID` only counts up), so a
 //!   stale id can never wake a later task.
 //!
-//! Callers re-check their own condition in a loop around `park`: a park may
-//! return without an unpark in exactly two refused cases — the caller is a
-//! core's idle task (the fallback that must always be runnable), or it has
-//! preemption disabled (blocking would hand the core on with the critical
-//! section still open). Both return [`Woken::Unparked`] at once and change
-//! nothing.
+//! Callers re-check their own condition in a loop around `park`.
+//!
+//! # Refused parks
+//!
+//! A park is **refused** — it returns [`Woken::Unparked`] at once and changes
+//! nothing — when the caller is a core's idle task (the fallback that must
+//! always be runnable), has preemption disabled (blocking would hand the core
+//! on inside an open critical section), or runs with interrupts disabled
+//! (IRQ context, or an `IF = 0` section: no tick could ever wake it). Each of
+//! these is a caller bug, and a `while !done { park() }` loop would turn it
+//! into a hot spin, so each is a `debug_assert!` (the kernel is built in the
+//! dev profile: the boot faults loudly). In a release build the park still
+//! returns at once — it never blocks a core that cannot be switched.
 //!
 //! # Where the state lives
 //!
@@ -52,9 +59,12 @@
 //! nested on itself, and sends its reschedule IPI with `IF = 0` too — so an
 //! IRQ can never land between the two xAPIC ICR writes of a `send_ipi` on
 //! the same core (`spawn_on`'s IPI is sent with `IF = 0` for the same
-//! reason). It does not switch: from an IRQ on the target's own core the
-//! woken task runs at that core's next switch (a tick's slice expiry, a
-//! yield, a park). [`park`] and [`park_until`] are task context only.
+//! reason). It does not switch, and sends no IPI to its own core: a task
+//! woken on the calling core runs at that core's next switch — the next
+//! tick if the core's idle is current (the tick reschedules whenever the idle
+//! runs with `ready` non-empty), else the current task's yield, park or
+//! slice expiry. [`park`] and [`park_until`] are task context only, with
+//! interrupts and preemption enabled (see "Refused parks").
 //!
 //! # Cross-core wake-up
 //!
@@ -248,21 +258,26 @@ impl ParkTable for TaskTable {
 pub(super) enum ParkStep {
     /// Return to the caller at once with this answer; nothing was switched.
     Return(Woken),
+    /// The park was refused (an idle or unknown caller; nothing else
+    /// runnable or the sleeper set full — both impossible for a non-idle
+    /// task): nothing changed.
+    Refused,
     /// The caller is now parked; switch to this task.
     Switch(TaskId),
 }
 
 /// The pure park decision for the task `*current` at mono time `now`.
 ///
-/// In order: a refused park (unknown task, an idle task) returns
-/// [`Woken::Unparked`]; a stored permit is consumed and returns
+/// In order: a park by an unknown or idle task is [`ParkStep::Refused`]; a
+/// stored permit is consumed and returns
 /// [`Woken::Unparked`]; a deadline already reached returns
 /// [`Woken::Deadline`]; otherwise the next ready task becomes `*current`
 /// (Running), the caller becomes [`TaskState::Parked`] on no ring, and its
 /// deadline (if any) joins `sleepers`. If nothing else is runnable — never the
 /// case for a non-idle task, since its core's idle is then on `ready` — or the
-/// sleeper set is full (cannot happen at capacity `MAX_TASKS`), it returns
-/// [`Woken::Unparked`] without parking.
+/// sleeper set is full (cannot happen at capacity `MAX_TASKS`), it is
+/// [`ParkStep::Refused`]. Nothing is mutated before the switch target is
+/// known.
 pub(super) fn park_step<Q: ReadyQueue, T: ParkTable, const N: usize>(
     ready: &mut Q,
     sleepers: &mut Sleepers<N>,
@@ -274,10 +289,10 @@ pub(super) fn park_step<Q: ReadyQueue, T: ParkTable, const N: usize>(
     let me = *current;
     {
         let Some(v) = table.view(me) else {
-            return ParkStep::Return(Woken::Unparked);
+            return ParkStep::Refused;
         };
         if v.idle {
-            return ParkStep::Return(Woken::Unparked);
+            return ParkStep::Refused;
         }
         if core::mem::take(v.permit) {
             return ParkStep::Return(Woken::Unparked);
@@ -287,10 +302,10 @@ pub(super) fn park_step<Q: ReadyQueue, T: ParkTable, const N: usize>(
         return ParkStep::Return(Woken::Deadline);
     }
     if deadline.is_some() && sleepers.is_full() {
-        return ParkStep::Return(Woken::Unparked);
+        return ParkStep::Refused;
     }
     let Some(next) = ready.pop_front() else {
-        return ParkStep::Return(Woken::Unparked);
+        return ParkStep::Refused;
     };
     if let Some(v) = table.view(me) {
         *v.state = TaskState::Parked;
@@ -309,7 +324,9 @@ pub(super) fn park_step<Q: ReadyQueue, T: ParkTable, const N: usize>(
 
 /// The pure unpark step for `id` on its own core's structures: wake it if
 /// parked (Ready, on the tail of `ready`, its deadline entry dropped), store
-/// its permit if it is running or ready, refuse if it is exited or unknown.
+/// its permit if it is running or ready, refuse if it is exited, unknown, or
+/// a core's idle task (which never parks, so a permit could never be
+/// consumed).
 pub(super) fn unpark_step<Q: ReadyQueue, T: ParkTable, const N: usize>(
     ready: &mut Q,
     sleepers: &mut Sleepers<N>,
@@ -319,6 +336,9 @@ pub(super) fn unpark_step<Q: ReadyQueue, T: ParkTable, const N: usize>(
     let Some(v) = table.view(id) else {
         return UnparkOutcome::Refused;
     };
+    if v.idle {
+        return UnparkOutcome::Refused;
+    }
     match *v.state {
         TaskState::Exited => UnparkOutcome::Refused,
         TaskState::Ready | TaskState::Running => {
@@ -386,7 +406,11 @@ pub fn park_until(deadline: u64) -> Woken {
 
 fn park_current(deadline: Option<u64>) -> Woken {
     let cpu = local_cpu();
-    if PREEMPT[cpu].count.load(Ordering::Relaxed) != 0 {
+    let preemptible = PREEMPT[cpu].count.load(Ordering::Relaxed) == 0;
+    debug_assert!(preemptible, "park with preemption disabled");
+    let interrupts = hal::cpu::interrupts_enabled();
+    debug_assert!(interrupts, "park with interrupts disabled (IRQ context?)");
+    if !preemptible || !interrupts {
         return Woken::Unparked;
     }
     with_interrupts_disabled(|| {
@@ -406,6 +430,10 @@ fn park_current(deadline: Option<u64>) -> Woken {
                 deadline,
             ) {
                 ParkStep::Return(w) => return w,
+                ParkStep::Refused => {
+                    debug_assert!(false, "park refused: called by an idle task");
+                    return Woken::Unparked;
+                }
                 ParkStep::Switch(next) => {
                     let prev_h = tasks
                         .get_mut(me)
@@ -413,7 +441,13 @@ fn park_current(deadline: Option<u64>) -> Woken {
                     let next_h = tasks
                         .get_mut(next)
                         .map(|t| hal::context::TaskHandle::new(&mut t.ctx));
-                    (me, prev_h.zip(next_h))
+                    // Both are in the slab by construction (`me` is this
+                    // core's current, `next` came off its ready ring), so
+                    // the state `park_step` committed is always followed by
+                    // the switch.
+                    let pair = prev_h.zip(next_h);
+                    debug_assert!(pair.is_some(), "park: a switch handle is missing");
+                    (me, pair)
                 }
             }
         }; // both guards dropped here — never held across `switch`.
@@ -428,7 +462,10 @@ fn park_current(deadline: Option<u64>) -> Woken {
 }
 
 /// Wake task `id` if it is parked, else store its permit so its next park
-/// returns at once; a dead or unknown id is refused and nothing changes.
+/// returns at once; a dead, unknown or idle id is refused and nothing
+/// changes. A wake on another core sends that core the reschedule IPI; a
+/// wake on this core is picked up at its next tick if this core's idle is
+/// running (see [`super::on_tick`]), else at the current task's next switch.
 /// Callable from any core, from task **and IRQ** context (see the module
 /// docs for the argument); never blocks, never allocates, never switches.
 pub fn unpark(id: TaskId) -> UnparkOutcome {
@@ -480,6 +517,8 @@ static PP_DEADLINE_OK: AtomicBool = AtomicBool::new(false);
 /// The proof task's deadline park: the ticks it asked for and the ticks it
 /// actually waited (for the informational line).
 static PP_DEADLINE_WAITED: AtomicU64 = AtomicU64::new(0);
+/// Mono tick at which the local-wake probe task resumed (`u64::MAX` before).
+static PL_RAN_AT: AtomicU64 = AtomicU64::new(u64::MAX);
 
 const STAGE_STARTED: u32 = 1;
 const STAGE_PERMIT_OK: u32 = 2;
@@ -531,6 +570,44 @@ fn park_proof_task() {
         Ordering::Release,
     );
     PP_STAGE.store(STAGE_DEADLINE_DONE, Ordering::Release);
+}
+
+/// The local-wake probe: park on the BSP, record when it resumed, exit.
+fn park_local_task() {
+    park();
+    PL_RAN_AT.store(crate::clock::mono_ticks(), Ordering::Release);
+}
+
+/// Informational: mono ticks from kmain (the BSP's idle) unparking a task
+/// parked on the BSP itself — no IPI — until that task runs, with kmain
+/// halted meanwhile. The tick's "idle is current and `ready` is not empty"
+/// rule bounds it by about one tick; before it, the wait was the rest of the
+/// idle's 10-tick slice. `None` if the probe could not run.
+fn measure_local_wake(bsp: usize) -> Option<u64> {
+    PL_RAN_AT.store(u64::MAX, Ordering::Release);
+    let id = super::spawn_on(bsp as u32, "park-local", park_local_task).ok()?;
+    let begin = crate::clock::mono_ticks();
+    while !task_is_parked(id)
+        && crate::clock::mono_ticks().wrapping_sub(begin) < PROOF_TIMEOUT_TICKS
+    {
+        super::yield_now();
+    }
+    if !task_is_parked(id) {
+        return None;
+    }
+    let t0 = crate::clock::mono_ticks();
+    if unpark(id) != UnparkOutcome::Woke {
+        return None;
+    }
+    while PL_RAN_AT.load(Ordering::Acquire) == u64::MAX
+        && crate::clock::mono_ticks().wrapping_sub(t0) < PROOF_TIMEOUT_TICKS
+    {
+        hal::cpu::halt();
+    }
+    match PL_RAN_AT.load(Ordering::Acquire) {
+        u64::MAX => None,
+        ran => Some(ran.wrapping_sub(t0)),
+    }
 }
 
 /// Wait (bounded) for the proof task to reach `stage`; `false` on timeout or
@@ -625,6 +702,8 @@ pub fn prove_park(sfs_commit: Option<TaskId>) {
         }
     }
 
+    let local_wake = measure_local_wake(bsp);
+
     // The idle window: kmain halts; count the BSP's ticks and switches.
     let sfs_before = sfs_parked_at(sfs_commit);
     let ticks0 = PREEMPT[bsp].ticks.load(Ordering::Relaxed);
@@ -669,6 +748,11 @@ pub fn prove_park(sfs_commit: Option<TaskId>) {
     write_dec(PP_DEADLINE_WAITED.load(Ordering::Relaxed));
     write_str("/");
     write_dec(PROOF_DEADLINE_TICKS);
+    write_str(" local-wake-ticks=");
+    match local_wake {
+        Some(t) => write_dec(t),
+        None => write_str("none"),
+    }
     write_str(" bsp-window ticks=");
     write_dec(ticks);
     write_str(" halts=");
@@ -899,11 +983,19 @@ mod tests {
     }
 
     #[test]
-    fn the_idle_never_parks() {
+    fn the_idle_never_parks_and_is_never_unparked() {
         let mut c: Core<3> = Core::new();
-        assert_eq!(c.park(0, None), ParkStep::Return(Woken::Unparked));
+        assert_eq!(c.park(0, None), ParkStep::Refused);
+        assert_eq!(c.park(0, Some(5)), ParkStep::Refused);
         assert_eq!(c.current, TaskId(0));
         assert_eq!(c.table.state[0], TaskState::Running);
+        assert_eq!(c.sleepers.len(), 0);
+        // A permit the idle could never consume is never stored.
+        assert_eq!(c.unpark(0), UnparkOutcome::Refused);
+        assert!(!c.table.permit[0]);
+        c.run(1);
+        assert_eq!(c.unpark(0), UnparkOutcome::Refused, "ready, still refused");
+        assert!(!c.table.permit[0]);
     }
 
     #[test]
@@ -1061,6 +1153,13 @@ mod proofs {
         deadline: [Option<u64>; IDS],
         /// Deadline wakes during the task's current blocking park.
         fires: [u8; IDS],
+        // What the step did, for the harnesses' `cover!`s.
+        /// A park switched away with a deadline (a sleeper entry was added).
+        ev_park_deadline: bool,
+        /// A tick's drain woke at least one task.
+        ev_expiry: bool,
+        /// An unpark woke a task and removed its sleeper entry.
+        ev_unpark_removed: bool,
     }
 
     impl Model {
@@ -1093,6 +1192,9 @@ mod proofs {
                 permit_owed: [false; IDS],
                 deadline: [None; IDS],
                 fires: [0; IDS],
+                ev_park_deadline: false,
+                ev_expiry: false,
+                ev_unpark_removed: false,
             }
         }
 
@@ -1144,6 +1246,13 @@ mod proofs {
                         assert!(deadline.is_some_and(|d| self.now >= d));
                     }
                 }
+                ParkStep::Refused => {
+                    // Only the idle is ever refused: a non-idle task always
+                    // finds its core's idle on `ready`.
+                    if self.prop == Prop::Places {
+                        assert!(me == 0);
+                    }
+                }
                 ParkStep::Switch(next) => {
                     if self.prop == Prop::Places {
                         assert!(me != 0, "the idle never parks");
@@ -1151,6 +1260,7 @@ mod proofs {
                     }
                     self.deadline[me] = deadline;
                     self.fires[me] = 0;
+                    self.ev_park_deadline = deadline.is_some();
                 }
             }
         }
@@ -1163,14 +1273,24 @@ mod proofs {
             } else {
                 None
             };
+            let sleepers_before = self.sleepers.len();
             let out = unpark_step(
                 &mut self.ready,
                 &mut self.sleepers,
                 &mut self.t,
                 TaskId::from_usize(id),
             );
+            self.ev_unpark_removed =
+                out == UnparkOutcome::Woke && self.sleepers.len() < sleepers_before;
             match was {
+                // Dead, unknown, or the idle (which never parks, so its
+                // permit could never be consumed): refused.
                 None | Some(TaskState::Exited) => {
+                    if self.prop == Prop::LostWakeup {
+                        assert!(out == UnparkOutcome::Refused);
+                    }
+                }
+                Some(_) if id == 0 => {
                     if self.prop == Prop::LostWakeup {
                         assert!(out == UnparkOutcome::Refused);
                     }
@@ -1217,6 +1337,7 @@ mod proofs {
             if self.prop == Prop::Deadline {
                 assert!(counted == woke);
             }
+            self.ev_expiry = woke > 0;
             if woke > 0 || kani::any() {
                 self.switch(false);
             }
@@ -1240,9 +1361,10 @@ mod proofs {
         }
 
         /// (a)'s invariant: an owed unpark is never left parked, and a stored
-        /// permit survives until a park consumes it.
+        /// permit survives until a park consumes it; the idle is never owed
+        /// one (an unpark of it is refused).
         fn lost_ok(&self) -> bool {
-            let mut ok = true;
+            let mut ok = !self.owed[0] && !self.permit_owed[0];
             for i in 0..IDS {
                 ok &= !(self.owed[i] && self.t.state[i] == TaskState::Parked);
                 ok &= !(self.permit_owed[i]
@@ -1256,7 +1378,7 @@ mod proofs {
         /// parked one on no ring and not current — every id on at most one of
         /// current/ready/zombies, the idle never parked or exited, and the
         /// sleepers name exactly the parked tasks with a deadline, once each,
-        /// with that deadline.
+        /// with that deadline, and `earliest` bounds every one of them.
         fn places_ok(&self) -> bool {
             let mut ready = [0u8; IDS];
             let mut zombie = [0u8; IDS];
@@ -1274,6 +1396,7 @@ mod proofs {
                     ok &= self.deadline[s.as_usize()] == Some(d);
                 }
             }
+            ok &= self.earliest_ok();
             ok &= self.t.state[self.current.as_usize()] == TaskState::Running;
             ok &= matches!(self.t.state[0], TaskState::Running | TaskState::Ready);
             for i in 0..IDS {
@@ -1293,11 +1416,25 @@ mod proofs {
             ok
         }
 
-        /// (c)'s invariant: a parked task's deadline has not passed (it would
-        /// have fired on the tick that reached it), and it has not fired
-        /// during this park.
-        fn deadline_ok(&self) -> bool {
+        /// The sleeper set's own invariant: the cached `earliest` is at most
+        /// every stored deadline (so the tick's `now < earliest` shortcut
+        /// never skips a due entry). Production keeps it exact; `<=` is what
+        /// correctness needs, and it is what is assumed and re-proven.
+        fn earliest_ok(&self) -> bool {
             let mut ok = true;
+            for j in 0..CAP {
+                if let Some((_, d)) = self.sleepers.get(j) {
+                    ok &= self.sleepers.earliest <= d;
+                }
+            }
+            ok
+        }
+
+        /// (c)'s invariant: a parked task's deadline has not passed (it would
+        /// have fired on the tick that reached it), it has not fired during
+        /// this park, and the sleeper set's `earliest` bounds every entry.
+        fn deadline_ok(&self) -> bool {
+            let mut ok = self.earliest_ok();
             for i in 0..IDS {
                 if self.t.state[i] == TaskState::Parked {
                     ok &= !self.deadline[i].is_some_and(|d| self.now >= d);
@@ -1307,8 +1444,9 @@ mod proofs {
             ok
         }
 
-        /// Any state satisfying all three invariants (and the sleeper set's
-        /// own: `earliest` is the minimum), the clock anywhere below 2^32.
+        /// Any state satisfying all three invariants, the clock anywhere
+        /// below 2^32. The sleeper set's cached `earliest` is symbolic too,
+        /// constrained only by the invariants (`earliest <=` every entry).
         fn any_valid(prop: Prop) -> Self {
             let mut ready: ReadyRing<CAP> = ReadyRing::new();
             let mut zombies: ReadyRing<CAP> = ReadyRing::new();
@@ -1333,7 +1471,7 @@ mod proofs {
                 kani::assume(at < 1 << 33);
                 sleepers.at[i] = at;
             }
-            sleepers.recompute();
+            sleepers.earliest = kani::any();
             let current: usize = kani::any();
             kani::assume(current < IDS);
             let mut deadline = [None; IDS];
@@ -1360,6 +1498,9 @@ mod proofs {
                 permit_owed: kani::any(),
                 deadline,
                 fires: kani::any(),
+                ev_park_deadline: false,
+                ev_expiry: false,
+                ev_unpark_removed: false,
             };
             kani::assume(m.places_ok() && m.lost_ok() && m.deadline_ok());
             m
@@ -1370,7 +1511,7 @@ mod proofs {
     /// first running task, the others ready in order, any stored permits)
     /// satisfies all three invariants. And the inductive assumption is not
     /// vacuous: [`Model::any_valid`] can produce a state with both non-idle
-    /// tasks parked, exactly one with a deadline, and a permit stored.
+    /// tasks parked, exactly one with a deadline.
     #[kani::proof]
     fn park_invariants_hold_at_boot() {
         let init = Model::new(Prop::Places);
@@ -1380,7 +1521,29 @@ mod proofs {
             m.t.state[1] == TaskState::Parked
                 && m.t.state[2] == TaskState::Parked
                 && m.sleepers.len() == 1
-                && m.t.permit[0]
+        );
+    }
+
+    /// The step's interesting transitions are reachable from the inductive
+    /// assumption, so no induction step below passes by never reaching them:
+    /// a park that switches away with a deadline, a tick whose drain wakes a
+    /// task, and an unpark that wakes a task and drops its sleeper entry.
+    ///
+    /// The same `any_valid` + `step` the three induction steps run (the
+    /// `Prop` only selects which assertions are checked, and CBMC assertions
+    /// never prune paths, so reachability is identical). Kept in its own
+    /// harness rather than in each step: the three cover goals cost each
+    /// step 10+ s and pushed two of them past the 60 s cap.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn park_transitions_are_reachable() {
+        let mut m = Model::any_valid(Prop::Places);
+        m.step(true);
+        kani::cover!(m.ev_park_deadline, "park switched away with a deadline");
+        kani::cover!(m.ev_expiry, "a tick's drain woke a task");
+        kani::cover!(
+            m.ev_unpark_removed,
+            "an unpark woke a task and dropped its deadline"
         );
     }
 

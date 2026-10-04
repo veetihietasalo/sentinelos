@@ -200,6 +200,41 @@ fn next_task_id() -> TaskId {
     TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// A lock-free cell holding at most one [`TaskId`] — for a subsystem that
+/// must name a service task (e.g. to [`unpark`] it) from any context, IRQ
+/// included, without taking a lock. One `AtomicU64`; `u64::MAX` (an id the
+/// counter never reaches) means empty. It hands out only ids it was given:
+/// there is no way to build a `TaskId` from an integer.
+pub struct TaskIdCell(AtomicU64);
+
+impl TaskIdCell {
+    /// An empty cell.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(u64::MAX))
+    }
+
+    /// Store `id` (Release: pairs with [`TaskIdCell::get`]).
+    pub fn set(&self, id: TaskId) {
+        self.0.store(id.0, Ordering::Release);
+    }
+
+    /// The stored id, if any.
+    #[must_use]
+    pub fn get(&self) -> Option<TaskId> {
+        match self.0.load(Ordering::Acquire) {
+            u64::MAX => None,
+            v => Some(TaskId(v)),
+        }
+    }
+}
+
+impl Default for TaskIdCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Task control block ──────────────────────────────────────────────────────
 
 /// A task's scheduling state.
@@ -625,8 +660,21 @@ pub fn preempt_enable() {
 ///
 /// First, under the same locks, it wakes every task parked on this core by
 /// [`park_until`] whose deadline is `<= crate::clock::mono_ticks()`
-/// (`park::expire_step`: O(1) when none is due, allocation-free); a wake is
-/// then treated like a slice expiry, so the woken task runs on this tick.
+/// (`park::expire_step`). Cost in IRQ context: one compare when nothing is
+/// due; otherwise one pass over this core's sleeper set (≤ [`MAX_TASKS`]
+/// entries) with a [`TaskTable`] lookup (≤ [`MAX_TASKS`] slots) per expired
+/// entry — about 64 × 64 slot visits in the worst case, bounded and
+/// allocation-free.
+///
+/// Then it reschedules — as on a slice expiry, through [`tick_action`] — if
+/// the slice expired, **or** a deadline woke a task, **or** this core's idle
+/// task is current while `ready` is non-empty (a task woken on this core by
+/// an [`unpark`], which sends no IPI to its own core). So deadline and local
+/// unpark wakes **preempt mid-slice**: the round-robin switch happens on this
+/// tick, and the woken task runs on it if it is at the head of `ready` —
+/// otherwise in its turn behind the tasks ahead of it. Only a slice expiry
+/// counts as [`PreemptState::tick_events`] (the AP preemption proof's
+/// evidence).
 ///
 /// # Interrupt-flag discipline
 ///
@@ -641,22 +689,23 @@ pub fn on_tick() {
     let cpu = local_cpu();
     PREEMPT[cpu].ticks.fetch_add(1, Ordering::Relaxed);
     let now = crate::clock::mono_ticks();
-    let (expired, woke) = {
+    let (expired, wake) = {
         // Lock order: this core's queue, then the task table.
         let mut queue = CPU_SCHED[cpu].lock();
         let state: &mut CpuSched = &mut queue;
         let mut tasks = TASKS.lock();
         // `park_until` deadlines due on this core: O(1) when none is.
         let woke = park::expire_step(&mut state.ready, &mut state.sleepers, &mut *tasks, now);
-        let expired = match tasks.get_mut(state.current) {
-            Some(t) => tick_slice(&mut t.slice),
-            None => false,
+        let (expired, idle) = match tasks.get_mut(state.current) {
+            Some(t) => (tick_slice(&mut t.slice), t.idle),
+            None => (false, false),
         };
-        (expired, woke)
+        (expired, woke > 0 || (idle && state.ready.len() > 0))
     };
-    // A deadline wake is handled like a slice expiry, so the woken task runs
-    // on this tick rather than at the end of the current task's quantum.
-    if !expired && woke == 0 {
+    // A wake (a deadline here, or an unpark while the idle ran) is handled
+    // like a slice expiry, so the switch happens on this tick rather than at
+    // the end of the current task's quantum.
+    if !expired && !wake {
         return;
     }
 
@@ -670,7 +719,9 @@ pub fn on_tick() {
         TickAction::Switch => {
             if reschedule_locked_on(cpu, false) {
                 PREEMPT[cpu].events.fetch_add(1, Ordering::Relaxed);
-                PREEMPT[cpu].tick_events.fetch_add(1, Ordering::Relaxed);
+                if expired {
+                    PREEMPT[cpu].tick_events.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         TickAction::Defer => PREEMPT[cpu].need_resched.store(true, Ordering::Relaxed),
