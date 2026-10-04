@@ -20,4 +20,4 @@ test-alloc = { path = "../test-alloc" }
 # proof). Declare it so `-D warnings` does not flag the cfg as unexpected on a
 # normal (non-Kani) build, matching the `hal` crate's configuration.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(kani_slow)'] }

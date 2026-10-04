@@ -696,6 +696,13 @@ mod proofs {
     /// Leaf packing, two items (the packing order and the gap): data of
     /// 0 or 1 byte each — what two items add over one is the order and the
     /// boundaries, not longer data.
+    ///
+    /// **Not in the gating suite:** it verifies, but in ~195 s, over the
+    /// 60 s per-harness cap (A19). Run it with
+    /// `RUSTFLAGS="--cfg kani_slow" cargo kani -p kernel --harness
+    /// leaf_packing_two_items_round_trip`. Two-item packing is covered by
+    /// the host round-trip tests; one item and decode totality gate here.
+    #[cfg(kani_slow)]
     #[kani::proof]
     #[kani::unwind(119)]
     fn leaf_packing_two_items_round_trip() {
