@@ -2,7 +2,7 @@
 
 One page for a fresh session (or a fresh container) to pick the kernel work back
 up without re-deriving state from git. Update it at the end of any session that
-changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + SentinelFS FS-1a landed; FS-1b PR open; PR-2b next).
+changes direction; keep it short. Last updated **2026-10-06** (component PR-2, PR-2b, SentinelFS FS-1a, park/unpark and SMP 3b-ii IOAPIC landed; SentinelFS FS-1b PR open).
 
 ## Landed (main)
 
@@ -35,6 +35,17 @@ changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + 
   still opens interrupts: the AP it waits for is not ticking yet). Boot proof
   `[clock] mono: … pit-frozen=yes bsp-stalled-advance=yes rate-ok=yes ok` asserted.
   Zero `hal` delta.
+- **IOAPIC routing (SMP 3b-ii).** `kernel::acpi` walks RSDP → RSDT/XSDT → MADT with
+  `&[u8] -> Result` decoders into a fixed-size `MadtInfo` (IOAPICs, overrides, NMI
+  structures; Kani + a mutation-fuzz host test over QEMU's real MADT);
+  `kernel::ioapic` routes the PIT (ISA 0 → GSI 2), keyboard, mouse and the e1000's
+  line through the IOAPIC to the **BSP** (wall clock + BSP-consumed rings), 8259 and
+  LINT0 masked and read back; EOI goes to whichever controller the LAPIC's ISR says
+  delivered. New `hal`: `hal::acpi`, `hal::ioapic` (hal-tcb §2l/§2m, invariant 17).
+  `make test` asserts the `[ioapic] madt: … ok` line exactly and types `about` over
+  QMP on boot 1 to prove keystrokes arrive via the IOAPIC (≈20 s of software
+  repaint under TCG; 120 s budget). Fixed on the way, by inspection: a latent IRQ-context
+  self-deadlock in `hal::e1000`'s lock.
 - **Component model PR-1 (native).** `kernel::hash` (SHA-256, framed
   `ComponentId`), `kernel::host`: `ComponentRuntime` trait + `native::NativeRuntime`,
   envelope codec (60-byte header, ≤256 B payload), per-instance `InboxRing<Wire, 8>`,
@@ -74,7 +85,7 @@ changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + 
   (`Allocator::check_ops`), then applied — refusals change nothing, ≤ 13 dirty blocks per
   op asserted (worst 9). `sfs::scrub` hashes every reachable block and checks structure and
   allocation; damage → read-only, objects named. `hal::ata` flush split (row A2,
-  invariant 16) and time-bounded ATA waits (TSC deadline, `hal::cpu::rdtsc` row C16, SRST
+  invariant 16) and time-bounded ATA waits (TSC deadline on `hal::cpu::rdtsc`, row C16 shared with the IOAPIC wait, SRST
   channel reset after a timeout — the FS-1c CI flake); hal review owed. Host: crash-point property test (2 744 crash points,
   ddmin shrinker), replay/order determinism, counting-allocator heap cap (`test-alloc`
   crate, 435 636 B on 16 MiB and 1 GiB), threaded race model (found and fixed a stale-miss
@@ -83,7 +94,7 @@ changes direction; keep it short. Last updated **2026-10-04** (component PR-2 + 
   previous commit exactly): `[sfs] torn-commit: cut-after=2 recovered-gen=3
   data-intact=yes ok`, `[sfs] scrub: blocks=10 hashed=10 bad=0 ok`.
 - **Verification.** Miri (hal + kernel ml/hash/host/cap/bus/blk/sfs) and Kani (hal + kernel,
-  35 kernel harnesses, ~5 min) are **gating** CI; every workflow job carries a timeout,
+  41 kernel harnesses, ~10 min locally; every SMP 3b-ii harness < 60 s) are **gating** CI; every workflow job carries a timeout,
   machine-checked. Source guards `check-no-vector`, `check-ata-callers` and
   `check-component-imports` run in Kernel CI. Boot timing harness (`make boot-timing`) is
   informational.
@@ -108,14 +119,17 @@ Kani never-amplifies, on top of component PR-2's `kernel::cap`; moved out of FS-
 into-buffer, `Corrupt`/`NoSpace` errors; fuzz lane; persistent orphan list for removes
 beyond `PENDING_MAX`; real entropy for the format seed; A27's older-slot fallback) → **FS-4** (blobs, snapshots, cap
 enforcement) → **identity spec** → **FS-5** (superblock hash signed into the IntegrityLog).
-Follow-ups owned in the spec as A25–A31. Before FS-2 adds callers that block on the commit
-task: one **sched park/unpark** primitive (wake permit + optional mono deadline), designed
-with component PR-2's blocking bus receive, replacing the task's yield-poll.
+Follow-ups owned in the spec as A25–A31. **A25 shipped (2026-10-04):** `sched::park` /
+`park_until` / `unpark` (one wake permit, optional mono deadline, IRQ-safe unpark) replaced
+the commit task's yield-poll — it is now a normal blocked task and the BSP idles after boot
+(`[sched] park: … sfs-commit=parked bsp-idles=yes ok`); FS-2's blocking callers still need a
+waiter list the task unparks.
 Login/identity spec next: it must solve Argon2id's ≥19 MiB vs the 4 MiB heap (a `hal::mm`
 arena outside the heap), wrap both the tree key and the KeyAgent key from one unlock secret
 (resolving component §18.1), and decide the rollback anchor. The superblock already reserves
 the KDF params at [352,384) and a `keys` pointer at [392,440) to a kind-6 keyring block
 (spec §7.1), so login needs no format bump.
+**Identity/login spec proposed 2026-10-04** (`docs/specs/2026-10-04-identity-login-design.md`; review round 1 complete, conditions in its §19; first PR ID-0).
 
 0. **Component-model PR-2b** identity v2 + wide indices (decided 2026-10-03, component spec
    A12/A13; **merges before PR-3 is opened**): manifest declarations bound into `ComponentId`
@@ -133,9 +147,9 @@ the KDF params at [352,384) and a `keys` pointer at [392,440) to a kind-6 keyrin
    `kernel/docs/external-tcb.md` + hal-tcb §1 amendment. Spike baseline in spec §19:
    `wasmi` 2.0 builds for the target, 10 crates, ~135 k lines, 303 `unsafe` sites in `wasmi`
    alone.
-2. **IOAPIC** (SMP 3b-ii) — ACPI MADT walk as a pure `&[u8] -> Result` parser (Kani + fuzz),
-   explicit device-IRQ routing, PIC masked. Blocks nothing above; after PR-3. Then: load
-   balancing / stealing is a product decision, not a default.
+2. ~~**IOAPIC** (SMP 3b-ii)~~ — done (see Landed). Open from it: `_PRT`/AML or MSI for
+   PCI devices (the NIC line leans on QEMU's PIRQ steering), and load balancing /
+   stealing, which is a product decision, not a default.
 3. **Component-model PR-4** state objects (signing-key id in records), **PR-5** Sentinel as
    components.
 4. **AMX tier / inference workload 2** — `docs/specs/2026-07-16-inference-workload2-design.md`.

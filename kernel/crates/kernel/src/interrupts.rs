@@ -15,9 +15,9 @@
 //! | 8      | #DF Double Fault   | Print + [`hal::cpu::halt_loop`]. |
 //! | 13     | #GP General Protection | Print error code + RIP + [`hal::cpu::halt_loop`]. |
 //! | 14     | #PF Page Fault     | Decode error-code bits + CR2 faulting address, print, [`hal::cpu::halt_loop`]. |
-//! | 32     | IRQ0 PIT timer     | Bump the tick counter + EOI, then [`crate::sched::on_tick`] (PR-B: may switch away right here), then **return** (whichever task is now current resumes). |
-//! | 33     | IRQ1 PS/2 keyboard | Drain the scancode byte into the ring + EOI, then **return** (resumes). |
-//! | 44     | IRQ12 PS/2 mouse   | Drain a packet byte, reassemble the 3-byte packet into the ring + dual EOI, then **return** (resumes). |
+//! | 32     | IRQ0 PIT timer (IOAPIC GSI 2 under QEMU) | Bump the tick counter + EOI (LAPIC once IOAPIC-routed — `hal::ioapic::device_eoi`), then [`crate::sched::on_tick`] (PR-B: may switch away right here), then **return** (whichever task is now current resumes). |
+//! | 33     | IRQ1 PS/2 keyboard | Drain the scancode byte into the ring + EOI, count it for `kernel::ioapic`'s delivery evidence, then **return** (resumes). |
+//! | 44     | IRQ12 PS/2 mouse   | Drain a packet byte, reassemble the 3-byte packet into the ring + EOI, then **return** (resumes). |
 //! | 240    | Reschedule IPI     | LAPIC EOI, then [`crate::sched::on_resched_ipi`] (may switch this core to a newly placed task right here), then **return**. |
 //! | 255    | LAPIC spurious     | No-op **return** (a spurious interrupt owes no EOI); prevents a boot-halt once the LAPIC is software-enabled. |
 //!
@@ -260,6 +260,7 @@ fn handle_lapic_timer(_frame: &InterruptFrame) {
 /// code (`crate::input`) from the idle loop.
 fn handle_keyboard(_frame: &InterruptFrame) {
     hal::keyboard::on_irq();
+    crate::ioapic::note_kbd_irq();
 }
 
 /// Vector 44 (IRQ12) — the PS/2 mouse (i8042 auxiliary device).
@@ -489,7 +490,8 @@ pub fn lapic_tick_active() -> bool {
     !SCHED_TICK_FROM_PIT.load(Ordering::Relaxed)
 }
 
-/// Register the NIC receive-interrupt handler and unmask its PIC line.
+/// Register the NIC receive-interrupt handler and open its line — an IOAPIC
+/// route when `kernel::ioapic` is active (SMP 3b-ii), else the 8259 line.
 ///
 /// Call **after** the NIC has been initialised (`net::init` → `hal::e1000::init`),
 /// which reads the NIC's IRQ line from PCI config space, and **before** `sti`.
@@ -506,7 +508,15 @@ pub fn init_nic_irq() {
     }
     let vector = hal::e1000::vector_for(irq);
     hal::interrupts::set_handler(vector, handle_nic as Handler);
-    hal::pic::unmask_irq(irq);
+    // SMP 3b-ii: through the IOAPIC once device IRQs are routed there (the
+    // 8259 is masked); the legacy 8259 line otherwise.
+    if crate::ioapic::active() {
+        if !crate::ioapic::route_nic(irq, vector) {
+            hal::serial::print_line("[ioapic] nic line not routable; nic is polled only");
+        }
+    } else {
+        hal::pic::unmask_irq(irq);
+    }
 }
 
 // ── Unit tests (host) ─────────────────────────────────────────────────────────

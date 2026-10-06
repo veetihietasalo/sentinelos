@@ -8,8 +8,11 @@
 //! what the denial log recorded.
 //!
 //! ```text
-//! [cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=N ok
+//! [cap] attested-from=yes deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged=N ok
 //! ```
+//!
+//! (`manifest-tamper` since PR-2b.) The probes' requests name **services**,
+//! routed by the boot policy to bob and carol (spec §8, A12).
 //!
 //! - `attested-from` — every envelope a recipient was handed (an event, a
 //!   request, a reply, three delegation notices, a delegated send) carries the
@@ -24,6 +27,12 @@
 //!   requester's timeout: each refused **for the right reason** (checked in
 //!   the log), each after a positive control that the same path works with an
 //!   honest capability. The late answer arrives nowhere: silence is denial.
+//! - `manifest-tamper=refused` — alice's manifest under her own id, its
+//!   declarations edited after the id was computed (a `Required` stripped,
+//!   two requests swapped, an op added, a request dropped, a provided
+//!   service added): each refused `IdMismatch` before anything runs — no
+//!   instance, no grant planned (threat T-MAN-1). carol-strict, carol's code
+//!   with her request marked required, is a component of its own id.
 //! - `denies-logged=N` — records written during the proof. The proof also
 //!   requires the A8 rules: a required capability that cannot be granted
 //!   refuses the start; every refusal is counted (`logged + suppressed ==
@@ -37,11 +46,13 @@
 use super::{call, dispatch, instantiate, terminate, with_host, HOST};
 use crate::cap::deny::{Action, DenyRecord, DenyTotals};
 use crate::cap::table::{GEN_MAX, MAX_CAPS};
-use crate::cap::{CapIndex, DenyReason, Op, OpSet, Tick};
+use crate::cap::{CapIndex, CapNeed, CapRequest, DenyReason, Op, OpSet, ReplyTag, Tick};
 use crate::host::codec::{Kind, Sender};
-use crate::host::probe::{self, code, Args, ALICE_ID, BOB_ID, CAROL_ID, QUIET};
+use crate::host::probe::{
+    self, code, Args, ALICE_ID, ANSWER_LEN, BOB_ID, CAROL_ID, CAROL_STRICT_ID, QUIET,
+};
 use crate::host::seen;
-use crate::host::{InstanceId, InstantiateError, MAX_INBOX, MAX_INSTANCES};
+use crate::host::{InstanceId, InstantiateError, Manifest, MAX_INBOX, MAX_INSTANCES};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hal::serial::{write_dec, write_str};
 
@@ -63,7 +74,7 @@ const MEASURE_CAP: u64 = 1_000_000;
 /// What a probe's `act` reported back.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Outcome {
-    Done(u32),
+    Done(u64),
     Denied,
     Busy,
     Nothing,
@@ -71,13 +82,16 @@ enum Outcome {
 }
 
 fn act(inst: InstanceId, args: &Args) -> Outcome {
-    let mut out = [0u8; 8];
+    let mut out = [0u8; ANSWER_LEN];
     match call(&HOST, inst, "act", args.as_slice(), &mut out) {
         Ok(n) if n >= 1 => {
-            let v = if n >= 5 {
-                u32::from_le_bytes([out[1], out[2], out[3], out[4]])
-            } else {
-                0
+            let v = match out.get(1..ANSWER_LEN) {
+                Some(b) if n >= ANSWER_LEN => {
+                    let mut le = [0u8; 8];
+                    le.copy_from_slice(b);
+                    u64::from_le_bytes(le)
+                }
+                _ => 0,
             };
             match out[0] {
                 code::OK => Outcome::Done(v),
@@ -104,7 +118,17 @@ fn totals() -> DenyTotals {
 }
 
 fn newest_record() -> Option<DenyRecord> {
-    with_host(|h| h.deny_len().checked_sub(1).and_then(|i| h.deny_record(i)))
+    record_back(0)
+}
+
+/// The record `back` places before the newest one held.
+fn record_back(back: u64) -> Option<DenyRecord> {
+    let back = usize::try_from(back).ok()?;
+    with_host(|h| {
+        h.deny_len()
+            .checked_sub(1 + back)
+            .and_then(|i| h.deny_record(i))
+    })
 }
 
 /// Counts every refusal the proof provokes and checks each was logged.
@@ -149,6 +173,25 @@ impl DenyWatch {
         })
     }
 
+    /// A start refused for a `Required` request: two refusals, reported once
+    /// each — the precise `cause`, then `missing-required` — both logged as
+    /// `holder`'s grant.
+    fn refused_required(&mut self, holder: Sender, cause: DenyReason) -> bool {
+        self.expected += 2;
+        let t = totals();
+        let two = t.total == self.total + 2;
+        self.total = t.total;
+        let rec = |back: u64, reason: DenyReason| {
+            record_back(back).is_some_and(|r| {
+                r.seq + 1 + back == t.logged
+                    && r.holder == holder
+                    && r.action == Action::Grant
+                    && r.reason == reason
+            })
+        };
+        two && rec(1, cause) && rec(0, DenyReason::MissingRequired)
+    }
+
     /// `n` refusals the rate limit may suppress: counted, not checked per record.
     fn burst(&mut self, n: u64) {
         self.expected += n;
@@ -191,6 +234,7 @@ struct Verdict {
     counts: (usize, usize, usize),
     grants: bool,
     strict_refused: bool,
+    tamper: bool,
     attested: bool,
     deny_by_default: bool,
     not_held: bool,
@@ -226,6 +270,7 @@ impl Verdict {
     fn ok(&self) -> bool {
         self.grants
             && self.strict_refused
+            && self.tamper
             && self.attested
             && self.reply_once
             && self.deny_by_default
@@ -326,13 +371,16 @@ fn run(w: &World, watch: &mut DenyWatch, v: &mut Verdict, carol_refusal: bool) {
     let strict = instantiate(&HOST, &probe::CAROL_STRICT_MANIFEST);
     v.strict_refused = strict == Err(InstantiateError::MissingRequiredCap)
         && with_host(|h| h.instance_count()) == before
-        && watch.refused_at_start(
+        && watch.refused_required(
             Sender {
                 instance: InstanceId::KERNEL,
-                component: CAROL_ID,
+                component: CAROL_STRICT_ID,
             },
-            DenyReason::MissingRequired,
+            DenyReason::PolicyRefused,
         );
+
+    // ── manifest-tamper: alice's id with her declarations edited ──
+    v.tamper = prove_manifest_tamper();
 
     // ── attested-from: each recipient sees who acted, as the host knows it ──
     let sent = done(act(w.alice.instance, &Args::send(w.a_bob, b"hello bob")));
@@ -341,20 +389,20 @@ fn run(w: &World, watch: &mut DenyWatch, v: &mut Verdict, carol_refusal: bool) {
         .is_some_and(|s| s.from == w.alice && s.kind == Kind::Event && s.cap == w.a_bob);
 
     let tag = match act(w.alice.instance, &Args::request(w.a_bob, 100, b"ping")) {
-        Outcome::Done(t) => Some(t),
+        Outcome::Done(t) => Some(ReplyTag(t)),
         _ => None,
     };
     deliver(w.bob.instance);
     let at_bob = seen::seen_last_for(w.bob.instance);
     let request = at_bob.is_some_and(|s| s.from == w.alice && s.answered == Some(true));
     let reply_right = match at_bob.map(|s| s.kind) {
-        Some(Kind::Request { reply_tag }) => Some(CapIndex(reply_tag)),
+        Some(Kind::Request { reply }) => Some(reply),
         _ => None,
     };
     deliver(w.alice.instance);
     let reply = tag.is_some_and(|t| {
         seen::seen_last_for(w.alice.instance)
-            .is_some_and(|s| s.from == w.bob && s.kind == (Kind::Reply { reply_tag: t }))
+            .is_some_and(|s| s.from == w.bob && s.kind == (Kind::Reply { tag: t }))
     });
     // One shot: the same right a second time is stale.
     v.reply_once = reply_right.is_some_and(|r| {
@@ -512,9 +560,7 @@ fn run(w: &World, watch: &mut DenyWatch, v: &mut Verdict, carol_refusal: bool) {
     ));
     deliver(w.bob.instance);
     let pending = seen::seen_last_for(w.bob.instance).and_then(|s| match s.kind {
-        Kind::Request { reply_tag } if s.from == w.alice && s.answered.is_none() => {
-            Some(CapIndex(reply_tag))
-        }
+        Kind::Request { reply } if s.from == w.alice && s.answered.is_none() => Some(reply),
         _ => None,
     });
     if let Some(r) = pending {
@@ -537,7 +583,7 @@ fn run(w: &World, watch: &mut DenyWatch, v: &mut Verdict, carol_refusal: bool) {
     for i in 0..BURST {
         all_denied &= act(
             w.carol.instance,
-            &Args::send(CapIndex(0xDEAD_0000 | i), b"flood"),
+            &Args::send(CapIndex(0xDEAD_0000 | u64::from(i)), b"flood"),
         ) == Outcome::Denied;
     }
     watch.burst(u64::from(BURST));
@@ -549,6 +595,84 @@ fn run(w: &World, watch: &mut DenyWatch, v: &mut Verdict, carol_refusal: bool) {
     // ── §18.4 measurement (informational) ──
     v.actor_deliveries = measure_actor(w);
     v.task_roundtrips = measure_task_switch();
+}
+
+/// alice's manifest — her code, her params, **her id** — with the
+/// declarations edited after the id was computed (threat T-MAN-1, A12). Each
+/// stays within what the policy would grant, which is why binding matters:
+///
+/// - `Required` stripped from her bob request (she would start without it);
+/// - her two requests swapped (`granted(0)` would be carol's capability);
+/// - `Request` added to her carol request;
+/// - her carol request dropped;
+/// - a service added to her `provides` — carol's, a squat on a routed name
+///   (threat T-ROUTE-1).
+const TAMPERED: [(&str, Manifest); 5] = [
+    (
+        "required-stripped",
+        Manifest {
+            caps: &[
+                CapRequest {
+                    need: CapNeed::Optional,
+                    ..probe::ALICE_ASKS_FOR_BOB
+                },
+                probe::ALICE_ASKS_FOR_CAROL,
+            ],
+            ..probe::ALICE_MANIFEST
+        },
+    ),
+    (
+        "swapped",
+        Manifest {
+            caps: &[probe::ALICE_ASKS_FOR_CAROL, probe::ALICE_ASKS_FOR_BOB],
+            ..probe::ALICE_MANIFEST
+        },
+    ),
+    (
+        "op-added",
+        Manifest {
+            caps: &[
+                probe::ALICE_ASKS_FOR_BOB,
+                CapRequest {
+                    ops: OpSet::of(&[Op::Send, Op::Request]),
+                    ..probe::ALICE_ASKS_FOR_CAROL
+                },
+            ],
+            ..probe::ALICE_MANIFEST
+        },
+    ),
+    (
+        "dropped",
+        Manifest {
+            caps: &[probe::ALICE_ASKS_FOR_BOB],
+            ..probe::ALICE_MANIFEST
+        },
+    ),
+    (
+        "provides-squat",
+        Manifest {
+            provides: &[probe::CAROL_SERVICE],
+            ..probe::ALICE_MANIFEST
+        },
+    ),
+];
+
+/// Every [`TAMPERED`] manifest is refused as `IdMismatch` **before anything
+/// runs**: no instance appears, and nothing reaches the grant planner (the
+/// denial log, which records every refused grant, does not move). The
+/// positive control is alice herself — the same id, honest declarations,
+/// verified and running.
+fn prove_manifest_tamper() -> bool {
+    let control = probe::ALICE_MANIFEST.verify().is_ok();
+    let mut all = control;
+    for (_, m) in &TAMPERED {
+        let (count, denials) = with_host(|h| (h.instance_count(), h.deny_totals().total));
+        let refused = instantiate(&HOST, m) == Err(InstantiateError::IdMismatch);
+        let untouched =
+            with_host(|h| h.instance_count() == count && h.deny_totals().total == denials);
+        all &= m.id == ALICE_ID && refused && untouched;
+    }
+    all
 }
 
 /// Run-to-completion delivery, end to end: one attested send exactly as
@@ -633,11 +757,11 @@ fn yes_no(b: bool) -> &'static str {
     }
 }
 
-fn write_hex32(v: u32) {
+fn write_hex64(v: u64) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut b = *b"0x00000000";
-    for i in 0..8 {
-        b[2 + i] = HEX[((v >> (28 - 4 * i)) & 0xF) as usize];
+    let mut b = *b"0x0000000000000000";
+    for i in 0..16 {
+        b[2 + i] = HEX[((v >> (60 - 4 * i)) & 0xF) as usize];
     }
     if let Ok(s) = core::str::from_utf8(&b) {
         write_str(s);
@@ -667,6 +791,18 @@ fn report(v: &Verdict, base: DenyTotals, end: DenyTotals) {
         "STARTED"
     });
     write_str("\n");
+
+    write_str("[cap] tamper: id=");
+    write_short_id(&ALICE_ID);
+    for (name, _) in &TAMPERED {
+        write_str(" ");
+        write_str(name);
+    }
+    write_str(if v.tamper {
+        " -> id-mismatch, nothing ran\n"
+    } else {
+        " -> NOT ALL REFUSED\n"
+    });
 
     write_str("[cap] forge: not-held=");
     write_str(yes_no(v.not_held));
@@ -722,7 +858,7 @@ fn report(v: &Verdict, base: DenyTotals, end: DenyTotals) {
         write_str(" did=");
         write_str(r.action.label());
         write_str(" idx=");
-        write_hex32(r.index.0);
+        write_hex64(r.index.0);
         write_str(" why=");
         write_str(r.reason.label());
         if r.suppressed_before > 0 {
@@ -750,6 +886,8 @@ fn report(v: &Verdict, base: DenyTotals, end: DenyTotals) {
     } else {
         "ACCEPTED"
     });
+    write_str(" manifest-tamper=");
+    write_str(if v.tamper { "refused" } else { "ACCEPTED" });
     write_str(" denies-logged=");
     write_dec(end.logged - base.logged);
     write_str(if v.ok() { " ok\n" } else { " FAIL\n" });

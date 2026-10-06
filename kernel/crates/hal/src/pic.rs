@@ -207,6 +207,28 @@ pub fn mask_irq(irq: u8) {
     }
 }
 
+/// Mask **every** line on both PICs (IMR = `0xFF` on master and slave) — the
+/// 8259 is retired once device IRQs are routed through the IOAPIC (SMP 3b-ii;
+/// ACPI requires it when the MADT's `PCAT_COMPAT` flag is set).
+pub fn mask_all() {
+    // SAFETY: (P4) writes `0xFF` to the master and slave data ports (the IMRs),
+    // exactly the final writes of `init` (P3). Device-only effect: no line can
+    // raise an interrupt; cannot corrupt Rust memory. `outb`'s contract holds.
+    unsafe {
+        outb(PIC1_DATA, 0xFF);
+        outb(PIC2_DATA, 0xFF);
+    }
+}
+
+/// Read both Interrupt Mask Registers back: `(master, slave)`. Boot-proof
+/// evidence that the 8259 is fully masked.
+#[must_use]
+pub fn masks() -> (u8, u8) {
+    // SAFETY: (P1) reads the master and slave data ports (IMRs) — pure device
+    // reads with no side effect. `inb`'s contract holds.
+    unsafe { (inb(PIC1_DATA), inb(PIC2_DATA)) }
+}
+
 /// Signal End-Of-Interrupt for the vector currently being serviced.
 ///
 /// Call this from an IRQ handler **before it returns**, passing the *vector*

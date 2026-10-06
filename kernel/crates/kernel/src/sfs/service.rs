@@ -17,16 +17,29 @@
 //!   seals a commit under it, releases it, writes, and takes it again only to
 //!   copy the next block out or to publish the result.
 //! - **Callers** never block on the device either: they post a request (a
-//!   commit ticket) and wait for the task to serve it, yielding meanwhile —
-//!   the kernel's blocking pattern (`sched` has no sleep queue; a waiter on the
-//!   task's core hands the core straight to the task).
+//!   commit ticket), which unparks the task, and wait for it to serve the
+//!   ticket. Today's only waiter is kmain's boot proof — an idle task, which
+//!   may not park — so it yields meanwhile, handing its core straight to the
+//!   task (FS-2's blocking callers will park on a waiter list instead).
 //!
 //! # Pacing
 //!
 //! The task serves requested commits first, and otherwise commits a dirty
 //! transaction once [`COMMIT_INTERVAL`] ticks of `clock::mono_ticks()` have
-//! passed since the last one, checking each time it is scheduled. Nothing here
-//! runs from `sched::on_tick` or any other IRQ path (A7).
+//! passed since the last one. Between commits it is **parked** (spec §15
+//! A25): with a dirty transaction until that pacing deadline
+//! (`sched::park_until`), otherwise until something unparks it
+//! (`sched::park`). Every [`with_sfs`] section that changes the task's
+//! decision ([`Sfs::next_step`] before vs after, at one `now`) kicks it
+//! after the lock is released ([`kick`]) — so a new wake reason needs no
+//! kick of its own, provided `next_step` reflects it (a mutation of state
+//! `next_step` does not read is not seen). [`request_commit`] also kicks
+//! explicitly. The decision and the park are race-free
+//! because an unpark that lands between them stores the task's wake permit,
+//! so the park returns at once and the loop decides again. A parked task is
+//! off its core's ready ring, so the BSP really idles. The deadline is checked
+//! by the scheduler's tick; nothing *here* runs from `sched::on_tick` or any
+//! other IRQ path (A7).
 //!
 //! # Where on the disk
 //!
@@ -45,7 +58,7 @@ use crate::blk::ata::{AtaDevice, SFS_BASE_LBA};
 use crate::blk::layout::Pointer;
 use crate::blk::{BlkError, Block, BlockDevice, BlockNo};
 use crate::clock;
-use crate::sched::SpawnError;
+use crate::sched::{SpawnError, TaskId, TaskIdCell};
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, Ordering};
 use hal::sync::SpinMutex;
@@ -129,6 +142,19 @@ pub struct Sfs {
     cut: Option<u32>,
 }
 
+/// What the commit task does next (see [`Sfs::next_step`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Next {
+    /// Commit now.
+    Commit,
+    /// Park until this mono tick (the pacing deadline of a dirty transaction)
+    /// or an unpark.
+    ParkUntil(u64),
+    /// Park until unparked: nothing to commit and nothing dirty (or the
+    /// volume is read-only / not mounted).
+    Park,
+}
+
 impl Sfs {
     const fn new() -> Sfs {
         Sfs {
@@ -205,24 +231,73 @@ impl Sfs {
                 && v.is_dirty()
                 && now >= self.last_commit_tick.saturating_add(COMMIT_INTERVAL))
     }
+
+    /// Whether a mounted volume has uncommitted changes (host tests).
+    #[cfg(test)]
+    fn is_dirty(&self) -> bool {
+        self.volume.as_ref().is_some_and(|v| v.is_dirty())
+    }
+
+    /// The commit task's decision at `now`: commit if [`Sfs::commit_due`];
+    /// else, with a dirty writable volume and no [`hold_commits`] in force,
+    /// park until its pacing deadline; else park until unparked. While held
+    /// the pacing deadline does not apply, so the answer is `Park` — a
+    /// deadline already past would return at once and the task would spin on
+    /// the BSP for as long as the hold lasts. Releasing the hold changes the
+    /// decision, which kicks the task ([`with_sfs`]).
+    fn next_step(&self, now: u64) -> Next {
+        if self.commit_due(now) {
+            return Next::Commit;
+        }
+        match self.volume.as_ref() {
+            Some(v) if !v.is_read_only() && v.is_dirty() && !self.hold => {
+                Next::ParkUntil(self.last_commit_tick.saturating_add(COMMIT_INTERVAL))
+            }
+            _ => Next::Park,
+        }
+    }
 }
 
 /// The filesystem state. Only ever locked through [`with_sfs`].
 static SFS: SpinMutex<Sfs> = SpinMutex::new(Sfs::new());
 /// Set once the task has been spawned.
 static STARTED: AtomicBool = AtomicBool::new(false);
+/// The `sfs-commit` task's id, recorded by the task itself before it mounts.
+/// Lock-free, so [`kick`] takes no lock.
+static COMMIT_TASK: TaskIdCell = TaskIdCell::new();
 
 /// Run `f` on the filesystem state with the lock held and preemption
 /// disabled on this core. `f` must be bounded in-memory work: no device I/O,
 /// no waiting, no allocation.
+///
+/// If `f` changed the commit task's decision — [`Sfs::next_step`] at one
+/// `now`, before vs after: the volume became dirty, a request was posted, or
+/// any wake reason FS-1b adds to `next_step` (read requests, scrubs, a
+/// released hold) — the task is [`kick`]ed once the lock is released and
+/// preemption is back on. A wake reason is only seen if `next_step` reads
+/// it; that is the one rule a new one must follow.
 pub fn with_sfs<R>(f: impl FnOnce(&mut Sfs) -> R) -> R {
+    let now = clock::mono_ticks();
     crate::sched::preempt_disable();
-    let r = {
+    let (r, decision_changed) = {
         let mut guard = SFS.lock();
-        f(&mut guard)
+        run_noting_wake(&mut guard, now, f)
     };
     crate::sched::preempt_enable();
+    if decision_changed {
+        kick();
+    }
     r
+}
+
+/// Run `f` on `s`; also report whether it changed the commit task's
+/// decision at `now` (the pure part of [`with_sfs`]). A spurious `true`
+/// (the task's own sections change it too) only costs the task one extra
+/// loop: the kick stores its permit.
+fn run_noting_wake<R>(s: &mut Sfs, now: u64, f: impl FnOnce(&mut Sfs) -> R) -> (R, bool) {
+    let before = s.next_step(now);
+    let r = f(s);
+    (r, s.next_step(now) != before)
 }
 
 /// Start the `sfs-commit` task, pinned to the BSP (`spawn_on(0, …)`, with a
@@ -247,18 +322,42 @@ pub fn start() -> Result<(), SpawnError> {
     }
 }
 
+/// The `sfs-commit` task's id, once it has started (`None` before, and
+/// whenever [`start`] was never called). Lock-free.
+#[must_use]
+pub fn commit_task_id() -> Option<TaskId> {
+    COMMIT_TASK.get()
+}
+
+/// Wake the commit task so it re-decides (arms its pacing deadline, or
+/// serves a request). [`with_sfs`] calls it whenever a section changed the
+/// task's decision, and [`request_commit`] after posting a request (also
+/// when the decision was already `Commit`). Harmless
+/// when the task is awake: the unpark then only stores its permit.
+///
+/// Takes no lock — an atomic load and `sched::unpark` — so it is safe from
+/// any context, including inside a [`with_sfs`] section and from IRQ
+/// context.
+pub fn kick() {
+    if let Some(id) = commit_task_id() {
+        let _outcome = crate::sched::unpark(id);
+    }
+}
+
 /// Ask the task for a commit (even of an empty transaction: the generation
-/// still advances and the slot alternates). Returns a ticket for
-/// [`commit_outcome`], or `None` unless mounted read-write.
+/// still advances and the slot alternates), and unpark it. Returns a ticket
+/// for [`commit_outcome`], or `None` unless mounted read-write.
 pub fn request_commit() -> Option<u64> {
-    with_sfs(|s| {
+    let ticket = with_sfs(|s| {
         let writable = s.volume.as_ref().is_some_and(|v| !v.is_read_only());
         if s.phase != Phase::Mounted || !writable {
             return None;
         }
         s.requested += 1;
         Some(s.requested)
-    })
+    })?;
+    kick();
+    Some(ticket)
 }
 
 /// Once `ticket` has been served: the outcome of the latest commit (the one
@@ -367,6 +466,7 @@ pub fn mount_or_format<D: BlockDevice>(
 
 /// The `sfs-commit` task body. The only code that touches the device.
 fn commit_task() {
+    COMMIT_TASK.set(crate::sched::current_id());
     let mut dev = match AtaDevice::open(SFS_BASE_LBA) {
         Ok(d) => d,
         Err(e) => {
@@ -398,10 +498,15 @@ fn commit_task() {
     }
     loop {
         let now = clock::mono_ticks();
-        if with_sfs(|s| s.commit_due(now)) {
-            run_commit(&mut dev, &mut ws);
+        // Decide under the lock, park with it released. An unpark between the
+        // two stores this task's permit, so the park returns at once.
+        match with_sfs(|s| s.next_step(now)) {
+            Next::Commit => run_commit(&mut dev, &mut ws),
+            Next::ParkUntil(deadline) => {
+                let _woken = crate::sched::park_until(deadline);
+            }
+            Next::Park => crate::sched::park(),
         }
-        crate::sched::yield_now();
     }
 }
 
@@ -597,6 +702,9 @@ fn commit_once(dev: &mut AtaDevice, ws: &mut Workspace, now: u64) {
 }
 
 /// Wait (yielding) until `poll` yields a value or `timeout` mono ticks pass.
+/// Its only callers are kmain's boot proofs (this file's and `sfs::proof`'s),
+/// and kmain is the BSP's idle task, which may not park; a yield hands the BSP
+/// straight to the commit task.
 pub(super) fn wait_for<T>(timeout: u64, mut poll: impl FnMut() -> Option<T>) -> Option<T> {
     let deadline = clock::mono_ticks().saturating_add(timeout);
     loop {
@@ -731,5 +839,150 @@ pub fn prove_mount() {
             write_str(" FAIL\n");
         }
         None => write_str("TIMEOUT FAIL\n"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{run_noting_wake, Next, Sfs, COMMIT_INTERVAL};
+    use crate::blk::allocator::AllocClass;
+    use crate::blk::mem::MemDevice;
+    use crate::sfs::volume::{format, FormatParams, Volume, Workspace};
+
+    /// The commit task parks without a deadline while there is nothing to do,
+    /// parks until the pacing deadline while dirty, and commits once a request
+    /// is pending or the deadline has passed (spec §15 A25).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn the_commit_task_parks_unless_a_commit_is_due() {
+        let mut s = Sfs::new();
+        assert_eq!(s.next_step(0), Next::Park, "nothing mounted");
+        s.requested = 1;
+        assert_eq!(s.next_step(0), Next::Park, "no volume to commit");
+        s.requested = 0;
+
+        let mut d = MemDevice::new(256);
+        let mut ws = Workspace::new();
+        format(&mut d, &mut ws, &FormatParams::from_seed(b"park", 1)).unwrap();
+        let mut v = Volume::mount(&mut d, &mut ws).unwrap();
+        s.last_commit_tick = 100;
+        s.volume = Some(v);
+        assert_eq!(s.next_step(100), Next::Park, "clean: park until unparked");
+        s.requested = 1;
+        assert_eq!(s.next_step(100), Next::Commit, "a request is due at once");
+        s.served = 1;
+
+        v = s.volume.take().unwrap();
+        v.alloc(AllocClass::Normal, None).unwrap();
+        assert!(v.is_dirty());
+        s.volume = Some(v);
+        let due = 100 + COMMIT_INTERVAL;
+        assert_eq!(s.next_step(100), Next::ParkUntil(due));
+        assert_eq!(s.next_step(due - 1), Next::ParkUntil(due));
+        assert_eq!(s.next_step(due), Next::Commit);
+    }
+
+    /// A `with_sfs` section reports a change of the commit task's decision
+    /// (so it can kick the task) exactly when one happens — whether or not
+    /// the volume's dirtiness changed: a posted request on a clean volume
+    /// (no dirtying) is a change, a first allocation is, a read or a second
+    /// allocation is not.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_section_that_changes_the_decision_is_noticed() {
+        let mut s = Sfs::new();
+        assert_eq!(run_noting_wake(&mut s, 0, |_| ()), ((), false), "no volume");
+
+        let mut d = MemDevice::new(256);
+        let mut ws = Workspace::new();
+        format(&mut d, &mut ws, &FormatParams::from_seed(b"kick", 1)).unwrap();
+        s.volume = Some(Volume::mount(&mut d, &mut ws).unwrap());
+        let now = 10;
+
+        // A wake reason that is not dirtiness: a request, volume clean.
+        let request = |s: &mut Sfs| {
+            s.requested += 1;
+            s.is_dirty()
+        };
+        assert_eq!(run_noting_wake(&mut s, now, request), (false, true));
+        assert_eq!(s.next_step(now), Next::Commit);
+        // Served: the decision goes back to Park (a change the task makes).
+        assert_eq!(
+            run_noting_wake(&mut s, now, |s| s.served = s.requested),
+            ((), true)
+        );
+
+        let alloc = |s: &mut Sfs| {
+            s.volume
+                .as_mut()
+                .map(|v| v.alloc(AllocClass::Normal, None).is_ok())
+        };
+        assert_eq!(
+            run_noting_wake(&mut s, now, |s| s.is_dirty()),
+            (false, false)
+        );
+        assert_eq!(run_noting_wake(&mut s, now, alloc), (Some(true), true));
+        assert_eq!(
+            s.next_step(now),
+            Next::ParkUntil(s.last_commit_tick + COMMIT_INTERVAL)
+        );
+        assert_eq!(run_noting_wake(&mut s, now, alloc), (Some(true), false));
+        assert_eq!(
+            run_noting_wake(&mut s, now, |s| s.is_dirty()),
+            (true, false)
+        );
+    }
+
+    /// FS-1b's wake reasons reach the decision: while commits are held a
+    /// dirty volume parks without a deadline even when the deadline has
+    /// passed (no hot spin), releasing the hold changes the decision (so the
+    /// section that releases it kicks the task), and a posted read or scrub
+    /// request is a commit-task wake-up like a commit request.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn hold_parks_and_releasing_it_or_posting_a_read_or_scrub_kicks() {
+        let mut s = Sfs::new();
+        let mut d = MemDevice::new(256);
+        let mut ws = Workspace::new();
+        format(&mut d, &mut ws, &FormatParams::from_seed(b"hold", 1)).unwrap();
+        let mut v = Volume::mount(&mut d, &mut ws).unwrap();
+        v.alloc(AllocClass::Normal, None).unwrap();
+        s.volume = Some(v);
+        s.last_commit_tick = 0;
+        let past = COMMIT_INTERVAL * 3;
+        assert_eq!(
+            s.next_step(past),
+            Next::Commit,
+            "unheld: the deadline passed"
+        );
+
+        assert_eq!(run_noting_wake(&mut s, past, |s| s.hold = true), ((), true));
+        assert_eq!(
+            s.next_step(past),
+            Next::Park,
+            "held + dirty + past deadline"
+        );
+        assert_eq!(s.next_step(0), Next::Park, "held + dirty, deadline ahead");
+        // Releasing the hold changes the decision: the releasing section kicks.
+        assert_eq!(
+            run_noting_wake(&mut s, past, |s| s.hold = false),
+            ((), true)
+        );
+        assert_eq!(s.next_step(past), Next::Commit);
+
+        // While held, a posted read or scrub is still a wake-up.
+        s.hold = true;
+        let p = crate::blk::layout::Pointer::NULL;
+        assert_eq!(
+            run_noting_wake(&mut s, past, |s| s.read_req = Some((p, 0))),
+            ((), true)
+        );
+        assert_eq!(s.next_step(past), Next::Commit);
+        s.read_req = None;
+        assert_eq!(
+            run_noting_wake(&mut s, past, |s| s.scrub_req += 1),
+            ((), true)
+        );
+        assert_eq!(s.next_step(past), Next::Commit);
     }
 }

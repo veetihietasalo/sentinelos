@@ -403,20 +403,23 @@ pub(crate) unsafe fn xrstor(area: *const u8, mask: u64) {
     }
 }
 
-/// Read the time-stamp counter (`rdtsc`).
-///
-/// Monotonic per core and never calibrated here: callers use it only for
-/// generous deadlines measured in cycles (the ATA status waits), never to
-/// tell the time. The same primitive is proposed by the IOAPIC PR (#41, TCB
-/// row C16); whichever lands second keeps one definition.
+/// Read the time-stamp counter (`rdtsc`). Monotonic per core only (no
+/// cross-core ordering is assumed), never calibrated: a coarse bound on waits
+/// that stay on one core, never a clock. Two callers (TCB row C16):
+/// `kernel::ioapic`'s boot-time PIT-liveness check, and `hal::ata`'s status
+/// waits, whose deadlines are generous TSC-cycle budgets (SentinelFS FS-1b).
+#[inline]
 #[must_use]
 pub fn rdtsc() -> u64 {
-    // SAFETY: `rdtsc` reads the 64-bit time-stamp counter into EDX:EAX. It
-    // touches no memory and no flags, cannot fault in ring 0 (CR4.TSD only
-    // restricts ring 3, and user mode on the host build allows it), and has
-    // no side effects. The intrinsic is `unsafe` only because it is an
-    // architecture intrinsic; nothing about its inputs can be invalid.
-    unsafe { core::arch::x86_64::_rdtsc() }
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: (C16) `rdtsc` reads the TSC into EDX:EAX. At CPL 0 it is always
+    // legal (CR4.TSD only restricts CPL > 0). It touches no memory (`nomem`,
+    // `nostack`) and leaves RFLAGS unchanged (`preserves_flags`).
+    unsafe {
+        asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
+    }
+    (u64::from(hi) << 32) | u64::from(lo)
 }
 
 /// Halt the CPU until the next interrupt (`hlt`) — executed exactly once.

@@ -19,6 +19,7 @@
 // types available to the safe kernel logic.
 extern crate alloc;
 
+pub mod acpi;
 pub mod app;
 pub mod blk;
 pub mod bus;
@@ -29,6 +30,7 @@ pub mod hash;
 pub mod host;
 pub mod input;
 pub mod interrupts;
+pub mod ioapic;
 pub mod memory;
 pub mod ml;
 pub mod net;
@@ -140,6 +142,15 @@ pub fn kmain() -> ! {
         None => hal::println!("[smp] no LAPIC access path; staying on the legacy PIC"),
     }
 
+    // SMP phase 3b-ii: route the PIT, keyboard and mouse through the IOAPIC
+    // (ACPI MADT walk, overrides honoured, every IRQ to the BSP), masking the
+    // 8259 and LINT0. Needs the LAPIC access path above (the new EOI target);
+    // precedes the LAPIC-timer calibration (which then counts IOAPIC-routed PIT
+    // ticks) and AP bring-up. On any failure the 8259 virtual wire stays.
+    if hal::apic::lint0_masked().is_some() {
+        ioapic::init();
+    }
+
     // SMP phase 3: calibrate the LAPIC timer against the PIT and move the
     // scheduler tick onto it — on this core now, on every AP as it comes up
     // (they copy the calibrated count). The PIT stays the wall clock. Must
@@ -188,6 +199,8 @@ pub fn kmain() -> ! {
     // Register the NIC's receive-interrupt handler and unmask its PIC line (a
     // no-op if no NIC came up). Must run before `sti`, after `net::init`.
     interrupts::init_nic_irq();
+    // The routing summary, once the NIC's line has been routed too.
+    ioapic::report();
 
     // Bring up STORAGE: probe the legacy ATA disk and prove the on-disk
     // filesystem persists across reboots. This loads the filesystem image from
@@ -263,10 +276,11 @@ pub fn kmain() -> ! {
     // timeouts tick off `clock::mono_ticks`, so this runs after `prove_mono`.
     // Keep it ahead of SentinelFS's `sfs::prove_mount`, for two reasons. Its
     // §18.4 measurement round-trips kmain against one short BSP task, which
-    // an always-runnable BSP task (`sfs-commit`) would dilute. And spawning
-    // that task allocates with kmain at IF = 0, which is allowed only while
-    // no other BSP task can be suspended inside the allocator — true before
-    // `sfs-commit` exists, not after (hal-tcb §5e as amended by FS-1a).
+    // another BSP task waking mid-measurement would dilute. And spawning that
+    // task allocates with kmain at IF = 0, which is allowed only while no
+    // other BSP task can be suspended inside the allocator (hal-tcb §5e as
+    // amended by FS-1a) — trivially true before `sfs-commit` exists; after,
+    // only while it is parked, which it is unless it has work.
     bus::proof::prove_caps();
 
     // SentinelFS FS-1a boot proof (docs/specs/2026-09-18-sentinelfs-design.md
@@ -274,11 +288,17 @@ pub fn kmain() -> ! {
     // that touches the device — which mounts the SentinelFS window of the IDE
     // disk past the old `kernel::fs` image (formatting it only if it is blank,
     // never over a disk that carries the magic), then commits once so the
-    // superblock slot alternates on every boot. Runs after every proof that
-    // drains this core's ready queue: from here on the task stays runnable on
-    // the BSP (it polls for commit requests), so nothing below may wait for
-    // that queue to empty.
+    // superblock slot alternates on every boot. From here on the task is a
+    // normal blocked task on the BSP: parked while it has no work, woken by
+    // `request_commit` or by its pacing deadline (spec §15 A25).
     sfs::prove_mount();
+
+    // Park/unpark boot proof (scheduler design doc, "Park / unpark"): a task
+    // on an AP parks and the BSP unparks it, an unpark before a park makes
+    // that park return at once, a `park_until` wakes by its deadline, a dead
+    // id is refused — and, with `sfs-commit` parked, the BSP halts through a
+    // window of its own ticks without a single switch.
+    sched::prove_park(sfs::service::commit_task_id());
 
     hal::println!("┌─────────────────────────────────────┐");
     hal::println!("│  SentinelOS — boot bring-up OK       │");
@@ -360,8 +380,10 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
     let mut wm: Option<WindowManager> = None;
 
     loop {
-        // Sleep until the next interrupt (a PIT tick or a keystroke).
-        hal::cpu::halt();
+        // Sleep until the next interrupt (a PIT tick or a keystroke). Halt
+        // through `sched::idle_halt`, so a task unparked on this core runs
+        // on the next tick rather than after this idle task's slice.
+        sched::idle_halt();
         // Free the tasks that exited on this core since the last pass — only
         // the idle task reaps (see `sched::idle_reap`).
         sched::idle_reap();
@@ -370,6 +392,7 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
         //    locked, the right-arrow (or Enter) starts the unlock; on the desktop
         //    every decoded event is fed to the shell.
         while let Some(scancode) = hal::keyboard::poll_scancode() {
+            ioapic::note_first_scancode();
             if let Some(event) = decoder.feed(scancode) {
                 if state.accepts_unlock() {
                     let is_unlock =

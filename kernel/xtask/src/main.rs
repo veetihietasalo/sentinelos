@@ -494,6 +494,23 @@ const TIMER_LAPIC_EVERY_CORE: &str = "scheduler tick on every core";
 /// like the BSP line: `gemm-exact=yes`, both iteration counts `> 0`,
 /// `tick-preempted >= 1`, trailing `ok`.
 const SCHED_AP_PREEMPTIVE_PREFIX: &str = "[sched] ap-preemptive: ";
+/// Prefix of the **park/unpark** verdict line written by
+/// `kernel::sched::prove_park` (SentinelFS spec §15 A25). Asserted exactly:
+/// [`SCHED_PARK_OK`]. (The informational `[sched] park: target=…` line before
+/// it carries the counts and is not asserted.)
+const SCHED_PARK_PREFIX: &str = "[sched] park: cross-core=";
+/// The whole park/unpark verdict line: a task on an AP parked and the BSP
+/// unparked it across cores; an unpark before a park made that park return at
+/// once; a `park_until` woke by its deadline, not early; the exited task's id
+/// was refused; the `sfs-commit` task is parked; and the BSP took a window of
+/// its own ticks (two slice expiries) halted, with zero switches.
+const SCHED_PARK_OK: &str = "[sched] park: cross-core=ok permit-before-park=ok deadline=ok \
+                             dead-unpark=refused sfs-commit=parked bsp-idles=yes ok";
+
+/// Whether `line` is exactly [`SCHED_PARK_OK`] (trailing whitespace aside).
+fn sched_park_passed(line: &str) -> bool {
+    line.trim_end() == SCHED_PARK_OK
+}
 
 /// Component model PR-1 (`docs/specs/2026-09-18-component-model-design.md`
 /// §14): the host verified the embedded `hello` component's framed SHA-256 id,
@@ -515,6 +532,27 @@ const COMP_HELLO_REQUIRED: &[&str] = &[
     "runtime=native",
     "reply=ok",
 ];
+/// SMP phase 3b-ii: the routing summary `kernel::ioapic::report` prints once the
+/// NIC's line is routed — **exact match** (same on TCG and KVM: QEMU builds the
+/// q35 MADT itself — one 24-pin IOAPIC at GSI 0, five overrides, IRQ0 on GSI 2 —
+/// and the e1000 sits on legacy line 11). `pic=masked`/`lint0=masked` are read
+/// back from the 8259 IMRs and the BSP's LVT; `pit-live=yes` means the PIT
+/// ticked through the IOAPIC after the switch.
+const IOAPIC_LINE: &str = "[ioapic] madt: ioapics=1 overrides=5 gsi-base=0 pins=24 \
+     pic=masked lint0=masked routed=pit,kbd,mouse,nic irq0-gsi=2 dest=apic0 pit-live=yes ok";
+/// The first keystroke the boot test injects over QMP: the keyboard handler ran
+/// while the 8259 and LINT0 read back masked — only the IOAPIC can have
+/// delivered vector 33. Exact match.
+const IOAPIC_KBD_LINE: &str =
+    "[ioapic] kbd: irq1 -> gsi1 vector=33 irqs>=1 pic=masked lint0=masked via=ioapic ok";
+/// The shell ran the `about` the boot test typed: IOAPIC-routed keystrokes reach
+/// the desktop shell end to end. Exact match.
+const SHELL_ABOUT_LINE: &str = "[shell] ran: about";
+/// The WM reached the desktop after the injected right-arrow unlock.
+const WM_DESKTOP_READY: &str = "[wm] desktop ready";
+/// Keys typed once the desktop is up (QMP `qcode`s): `about` + Enter.
+const ABOUT_KEYS: [&str; 6] = ["a", "b", "o", "u", "t", "ret"];
+
 /// SentinelFS FS-1a (`docs/specs/2026-09-18-sentinelfs-design.md` §11): the
 /// `sfs-commit` task mounted the SentinelFS window of the IDE disk (formatting
 /// it first only on a blank image), every block it read verified, and the line
@@ -850,15 +888,18 @@ fn check_persistence_chain(boot1: &str, boot2: &str, fresh: bool) -> Result<Stri
 /// §14): bus + capabilities on the kernel-wide host. `from` is kernel-stamped
 /// on every delivery, a component with no capability is denied by default,
 /// forged indices (never issued, another instance's, revoked, expired) are
-/// refused, and every denial is logged, rate-limited. Asserted exactly, with
-/// `N >= 1`: [`cap_proof_passed`].
+/// refused, every denial is logged, rate-limited, and (PR-2b, A12) a manifest
+/// whose declarations were edited after its id was computed is refused as
+/// `id-mismatch` before anything runs. Asserted exactly, with `N >= 1`:
+/// [`cap_proof_passed`].
 const CAP_PROOF_PREFIX: &str = "[cap] attested-from=";
 
 /// Whether `line` is exactly `[cap] attested-from=yes deny-by-default=yes
-/// forge-attempt=refused denies-logged=N ok` with a decimal `N >= 1`.
+/// forge-attempt=refused manifest-tamper=refused denies-logged=N ok` with a
+/// decimal `N >= 1`.
 fn cap_proof_passed(line: &str) -> bool {
-    const HEAD: &str =
-        "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=";
+    const HEAD: &str = "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused \
+                        manifest-tamper=refused denies-logged=";
     line.trim_end()
         .strip_prefix(HEAD)
         .and_then(|rest| rest.strip_suffix(" ok"))
@@ -1937,12 +1978,19 @@ fn boot_test(kvm: bool) -> ExitCode {
             BOOT_TEST_LOGS.len()
         );
         let started = Instant::now();
-        let (log, found) = run_boot(kvm, &iso, &disk, &kr(rel));
+        // The QMP keystroke phase (~20 s under TCG) runs on boot 1 only.
+        let interactive = boot == 1;
+        let (log, found) = run_boot(kvm, &iso, &disk, &kr(rel), interactive);
         println!(
-            "boot {boot}: {} ms from QEMU launch to the end marker (200 ms polling)",
-            started.elapsed().as_millis()
+            "boot {boot}: {} ms from QEMU launch to {} (200 ms polling)",
+            started.elapsed().as_millis(),
+            if interactive {
+                "the end of the QMP keystroke phase"
+            } else {
+                "the end marker"
+            }
         );
-        if check_boot_log(kvm, &log, found) != ExitCode::SUCCESS {
+        if check_boot_log(kvm, &log, found, interactive) != ExitCode::SUCCESS {
             eprintln!(
                 "TEST FAILED on boot {boot} of {} (serial log: kernel/{rel}).",
                 BOOT_TEST_LOGS.len()
@@ -2025,7 +2073,7 @@ fn torn_commit_boots(kvm: bool, iso: &Path, disk: &Path, prev_log: &str) -> Resu
             l.starts_with(SFS_TORN_PREFIX) && (l.ends_with("halting") || l.ends_with("FAIL"))
         })
     };
-    let (log, found) = run_boot_until(kvm, iso, disk, &kr(TORN_LOGS[0]), cut_marker);
+    let (log, found) = run_boot_until(kvm, iso, disk, &kr(TORN_LOGS[0]), false, cut_marker);
     if !found {
         return Err(format!(
             "the cut boot never reached its cut (kernel/{})",
@@ -2071,8 +2119,8 @@ fn torn_commit_boots(kvm: bool, iso: &Path, disk: &Path, prev_log: &str) -> Resu
         "=== torn-commit stage: recovery boot (serial log: {}) ===",
         TORN_LOGS[1]
     );
-    let (log, found) = run_boot(kvm, iso, disk, &kr(TORN_LOGS[1]));
-    if check_boot_log(kvm, &log, found) != ExitCode::SUCCESS {
+    let (log, found) = run_boot(kvm, iso, disk, &kr(TORN_LOGS[1]), false);
+    if check_boot_log(kvm, &log, found, false) != ExitCode::SUCCESS {
         return Err(format!(
             "the recovery boot failed its boot assertions (kernel/{})",
             TORN_LOGS[1]
@@ -2117,8 +2165,16 @@ fn torn_commit_boots(kvm: bool, iso: &Path, disk: &Path, prev_log: &str) -> Resu
 /// COM1 goes to `serial_log`, polled every 200 ms until [`END_MARKER`] appears
 /// or [`BOOT_TIMEOUT_SECS`] pass, then QEMU is killed. Returns the final log and
 /// whether the marker appeared.
-fn run_boot(kvm: bool, iso: &Path, disk: &Path, serial_log: &Path) -> (String, bool) {
-    run_boot_until(kvm, iso, disk, serial_log, |log| log.contains(END_MARKER))
+fn run_boot(
+    kvm: bool,
+    iso: &Path,
+    disk: &Path,
+    serial_log: &Path,
+    interactive: bool,
+) -> (String, bool) {
+    run_boot_until(kvm, iso, disk, serial_log, interactive, |log| {
+        log.contains(END_MARKER)
+    })
 }
 
 /// [`run_boot`] with another stop condition: poll until `done(log)` or the
@@ -2129,6 +2185,7 @@ fn run_boot_until(
     iso: &Path,
     disk: &Path,
     serial_log: &Path,
+    interactive: bool,
     done: impl Fn(&str) -> bool,
 ) -> (String, bool) {
     let pcap = kr("target/net.pcap");
@@ -2149,10 +2206,16 @@ fn run_boot_until(
     // Spawn QEMU in the background; direct COM1 to a file so we can poll it. The
     // e1000 NIC + SLIRP backend + filter-dump pcap let the test confirm the NIC
     // brings up and frames cross the wire (inspect target/net.pcap).
+    // QMP control socket (system temp dir: unix socket paths are length-limited)
+    // so the keystroke phase below can inject `send-key` events.
+    let qmp_sock = std::env::temp_dir().join(format!("sos-boot-qmp-{}.sock", std::process::id()));
+    let _ = fs::remove_file(&qmp_sock);
     let mut child = Command::new("qemu-system-x86_64")
         .args(&qargs)
         .args(e1000_args(pcap.to_str().unwrap()))
         .args(ide_disk_args(disk))
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
         .spawn()
         .expect("failed to spawn qemu-system-x86_64");
 
@@ -2170,9 +2233,20 @@ fn run_boot_until(
         }
     }
 
+    // SMP 3b-ii keystroke evidence: once the kernel is idle, unlock the lock
+    // screen and type `about` over QMP; the kernel logs the first keystroke's
+    // delivery path and the shell logs the command (asserted in check_boot_log).
+    // `interactive` is set for the first boot only.
+    if found && interactive {
+        if let Err(e) = qmp_type_about(&qmp_sock, serial_log) {
+            eprintln!("keystroke injection: {e}");
+        }
+    }
+
     // Always kill QEMU after we're done polling (it halts forever in `halt_loop`).
     let _ = child.kill();
     let _ = child.wait();
+    let _ = fs::remove_file(&qmp_sock);
 
     // Read final log (may have grown slightly after the last poll).
     let log = fs::read_to_string(serial_log).unwrap_or_default();
@@ -2186,9 +2260,84 @@ fn run_boot_until(
     (log, found)
 }
 
+/// Wait until `serial_log` contains `needle`, polling every 100 ms.
+fn wait_for_serial(serial_log: &Path, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if fs::read_to_string(serial_log).unwrap_or_default().contains(needle) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Drive the booted guest over QMP: press Right (unlock), wait for the desktop,
+/// type [`ABOUT_KEYS`], and wait for [`SHELL_ABOUT_LINE`]. A dependency-free
+/// QMP client: one JSON command per line, reading until its `return`/`error`
+/// (asynchronous events may interleave and are skipped).
+fn qmp_type_about(sock: &Path, serial_log: &Path) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        match UnixStream::connect(sock) {
+            Ok(s) => break s,
+            Err(e) if Instant::now() >= deadline => return Err(format!("QMP connect: {e}")),
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).map_err(|e| format!("QMP greeting: {e}"))?;
+
+    let mut command = |cmd: &str| -> Result<(), String> {
+        writer
+            .write_all(format!("{cmd}\n").as_bytes())
+            .map_err(|e| format!("QMP write: {e}"))?;
+        loop {
+            let mut reply = String::new();
+            if reader.read_line(&mut reply).map_err(|e| format!("QMP read: {e}"))? == 0 {
+                return Err("QMP closed".into());
+            }
+            if reply.contains("\"return\"") {
+                return Ok(());
+            }
+            if reply.contains("\"error\"") {
+                return Err(format!("QMP error for {cmd}: {}", reply.trim()));
+            }
+        }
+    };
+    let key = |k: &str| {
+        format!(r#"{{"execute":"send-key","arguments":{{"keys":[{{"type":"qcode","data":"{k}"}}]}}}}"#)
+    };
+
+    command(r#"{"execute":"qmp_capabilities"}"#)?;
+    command(&key("right"))?;
+    if !wait_for_serial(serial_log, WM_DESKTOP_READY, Duration::from_secs(30)) {
+        return Err(format!("'{WM_DESKTOP_READY}' did not appear after the unlock key"));
+    }
+    for k in ABOUT_KEYS {
+        command(&key(k))?;
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    // Each keystroke repaints the terminal window in software (debug build);
+    // under TCG on a loaded host the six keys take ~20 s end to end, so the
+    // budget is generous — a real delivery failure never produces the line.
+    if !wait_for_serial(serial_log, SHELL_ABOUT_LINE, Duration::from_secs(120)) {
+        return Err(format!("'{SHELL_ABOUT_LINE}' did not appear after typing"));
+    }
+    Ok(())
+}
+
 /// Every per-boot assertion over one boot's serial `log` (`found`: whether the
 /// end marker appeared in time). [`boot_test`] runs it on both boots.
-fn check_boot_log(kvm: bool, log: &str, found: bool) -> ExitCode {
+fn check_boot_log(kvm: bool, log: &str, found: bool, interactive: bool) -> ExitCode {
     if !found {
         eprintln!(
             "TEST FAILED: end-marker '{}' not found within {} s.",
@@ -2323,6 +2472,23 @@ fn check_boot_log(kvm: bool, log: &str, found: bool) -> ExitCode {
             "TEST FAILED: the AP preemption proof did not pass (expected '{}', \
              tick-preempted>=1, both iteration counts > 0, trailing 'ok'): '{}'",
             SCHED_PREEMPTIVE_GEMM_EXACT, ap_line
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // Park/unpark (A25): the exact verdict line, on every boot.
+    let Some(park_line) = log.lines().find(|l| l.contains(SCHED_PARK_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: park/unpark proof line '{}…' missing (did \
+             `kernel::sched::prove_park` run?).",
+            SCHED_PARK_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    if !sched_park_passed(park_line) {
+        eprintln!(
+            "TEST FAILED: the park/unpark proof did not pass (expected exactly '{}'): '{}'",
+            SCHED_PARK_OK, park_line
         );
         return ExitCode::FAILURE;
     }
@@ -2472,11 +2638,43 @@ fn check_boot_log(kvm: bool, log: &str, found: bool) -> ExitCode {
     if !cap_proof_passed(cap_line) {
         eprintln!(
             "TEST FAILED: the capability proof did not pass (expected exactly '[cap] \
-             attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=N ok' \
-             with N >= 1): '{}'",
+             attested-from=yes deny-by-default=yes forge-attempt=refused \
+             manifest-tamper=refused denies-logged=N ok' with N >= 1): '{}'",
             cap_line
         );
         return ExitCode::FAILURE;
+    }
+
+    // SMP phase 3b-ii: device IRQs routed through the IOAPIC, the 8259 and
+    // LINT0 masked (read back), the PIT live on GSI 2 — and keystrokes injected
+    // over QMP after the end marker arrive through the IOAPIC and run `about`.
+    let keystroke_lines: &[(&str, &str)] = if interactive {
+        &[
+            (IOAPIC_KBD_LINE, "IOAPIC keyboard-delivery evidence (injected keystroke)"),
+            (SHELL_ABOUT_LINE, "shell `about` run from injected keystrokes"),
+        ]
+    } else {
+        &[]
+    };
+    for &(line, what) in [(IOAPIC_LINE, "IOAPIC routing summary")]
+        .iter()
+        .chain(keystroke_lines)
+    {
+        if !log.lines().any(|l| l.trim_end() == line) {
+            let near = log
+                .lines()
+                .find(|l| l.starts_with(&line[..line.len().min(12)]))
+                .unwrap_or("<none>");
+            eprintln!("TEST FAILED: {what}: expected exactly '{line}', nearest: '{near}'");
+            return ExitCode::FAILURE;
+        }
+    }
+    if interactive {
+        println!(
+            "IOAPIC routing proven: '{IOAPIC_LINE}'; '{IOAPIC_KBD_LINE}'; '{SHELL_ABOUT_LINE}'"
+        );
+    } else {
+        println!("IOAPIC routing proven: '{IOAPIC_LINE}' (keystroke phase: boot 1 only)");
     }
 
     // A vector int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is a
@@ -3105,24 +3303,59 @@ ffffffff80105000 <isr_common>:\n\
     }
 
     #[test]
+    fn sched_park_passed_accepts_only_the_exact_line() {
+        use super::{sched_park_passed, SCHED_PARK_OK, SCHED_PARK_PREFIX};
+        assert!(sched_park_passed(SCHED_PARK_OK));
+        assert!(sched_park_passed(&format!("{SCHED_PARK_OK}\r")));
+        assert!(SCHED_PARK_OK.starts_with(SCHED_PARK_PREFIX));
+        for (good, bad) in [
+            ("cross-core=ok", "cross-core=FAIL"),
+            ("permit-before-park=ok", "permit-before-park=FAIL"),
+            ("deadline=ok", "deadline=FAIL"),
+            ("dead-unpark=refused", "dead-unpark=ACCEPTED"),
+            ("sfs-commit=parked", "sfs-commit=runnable"),
+            ("sfs-commit=parked", "sfs-commit=none"),
+            ("bsp-idles=yes", "bsp-idles=no"),
+            (" ok", " FAIL"),
+        ] {
+            let line = SCHED_PARK_OK.replace(good, bad);
+            assert!(!sched_park_passed(&line), "{line}");
+        }
+        assert!(!sched_park_passed(&format!("{SCHED_PARK_OK} x")));
+        assert!(!sched_park_passed(
+            "[sched] park: target=cpu1 deadline-waited=5/5 bsp-window ticks=25 halts=25 switches=0"
+        ));
+    }
+
+    #[test]
     fn cap_proof_passed_accepts_only_the_exact_line() {
         use super::cap_proof_passed;
 
         let good = "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused \
-                    denies-logged=13 ok";
+                    manifest-tamper=refused denies-logged=13 ok";
         assert!(cap_proof_passed(good));
         assert!(cap_proof_passed(&format!("{good}\r")));
+        const A: &str = "[cap] attested-from=";
         for bad in [
-            "[cap] attested-from=no deny-by-default=yes forge-attempt=refused denies-logged=13 ok",
-            "[cap] attested-from=yes deny-by-default=no forge-attempt=refused denies-logged=13 ok",
-            "[cap] attested-from=yes deny-by-default=yes forge-attempt=ACCEPTED denies-logged=13 ok",
-            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=0 ok",
-            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged= ok",
-            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=13 FAIL",
-            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=1x ok",
-            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=13 ok x",
+            // The PR-2 line, without the tamper field, no longer passes.
+            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=13 ok",
+            "no deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged=13 ok",
+            "yes deny-by-default=no forge-attempt=refused manifest-tamper=refused denies-logged=13 ok",
+            "yes deny-by-default=yes forge-attempt=ACCEPTED manifest-tamper=refused denies-logged=13 ok",
+            "yes deny-by-default=yes forge-attempt=refused manifest-tamper=ACCEPTED denies-logged=13 ok",
+            "yes deny-by-default=yes forge-attempt=refused denies-logged=13 manifest-tamper=refused ok",
+            "yes deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged=0 ok",
+            "yes deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged= ok",
+            "yes deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged=13 FAIL",
+            "yes deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged=1x ok",
+            "yes deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged=13 ok x",
         ] {
-            assert!(!cap_proof_passed(bad), "{bad}");
+            let line = if bad.starts_with('[') {
+                bad.to_string()
+            } else {
+                format!("{A}{bad}")
+            };
+            assert!(!cap_proof_passed(&line), "{line}");
         }
     }
 

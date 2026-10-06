@@ -119,5 +119,5 @@ pub fn on_tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     // The PIT is IRQ0 → master-PIC vector PIC1_OFFSET (0x20). EOI lets the PIC
     // deliver the next tick.
-    crate::pic::end_of_interrupt(crate::pic::PIC1_OFFSET);
+    crate::ioapic::device_eoi(crate::pic::PIC1_OFFSET);
 }

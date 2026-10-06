@@ -16,13 +16,16 @@
 //!
 //! # Indices
 //!
-//! A [`CapIndex`] is `generation:24 ‖ table:4 ‖ slot:4`. It is valid only if
-//! its table is the holder's own (otherwise *foreign*), its slot is occupied,
-//! and its generation is the slot's current one. Every free bumps the slot's
+//! A [`CapIndex`] is `generation:48 ‖ table:8 ‖ slot:8` (a `u64`; widened from
+//! `24 ‖ 4 ‖ 4` in PR-2b, amendment A13). It is valid only if its table is the
+//! holder's own (otherwise *foreign*), its slot is occupied, and its
+//! generation is the slot's current one. Every free bumps the slot's
 //! generation, so an index to a revoked, released, used or reclaimed
 //! capability is *stale* forever and can never alias a newer capability; a
-//! slot whose generation would wrap is retired instead. Generation 0 is never
-//! issued, so `CapIndex(0)` (`CapIndex::KERNEL`) is never valid in any table.
+//! slot whose generation would wrap is retired instead — the never-wrap
+//! backstop, which at 48 bits no boot reaches (2⁴⁸ − 1 frees of one slot:
+//! 325 days at 10⁷ frees/s; threat T-DOS-5). Generation 0 is never issued, so
+//! `CapIndex(0)` (`CapIndex::KERNEL`) is never valid in any table.
 //!
 //! # Revocation
 //!
@@ -49,7 +52,8 @@
 //!
 //! # Bounds
 //!
-//! `T` tables of `S` slots, both `<= 16` (the index fields are four bits).
+//! `T` tables of `S` slots, both `<= 256` (the index fields are eight bits;
+//! T-CON-3's revocation cost bounds the slab, not the index).
 //! Production is `CapSpace<MAX_INSTANCES, MAX_CAPS>`; the harnesses run the
 //! same code at `CapSpace<2, 2>`. Every loop is a constant-range loop over `T`
 //! and `S`; nothing allocates.
@@ -59,28 +63,29 @@ use super::{Access, Authority, CapError, CapIndex, Capability, DenyReason, Tick}
 /// Capabilities one instance can hold at once.
 pub const MAX_CAPS: usize = 16;
 /// Largest generation a slot reaches; freeing it then retires the slot.
-pub const GEN_MAX: u32 = (1 << 24) - 1;
+pub const GEN_MAX: u64 = (1 << 48) - 1;
 /// Reply capabilities one table may hold at once (threat T-DOS-2).
 pub const MAX_PENDING_REPLIES: usize = 4;
 
-const SLOT_BITS: u32 = 4;
-const TABLE_BITS: u32 = 4;
-const FIELD_MASK: u32 = 0xF;
+const SLOT_BITS: u32 = 8;
+const TABLE_BITS: u32 = 8;
+const FIELD_MASK: u64 = 0xFF;
 const GEN_SHIFT: u32 = SLOT_BITS + TABLE_BITS;
 
 impl CapIndex {
     /// The index naming `slot` of `table` at generation `gen`. Callers pass
-    /// `table, slot < 16` and `gen <= GEN_MAX`; excess bits are masked off.
-    pub const fn compose(table: usize, slot: usize, gen: u32) -> CapIndex {
+    /// `table, slot < 256` and `gen <= GEN_MAX`; excess bits are masked off
+    /// (a generation above [`GEN_MAX`] loses its top bits).
+    pub const fn compose(table: usize, slot: usize, gen: u64) -> CapIndex {
         CapIndex(
-            (gen << GEN_SHIFT)
-                | (((table as u32) & FIELD_MASK) << SLOT_BITS)
-                | ((slot as u32) & FIELD_MASK),
+            ((gen & GEN_MAX) << GEN_SHIFT)
+                | (((table as u64) & FIELD_MASK) << SLOT_BITS)
+                | ((slot as u64) & FIELD_MASK),
         )
     }
 
     /// `(table, slot, generation)`.
-    pub const fn parts(self) -> (usize, usize, u32) {
+    pub const fn parts(self) -> (usize, usize, u64) {
         (
             ((self.0 >> SLOT_BITS) & FIELD_MASK) as usize,
             (self.0 & FIELD_MASK) as usize,
@@ -108,7 +113,7 @@ pub struct CapRef {
     /// Slot within the table.
     pub slot: u8,
     /// Generation of the slot when the capability was installed.
-    pub gen: u32,
+    pub gen: u64,
 }
 
 /// A live table entry.
@@ -125,7 +130,7 @@ pub struct Entry<C = Capability> {
 #[derive(Clone, Copy)]
 struct Slot<C> {
     /// Generation the next (or current) occupant carries. Starts at 1.
-    gen: u32,
+    gen: u64,
     /// The generation space is exhausted: never reused.
     retired: bool,
     entry: Option<Entry<C>>,
@@ -153,8 +158,8 @@ impl<const T: usize, const S: usize, C: Authority> Default for CapSpace<T, S, C>
 }
 
 impl<const T: usize, const S: usize, C: Authority> CapSpace<T, S, C> {
-    /// The index fields are four bits each; a larger slab could not be named.
-    const FITS_THE_INDEX: () = assert!(T >= 1 && T <= 16 && S >= 1 && S <= 16);
+    /// The index fields are eight bits each; a larger slab could not be named.
+    const FITS_THE_INDEX: () = assert!(T >= 1 && T <= 256 && S >= 1 && S <= 256);
 
     /// Empty tables.
     pub const fn new() -> Self {
@@ -433,7 +438,7 @@ impl<const T: usize, const S: usize, C: Authority> CapSpace<T, S, C> {
 
     /// The entry in `table`'s `slot` and its generation, if occupied
     /// (audit, tests, and the Kani invariants).
-    pub fn entry_at(&self, table: usize, slot: usize) -> Option<(Entry<C>, u32)> {
+    pub fn entry_at(&self, table: usize, slot: usize) -> Option<(Entry<C>, u64)> {
         if table >= T || slot >= S {
             return None;
         }
@@ -585,13 +590,13 @@ impl<const T: usize, const S: usize, C: Authority> CapSpace<T, S, C> {
 
     /// Test hook: the generation of `slot` of `table`, occupied or not.
     #[cfg(test)]
-    pub(crate) fn gen_for_test(&self, table: usize, slot: usize) -> u32 {
+    pub(crate) fn gen_for_test(&self, table: usize, slot: usize) -> u64 {
         self.tables[table][slot].gen
     }
 
     /// Test hook: move `slot` of `table` to generation `gen` (empty slots only).
     #[cfg(test)]
-    pub(crate) fn set_gen_for_test(&mut self, table: usize, slot: usize, gen: u32) {
+    pub(crate) fn set_gen_for_test(&mut self, table: usize, slot: usize, gen: u64) {
         if self.tables[table][slot].entry.is_none() {
             self.tables[table][slot].gen = gen;
         }
@@ -626,7 +631,7 @@ impl<const T: usize, const S: usize> CapSpace<T, S, Capability> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Attenuation, Op, OpSet, Target};
+    use super::super::{Attenuation, Op, OpSet, ReplyTag, Target};
     use super::*;
     use crate::host::codec::MAX_PAYLOAD;
     use crate::host::InstanceId;
@@ -737,6 +742,16 @@ mod tests {
             CapIndex::compose(15, 15, GEN_MAX).parts(),
             (15, 15, GEN_MAX)
         );
+        // The wide index (A13): 48-bit generations, 8-bit table and slot.
+        assert_eq!(GEN_MAX, (1u64 << 48) - 1);
+        assert_eq!(
+            CapIndex::compose(255, 255, GEN_MAX).parts(),
+            (255, 255, GEN_MAX)
+        );
+        assert_eq!(CapIndex::compose(255, 255, GEN_MAX).0, u64::MAX);
+        assert_eq!(CapIndex::compose(1, 2, 3).0, (3 << 16) | (1 << 8) | 2);
+        // A generation past 2²⁴ — unreachable before A13 — still round-trips.
+        assert_eq!(CapIndex::compose(0, 0, 1 << 24).parts(), (0, 0, 1 << 24));
         let (sp, idx) = rooted();
         assert_ne!(idx, CapIndex::KERNEL);
         assert_eq!(idx.parts().2, 1, "first generation is 1");
@@ -956,10 +971,10 @@ mod tests {
     #[test]
     fn reply_caps_are_bounded_one_shot_rights() {
         let mut sp = Space::new();
-        let right = |tag: u32| Capability::reply_right(InstanceId(5), tag, 100);
+        let right = |tag: u64| Capability::reply_right(InstanceId(5), ReplyTag(tag), 100);
         let mut minted = [CapIndex::KERNEL; MAX_PENDING_REPLIES];
         for (tag, slot) in minted.iter_mut().enumerate() {
-            *slot = sp.mint_reply(2, right(tag as u32)).unwrap();
+            *slot = sp.mint_reply(2, right(tag as u64)).unwrap();
         }
         assert_eq!(
             sp.mint_reply(2, right(99)),
@@ -1006,7 +1021,7 @@ mod tests {
             .delegate(0, root, 1, &child(&[Op::Send], 8, None), 0)
             .unwrap();
         let r = sp
-            .mint_reply(1, Capability::reply_right(InstanceId(9), 1, 50))
+            .mint_reply(1, Capability::reply_right(InstanceId(9), ReplyTag(1), 50))
             .unwrap();
         // Everything naming instance 9: the root, its child, the reply right.
         let freed = sp.free_where(|e| e.cap.target.names(InstanceId(9)));
@@ -1062,7 +1077,7 @@ mod tests {
         let mut rng = Lcg(0x5EED_CA95);
         let mut sp: CapSpace<T, MAX_CAPS> = CapSpace::new();
         // Ghost: (generation, entry) as produced, per slot.
-        let mut ghost: [[Option<(u32, Entry)>; MAX_CAPS]; T] = [[None; MAX_CAPS]; T];
+        let mut ghost: [[Option<(u64, Entry)>; MAX_CAPS]; T] = [[None; MAX_CAPS]; T];
         let mut bounds: [[Option<Capability>; MAX_CAPS]; T] = [[None; MAX_CAPS]; T];
         let mut issued: alloc::vec::Vec<(usize, CapIndex)> = alloc::vec::Vec::new();
         let mut now: Tick = 0;
@@ -1075,7 +1090,7 @@ mod tests {
                 if !issued.is_empty() && rng.next() % 4 != 0 {
                     issued[(rng.next() as usize) % issued.len()].1
                 } else {
-                    CapIndex(rng.next() as u32)
+                    CapIndex((rng.next() << 32) ^ rng.next())
                 }
             };
             let any_cap = |rng: &mut Lcg| Capability {
@@ -1113,7 +1128,7 @@ mod tests {
                 }
                 4 => {
                     let to = InstanceId(rng.next() % 3);
-                    let right = Capability::reply_right(to, rng.next() as u32, now + 5);
+                    let right = Capability::reply_right(to, ReplyTag(rng.next()), now + 5);
                     sp.mint_reply(t, right).ok().map(|i| (i, None))
                 }
                 _ => {
@@ -1192,6 +1207,14 @@ mod tests {
 /// `Capability`'s, whose lattice laws `cap::proofs` proves separately over
 /// full-width symbolic values. `delegate_never_amplifies` runs on
 /// `Capability` itself.
+///
+/// Since PR-2b (A13) every generation and index here is the production
+/// width — 48-bit generations in a `u64` index, `any_slot` drawing from
+/// `1..=GEN_MAX`. That grew the formulas ~30 % and roughly doubled the
+/// default solver's (cadical) time; the four table harnesses below therefore
+/// name `minisat`, which discharges the same formulas in about half the time
+/// locally (times in spec §14, PR-2b row). The solver changes how fast, not
+/// what, is proven.
 #[cfg(kani)]
 mod proofs {
     use super::super::proofs::{any_access, any_capability};
@@ -1266,7 +1289,7 @@ mod proofs {
     /// holding any token with any origin and any parent record (in range or
     /// not).
     fn any_slot() -> Slot<Token> {
-        let gen: u32 = kani::any();
+        let gen: u64 = kani::any();
         kani::assume(gen >= 1 && gen <= GEN_MAX);
         let parent = if kani::any() {
             Some(CapRef {
@@ -1409,7 +1432,7 @@ mod proofs {
     /// sequence, the analogue of `sched`'s Invariant #4 harness. From the
     /// empty slab, any two operations — `grant`, `delegate`, `revoke`,
     /// `release`, `mint_reply`, `reap_expired`, on symbolic tables with
-    /// symbolic 32-bit (mostly garbage) indices, values and ticks — leave in
+    /// symbolic 64-bit (mostly garbage) indices, values and ticks — leave in
     /// the tables only capabilities that a producer call returned for that
     /// slot and generation, unchanged since (the ghost); each granted one is
     /// exactly `request ∧ bound`; and the table invariant holds (well formed;
@@ -1419,6 +1442,7 @@ mod proofs {
     /// statement to every length.
     #[kani::proof]
     #[kani::unwind(8)]
+    #[kani::solver(minisat)]
     fn no_capability_without_a_producer() {
         const STEPS: usize = 2;
         let table = || -> usize {
@@ -1427,7 +1451,7 @@ mod proofs {
             t
         };
         let mut sp = Space::new();
-        let mut ghost: [[Option<(u32, Entry<Token>)>; S]; T] = [[None; S]; T];
+        let mut ghost: [[Option<(u64, Entry<Token>)>; S]; T] = [[None; S]; T];
         let mut granted: [[Option<Token>; S]; T] = [[None; S]; T];
         for _ in 0..STEPS {
             let now = Tick::from(kani::any::<u8>());
@@ -1502,6 +1526,7 @@ mod proofs {
     /// `delegate` or by `mint_reply`, and is unchanged since.
     #[kani::proof]
     #[kani::unwind(4)]
+    #[kani::solver(minisat)]
     fn producers_install_exactly_what_they_checked() {
         assert!(invariant(&Space::new()));
 
@@ -1572,6 +1597,7 @@ mod proofs {
     /// ancestor's freeing reaches, survives `revoke`.
     #[kani::proof]
     #[kani::unwind(8)]
+    #[kani::solver(minisat)]
     fn revoke_removes_every_descendant() {
         let mut sp = any_valid_space();
         let before = sp.tables;
@@ -1614,6 +1640,7 @@ mod proofs {
     /// installed; invariant kept.
     #[kani::proof]
     #[kani::unwind(8)]
+    #[kani::solver(minisat)]
     fn reclamation_frees_the_chosen_and_their_descendants() {
         let mut sp = any_valid_space();
         let before = sp.tables;

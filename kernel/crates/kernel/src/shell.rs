@@ -310,6 +310,7 @@ impl Shell {
             None => (trimmed, ""),
         };
 
+        let mut builtin = true;
         match cmd {
             "help" => self.cmd_help(),
             "clear" => self.cmd_clear(),
@@ -327,10 +328,20 @@ impl Shell {
             "cd" => self.cmd_cd(rest),
             "pwd" => self.cmd_pwd(),
             other => {
+                builtin = false;
                 let mut msg = String::from("command not found: ");
                 msg.push_str(other);
                 self.push_line(msg);
             }
+        }
+
+        // Serial breadcrumb for the built-ins the match above dispatched (the
+        // verb only, never arguments or unknown input): the boot test types
+        // `about` over QMP and asserts this line as end-to-end evidence that
+        // IOAPIC-routed keyboard IRQs reach the shell (SMP 3b-ii).
+        if builtin {
+            hal::serial::write_str("[shell] ran: ");
+            hal::serial::print_line(cmd);
         }
     }
 
