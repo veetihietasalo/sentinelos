@@ -742,4 +742,45 @@ mod proofs {
         // The rest of the payload (the canonical zero gap) is what is left.
         assert!(cursor >= table_end);
     }
+
+    /// Leaf-packing totality for **any** item count, by induction over the
+    /// placement loop (the encoder's and decoder's) at the real 4096-byte
+    /// block. Invariant before each step: `table_end <= cursor <= BLOCK` and
+    /// the gap `cursor - table_end` holds every item still to be placed
+    /// (`remaining`, of which the next item's `len` is part).
+    ///
+    /// Base: for any `n <= LEAF_CAP` and any total data length that passes
+    /// the encoder's weight check, the invariant holds at `cursor = BLOCK`.
+    /// Step: from any state satisfying it, [`place`] returns `Some(start)`
+    /// with `start + len == cursor`, and the invariant holds again for
+    /// `remaining - len`. Together: no item count makes packing fail, and
+    /// the data ranges are consecutive and clear of the table. Integers
+    /// only, no loop.
+    #[kani::proof]
+    fn leaf_packing_invariant_is_inductive() {
+        const BLOCK: usize = crate::blk::BLOCK_SIZE;
+        let limit = payload_limit(BLOCK) as usize;
+
+        // Base case.
+        let n: usize = kani::any();
+        let total: usize = kani::any();
+        kani::assume(n >= 1 && n <= super::super::LEAF_CAP && total <= limit);
+        kani::assume(n * LEAF_SLOT + total <= limit);
+        let table_end = NODE_HDR + n * LEAF_SLOT;
+        assert!(table_end <= BLOCK && BLOCK - table_end >= total);
+
+        // Inductive step, from an arbitrary state satisfying the invariant.
+        let cursor: usize = kani::any();
+        let remaining: usize = kani::any();
+        let len: usize = kani::any();
+        kani::assume(table_end <= cursor && cursor <= BLOCK);
+        kani::assume(cursor - table_end >= remaining);
+        kani::assume(len <= remaining && len <= ITEM_MAX);
+        let start = place(cursor, len, table_end);
+        assert!(start.is_some());
+        let start = start.unwrap_or(0);
+        assert!(start + len == cursor);
+        assert!(table_end <= start && start <= BLOCK);
+        assert!(start - table_end >= remaining - len);
+    }
 }
