@@ -102,6 +102,13 @@ jobs:
         working-directory: kernel
         run: cargo clippy --target x86_64-unknown-none -- -D warnings
 
+      # The boot tests' kernel (`cargo xtask test`) is built with the boot
+      # crate's `test-hooks` feature; lint that configuration too, or the
+      # `#[cfg(feature = "test-hooks")]` code is never linted.
+      - name: cargo clippy (test-hooks)
+        working-directory: kernel
+        run: cargo clippy -p boot --features test-hooks --target x86_64-unknown-none -- -D warnings
+
       # ── 8. Build ──────────────────────────────────────────────────────────
       - name: cargo build
         working-directory: kernel

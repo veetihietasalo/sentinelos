@@ -278,11 +278,23 @@ fn build_kernel_with(test_hooks: bool) -> Option<PathBuf> {
 ///   limine-uefi-cd.bin
 ///   EFI/BOOT/BOOTX64.EFI
 fn build_iso(kernel_elf: &Path) -> Option<PathBuf> {
+    build_iso_named(kernel_elf, "sentinelos")
+}
+
+/// [`build_iso`] into `target/<name>.iso` (staged in `target/<name>-iso_root`
+/// for any name but the default). The boot tests' `test-hooks` kernel goes to
+/// `sentinelos-test.iso`, so `target/sentinelos.iso` — what `run`, the
+/// screenshot and the demo tooling boot — is never the hooked kernel.
+fn build_iso_named(kernel_elf: &Path, name: &str) -> Option<PathBuf> {
     let limine_dir = kr("limine");
     let limine_bin = limine_dir.join("limine");
     let limine_conf = kr("limine.conf");
-    let iso_root = kr("target/iso_root");
-    let iso_path = kr("target/sentinelos.iso");
+    let iso_root = if name == "sentinelos" {
+        kr("target/iso_root")
+    } else {
+        kr(&format!("target/{name}-iso_root"))
+    };
+    let iso_path = kr(&format!("target/{name}.iso"));
 
     // Verify limine host tool exists.
     if !limine_bin.exists() {
@@ -1958,7 +1970,7 @@ fn boot_test(kvm: bool) -> ExitCode {
     let Some(elf) = build_kernel_with(true) else {
         return ExitCode::FAILURE;
     };
-    let Some(iso) = build_iso(&elf) else {
+    let Some(iso) = build_iso_named(&elf, "sentinelos-test") else {
         return ExitCode::FAILURE;
     };
     let fresh = match prepare_test_disk() {
