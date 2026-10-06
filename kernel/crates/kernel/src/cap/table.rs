@@ -1217,7 +1217,7 @@ mod tests {
 /// what, is proven.
 #[cfg(kani)]
 mod proofs {
-    use super::super::proofs::{any_access, any_capability};
+    use super::super::proofs::{any_access, any_capability, any_capability_of_kind};
     use super::super::Op;
     use super::*;
 
@@ -1679,18 +1679,56 @@ mod proofs {
     /// `⊑` the parent, and — semantically, independent of how `⊑` is written —
     /// every access the child permits at any tick, the parent permits. The
     /// parent is never modified; a refusal installs nothing.
+    ///
+    /// FS-1c split it by the parent's kind (bus here, storage in
+    /// [`delegate_never_amplifies_storage`]) to keep each under 60 s; only a
+    /// well-formed parent is ever granted, so no parent is lost. Here the
+    /// requested child is of every kind (bus, reply, storage, and malformed
+    /// mixtures), so a cross-kind delegation is exercised at the table level.
     #[kani::proof]
-    #[kani::unwind(4)]
+    #[kani::unwind(7)] // 7: the loops over storage paths and references (FS-1c)
     fn delegate_never_amplifies() {
+        delegate_never_amplifies_from(any_capability_of_kind(false), any_capability, any_access);
+    }
+
+    /// [`delegate_never_amplifies`] for a storage parent of constant shape
+    /// (`/a` on the live tree; symbolic blobs, quota, ops and expiry) and a
+    /// symbolic storage child and storage access (FS-1c). The child is
+    /// storage: a child of any other kind fails `⊑` on its target and
+    /// its attenuation's kind (`cap::proofs::attenuation_order_is_sound_and_transitive`
+    /// covers every kind against every kind), and generating it here costs
+    /// this harness its 60 s budget.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn delegate_never_amplifies_storage() {
+        let parent = Capability {
+            target: super::super::Target::Service(super::super::ServiceId::Storage),
+            ops: super::super::OpSet::from_bits(kani::any()),
+            attenuation: super::super::Attenuation::Storage(
+                super::super::storage::proofs::storage_parent_attenuation(),
+            ),
+            expires: if kani::any() { Some(kani::any()) } else { None },
+        };
+        delegate_never_amplifies_from(
+            parent,
+            || any_capability_of_kind(true),
+            || super::super::Access::Storage(super::super::storage::proofs::some_storage_access()),
+        );
+    }
+
+    fn delegate_never_amplifies_from(
+        parent: Capability,
+        any_child: fn() -> Capability,
+        any_access: fn() -> super::super::Access,
+    ) {
         let mut sp: CapSpace<T, S> = CapSpace::new();
-        let parent = any_capability();
         let Ok(pidx) = sp.grant(0, &parent, &parent) else {
             return;
         };
         let (_, pslot, _) = pidx.parts();
         assert!(sp.entry_at(0, pslot).is_some_and(|(e, _)| e.cap == parent));
 
-        let requested = any_capability();
+        let requested = any_child();
         let presented = if kani::any() { pidx } else { any_index() };
         let recipient: usize = kani::any();
         kani::assume(recipient < T);

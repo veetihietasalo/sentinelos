@@ -484,7 +484,7 @@ FS-1 splits in two, and attestation waits for the identity spec.
 |---|---|---|
 | **FS-1a** block layer + superblocks | `kernel::blk` (`BlockDevice` with multi-block I/O + `flush`, `AtaDevice`, `MemDevice` with crash-index / torn-sector / unflushed-subset hooks, verified reads, the 64-block slab, group bitmaps + one-level index, reserve), superblock format/mount/`Corrupt`-vs-`Unformatted` with the A12 fields, the `sfs-commit` task. Kani: superblock selection over decoded `(valid, gen)` candidates; 64-bit bitmap ops; extent arithmetic; header decode totality. Host: adversarial mount corpus (deterministic, fuzz-shaped, lifts into the lane unchanged). | `[sfs] mount: gen=N slot=S sb=<8 hex> verified=yes groups=1 free=N/N reserve=64 ok` (shape exact, `slot = gen % 2`) then `[sfs] commit: gen=N+1 slot=1-S sb=<8 hex> blocks=B flushes=2 ok` |
 | **FS-1b** tree + transactions + durability | CoW B+tree (`Node<CAP>` algebra + 4 KiB encoding), items, transactions with the ≤ 13-block bound, scrub; `hal::ata` API split: `write_sectors` unflushed + public `flush()` (**row A2 text amended**, new §4 invariant naming the command-serialising lock, and the pre-existing `issue_command(CMD_FLUSH)`-without-`wait_not_busy` fixed). Kani: `Node<4>` split/merge (sorted, occupancy, key-set preservation, separators); leaf packing totality over a shrunken block. Host: crash-point property test (shadow map advanced at commit; write-index × torn-sector × unflushed-subset; seeded PRNG, delta-debugging shrinker, 20 seeds < 30 s); order-independence and replay-determinism tests (principle 4, 7); counting-allocator cap on a 1 GiB `MemDevice`. QEMU: **torn-commit** — xtask runs QEMU with `cache=writeback`, the kernel halts after the k-th block write of a commit under a boot flag, xtask SIGKILLs and reboots; the next boot must mount `gen-1` intact. | `[sfs] torn-commit: cut-after=K recovered-gen=N-1 data-intact=yes ok` and `[sfs] scrub: blocks=N hashed=N bad=0 ok` |
-| **FS-1c** storage-cap lattice | Split out of FS-1a (Veeti, 2026-10-03): the storage-cap lattice type + `⊑` + Kani "never amplifies", on top of component PR-2's `kernel::cap` (`cap::Target::Storage`, §9, A13). Lands after PR-2; enforcement and denial logging stay in FS-4. | — (a type and its proofs; the enforcement line is FS-4's) |
+| **FS-1c** storage-cap lattice — **landing** (PR #42, rebased on PR-2b) | Split out of FS-1a (Veeti, 2026-10-03): the storage-cap lattice type + `⊑` + Kani "never amplifies", on top of component PR-2's `kernel::cap` (as built: `kernel::cap::storage`, reached as `Target::Service(ServiceId::Storage)`, §9, A13; *FS-1c as built* below). Lands after PR-2; enforcement and denial logging on the storage path stay in FS-4. | `[sfs] cap: narrow=ok wider-prefix=refused sibling-prefix=refused rollback-from-write=refused blobs-widen=refused quota-raise=refused expiry-extend=refused tree-from-live=refused ok` (exact; a boot proof of delegation through the capability tables — the enforcement line is still FS-4's) |
 | **FS-2** files + facade | `INODE`/`DIRENT` (re-chaining delete, Kani)/`INLINE`/`EXTENT`; `kernel::fs` facade with the §3 API changes; `stat`; old serialiser deleted; `Corrupt`/`NoSpace`/`Io`/`ReadOnly`. Fuzz lane lands here at the latest (own workspace like `xtask`, so `kernel/Cargo.lock` stays at 6 packages). | existing `[fs] persistence … ok` line (adapted), plus `[sfs] full-disk: filled=yes delete=ok ok` |
 | **FS-4** blobs + snapshots + caps | domains, `put_blob`/`get_blob` with per-domain refcounts and hit/miss-indistinguishable path, `BLOB_REF` extents, snapshots (`MAX_SNAPSHOTS`), rollback as a logged privileged op, bounded reclaim, storage-cap enforcement + denial logging; the host loads `hello` from the `Public` domain by `ComponentId`. | `[sfs] cas: put=2 stored=1 dedup=yes component-from-cas=verified snapshot=ok rollback=ok logged=yes reclaim<=256 ok` |
 | *(identity spec, then component PR-3 with a persistent key)* | | |
@@ -560,6 +560,110 @@ FS-1 splits in two, and attestation waits for the identity spec.
   and a 1 GiB device (≤ 300 KiB) and unchanged across 40 commits. A true counting allocator
   (which would also catch a stray temporary) needs a test-only crate outside the forbid
   boundary; it moves to FS-1b (A23, A31).
+
+**FS-1c as built (2026-10-04).** `kernel::cap::storage` holds the §9 lattice; the hooks in
+`kernel::cap` are additive (storage `Op` bits 8–12, `Target::Service(ServiceId::Storage)`,
+`Attenuation::Storage`, `Access::Storage`, and their arms of `allowed_ops`, `names`,
+`is_attenuation_of`, `admits`, `fits`, `op`, `meet`). The tables, `delegate` and `revoke` are
+unchanged in code; the PR-2 harnesses are not (generators, and a split — *Kani* below). Threat
+entries T-STO-1 … T-STO-6 (`docs/security/threat-model.md` §6).
+
+*Rebased onto component PR-2b (2026-10-06).* (1) **A real storage meet**
+(`StorageAttenuation::meet`, what `grant` installs for request ∧ policy): same tree, the deeper of
+two comparable prefixes (else `None`), the blob scopes' meet (`None` is the bottom, so disjoint
+scopes meet at `None`), the field-wise minimum quota; expiry is the capability's minimum. Kani
+`storage_meet_is_the_greatest_lower_bound` (below both, above every common lower bound, `None`
+only when there is none) and a host property test. (2) **Kind 1 is framed**:
+`Attenuation::id_encoding` writes into a buffer of `ATTENUATION_ENCODING_MAX` = 245 bytes
+(const-asserted ≤ `u16::MAX`), and `frame_requests` frames `u8(1) ‖ le16(len) ‖ body`, still
+infallible. Its injectivity for kind 1 is argued from the canonical-encoding proofs (in
+`frame_requests`' docs; the request harness stays kind-0 for cost) and host-tested. (3)
+`OpSet::DEFINED` now includes bits 8–12, and `CapRequest::is_meaningful` accepts storage ops
+only with a storage attenuation and an attenuation only if it fits a component instance — so
+every storage request is refused (`malformed-request`) until FS-4 adds a route form for kernel
+services; storage authority stays reachable only through the kernel's `pub(crate)`
+`Host::grant_service`. (4) The boot proof finds alice's `Send` capability over bob by target.
+
+- *The order, exactly.* tree: `Live` and each `SnapshotRo(name)` are pairwise incomparable
+  (equal only — reading an old snapshot can resurrect what the live tree deleted, so it is not a
+  narrowing of `Live`); prefix: whole components (`StoragePath::is_within`); blobs: `None` is the
+  bottom, `RefSet(R) ⊑ RefSet(R′)` iff `R ⊆ R′`, `RefSet(R) ⊑ Domain(d)` iff every reference in
+  `R` is in `d`, `Domain(d) ⊑ Domain(d′)` iff `d = d′`, never `Domain ⊑ RefSet`; quota: `≤` on
+  each of `bytes`, `inodes`, `blob_bytes`.
+- *Quota is a ceiling on a shared, lineage-charged budget* (review of FS-1c). `≤` only says a
+  delegate's ceiling never grows; it does not stop fan-out — a holder can hand a full-ceiling copy
+  to every instance it reaches with `Send` (or up to 16 to itself through a `Send` capability over
+  itself) and keep its own, and revoke-then-re-delegate would reset any per-capability counter.
+  **FS-4 charges every write to the counter of the root grant** (equivalently, to every ancestor
+  in the `CapSpace` derivation chain), **and that usage survives revoke and re-delegate**; the
+  ceiling is then checked against the shared counter. `quota.inodes` is not consulted by
+  `admits` today. Open until FS-4 (threat T-STO-6). A blob reference is `(BlobDomain, hash)` with the
+  domain exactly as on disk (`kernel::sfs::key`, `0 = Public`, `n ≥ 1 = User(n)`).
+- *Paths.* `StoragePath::parse(&[u8]) -> Result` accepts one spelling per path: absolute,
+  components separated by single `/`, no trailing `/`, every component non-empty, not `.` or
+  `..`, no NUL; at most 8 components and 64 bytes (the relative form `a/b`), in a fixed array
+  — no heap, nothing sized by input. Snapshot names are one such component of at most 16
+  bytes; a `RefSet` holds 1 … 4 references. Components compare byte-exactly.
+- *What a capability admits* (`StorageAttenuation::admits`, for FS-4's `check`): `Read` — same
+  tree, a path within the prefix or a blob in scope; `Write` — the live tree, a path within the
+  prefix with `bytes ≤ quota.bytes`, or a blob in scope with `bytes ≤ quota.blob_bytes`;
+  `Snapshot`, `Rollback`, `Format` — volume-wide, so only a capability with the root prefix on the
+  live tree, on the root path. A `SnapshotRo` capability therefore admits `Read` only, and no
+  prefix-narrowed capability can ever snapshot, roll back or format, whatever its op set says.
+  Inode and running quota accounting are FS-4's.
+- *Wire form.* `StorageAttenuation::encode(&self, out) -> Result<usize>` / `decode(&[u8]) ->
+  Result` define the body of v2 attenuation **kind 1** (`storage::KIND`; module docs give the
+  layout; at most `MAX_ENCODED_LEN` = 245 bytes), framed into the v2 `ComponentId` as
+  `u8(1) ‖ le16(len) ‖ body` since the PR-2b rebase.
+- *Granting.* No manifest can request storage yet (requests that name services are PR-2b): the
+  kernel, as the storage service's authority, grants with `Host::grant_service` (deny by default,
+  refusals logged as `grant` in the kernel's bucket). From there a storage capability is an
+  ordinary table entry: delegated by `Ctx::delegate` (to an instance the delegator reaches with
+  a `Send` capability, as every delegation), revoked, released, freed at `terminate`, and checked
+  by `CapSpace::check` with an `Access::Storage`.
+- *Boot proof* (`kernel::bus::storage_proof`, after `prove_caps`, before `sfs::prove_mount`). The
+  kernel grants the probe alice `{Read, Write, Delegate}` over `/app/foo`, two `User(1)` blobs, a
+  quota and an expiry. A narrower delegation to bob is installed, announced by a kernel-stamped
+  `Grant` notice from alice, and checked (a read under the child's prefix admitted; `/app/foobar`
+  refused for attenuation, a write for its op). Then `/app`, `/app/foobar`, `{Write, Rollback}`,
+  `Domain(User(1))`, one quota byte more, a lifetime past the parent's and a `SnapshotRo` tree
+  from the live-tree parent are each refused with
+  exactly one new denial, logged as alice's `delegate` / `amplification`. The delegations go
+  through `Host::delegate_from` — what `Ctx::delegate` runs — acting as alice; a probe `act`
+  command for storage was not added, to leave `host/probe.rs` to PR-2b.
+- *Kani* (shrunken bounds under `cfg(kani)`: 2 components, 5 path bytes, 2-byte names, 2
+  references of 1-byte hashes). `storage_order_is_a_partial_order` (reflexive, transitive,
+  antisymmetric on canonical values), `storage_delegate_never_amplifies` (child ⊑ parent ⇒
+  every storage access the child admits, the parent admits; volume-wide ops need the whole live
+  tree; snapshots read only), `prefix_order_is_component_wise` (`is_within` ⟺ component-wise
+  equality of the parent's components, plus the sibling counterexample), `storage_decode_is_total`,
+  and the wire form canonical and round-tripping **field by field**
+  (`storage_wire_{tree,prefix,quota}_is_canonical_and_round_trips`,
+  `storage_wire_blobs_is_canonical`, `storage_wire_blobs_round_trips`) — whole-body canonicity
+  and round-trip harnesses ran past 8 minutes; since `decode`/`encode` are the four field codecs
+  in sequence plus "nothing left", the field results compose, and the host tests check the whole
+  body at the production bounds. The PR-2 harnesses changed: `any_target` names the storage service
+  and `any_attenuation`/`any_access` add **one constant** storage value (live tree, root prefix,
+  no blobs, no ceiling; read of the root) — enough to reach every cross-kind arm, so
+  `attenuation_order_is_sound_and_transitive` stays cheap and storage soundness is left to
+  `storage_delegate_never_amplifies`. `table::proofs::delegate_never_amplifies` is split by the
+  parent's kind (unwind 4 → 7): a bus parent with a child of every kind, and
+  `delegate_never_amplifies_storage`, a parent of constant shape (`/a` on the live tree, symbolic
+  blobs — `None` or one reference — quota, ops and expiry) with a symbolic storage child (paths
+  `/`, `/a`, `/ab`, `/a/b`, one snapshot) and storage access; a child of another kind fails `⊑`
+  on target and attenuation kind, which the lattice harness covers for every pair of kinds. The
+  Kani path bound is 5 bytes so `TooDeep` is reachable (`kani::cover!`). Every harness is listed
+  with its measured time in the PR's report.
+- *Cost.* The lattice is stored inline in every slot of the static capability slab: a
+  `Capability` is 296 bytes and a table entry 328 on PR-2b's wide index (pinned by a host test),
+  so `kernel::bus::HOST` is 136 464 bytes of `.data`. Slot copies under the host lock grow accordingly (threat T-CON-3).
+- *Spec deviations.* (1) §9 named `cap::Target::Storage`; storage is `Target::Service(ServiceId::Storage)`,
+  `Target::Service` being reserved for kernel services (component §8). (2) §9 lists `ops` and
+  `expires` inside the lattice; they are the capability's own `ops` (bits 8–12) and `expires`, so
+  the product order is `Capability::is_attenuation_of` unchanged. (3) A boot line exists, though
+  the row said FS-1c would have none. (4) "Format is the strongest op" is realised as above (it
+  implies nothing, nothing implies it, and only the whole live tree can exercise it); op sets stay
+  a plain set lattice.
 
 Every PR: the entire FS runs on `MemDevice` on the host — this is where the real coverage
 is; Miri on `sfs::codec` and `blk` (scoped step; honest value on a `forbid(unsafe_code)`
@@ -679,7 +783,7 @@ where they set conditions, the PR that owns them is named.
 | A10 | §4 | `Key` had no parse/alignment rule. 17 bytes packed LE at fixed offsets. | applied |
 | A11 | §6 | `read(BlockNo, &mut Block)` would cap future DMA. `read_blocks`/`write_blocks` + `flush`. | applied |
 | A12 | §7.3/§9/§10 | On-disk fields that cannot be added later: blob **domains** (dedup never spans users; `Public` vs `User(n)`), `dirent_key`, KDF-params + wrap slot inside the signed superblock, metadata reserve. | applied (FS-1a) |
-| A13 | §9 | Storage attenuation must be a lattice with decidable `⊑`: path *components*, `blobs` never `List`, `Snapshot`/`Rollback` distinct from `Write`, quotas, expiry; Kani "never amplifies". | type + Kani in FS-1c (after component PR-2); enforcement FS-4 |
+| A13 | §9 | Storage attenuation must be a lattice with decidable `⊑`: path *components*, `blobs` never `List`, `Snapshot`/`Rollback` distinct from `Write`, quotas, expiry; Kani "never amplifies". | **type + Kani + boot proof: FS-1c (landing; §11 *FS-1c as built*)**; enforcement FS-4 |
 | A14 | §9/§12 | Attestation record = superblock hash, framed with `signing_key_id`, `prev_record_hash`, `anchor`; mismatch has three cases; response is read-only + finding + PolicyAgent consent + KeyAgent refusal; vector `Unavailable` under an ephemeral key. | applied |
 | A15 | §10 | Encrypt dirent names and xattr values (leaf payload, no shape change); per-object keys for crypto-shred; residual leak stated; cache zeroize. | applied |
 | A16 | §8/§11 | "Every prefix" is the wrong durability model. Unflushed-subset model in `MemDevice`; shadow map advanced at commit; torn variants at sector granularity for blocks 0/1; seeded PRNG + shrinker; 20 seeds < 30 s. | applied |

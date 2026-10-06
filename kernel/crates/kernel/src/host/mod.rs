@@ -188,15 +188,36 @@ fn frame_head(code: &[u8], params: &[u8], sink: &mut impl FrameSink) {
 /// The frame's requests, in manifest order: `le64(n) ‖ req₁ … reqₙ`, each
 /// `service[32] ‖ le32(ops) ‖ u8(need) ‖ u8(kind) ‖ le16(len) ‖
 /// attenuation[len]`. Prefix-free: its own bytes say where it ends.
+/// Infallible: `len ≤ ATTENUATION_ENCODING_MAX ≤ u16::MAX` (const-asserted).
+///
+/// **Kind 1 (storage), argued rather than re-proven here.** The request
+/// harness (`proofs::request_framing_is_self_delimiting_bounded`) generates
+/// kind-0 attenuations only: a symbolic storage body would multiply its
+/// state. Kind 1 keeps the frame injective and self-delimiting because
+/// (1) the `u8(kind) ‖ le16(len)` header is fixed-width and read before the
+/// body, so a decoder knows the kind and exactly how many body bytes follow
+/// — the same argument the harness proves for kind 0, with the body length
+/// read from the frame instead of known; (2) the kind byte differs, so no
+/// kind-1 body is compared with a kind-0 one; (3) within kind 1 the body is
+/// `StorageAttenuation::encode`, whose decoder reads back exactly the bytes
+/// each field encoder wrote and returns the same value (Kani
+/// `cap::storage::proofs::storage_wire_*`, field by field; `decode` is those
+/// fields in order plus "nothing left", proven total by
+/// `storage_decode_is_total`), so distinct attenuations have distinct
+/// bodies. Those storage harnesses run at the `cfg(kani)` bounds, which
+/// shrink `MAX_ENCODED_LEN` and `REF_HASH_LEN` (the code is the same); the
+/// host tests check the production bounds, including a framed storage
+/// request (`tests::storage_requests_frame_canonically`).
 fn frame_requests(requests: &[CapRequest], sink: &mut impl FrameSink) {
     sink.absorb(&(requests.len() as u64).to_le_bytes());
     for req in requests {
-        let (kind, bytes, len) = req.attenuation.id_encoding();
+        let mut body = [0u8; crate::cap::ATTENUATION_ENCODING_MAX];
+        let (kind, len) = req.attenuation.id_encoding(&mut body);
         sink.absorb(req.target.as_bytes());
         sink.absorb(&req.ops.bits().to_le_bytes());
         sink.absorb(&[req.need.id_byte(), kind]);
         sink.absorb(&(len as u16).to_le_bytes());
-        sink.absorb(&bytes[..len]);
+        sink.absorb(body.get(..len).unwrap_or(&[]));
     }
 }
 
@@ -285,9 +306,12 @@ pub enum InstantiateError {
     /// duplicate): one set, one encoding. Refused before hashing.
     NonCanonicalProvides,
     /// A capability request that can never mean anything: no operation, an
-    /// operation bit no `Op` names (FS-1c's reserved 8..=12 included), or an
-    /// attenuation that never fits (`Message.max_len > MAX_PAYLOAD`). Refused
-    /// before hashing, so every declaration an id binds is meaningful.
+    /// operation bit no `Op` names, storage operations (bits 8..=12) without
+    /// a storage attenuation, or an attenuation that fits no component
+    /// instance (`Message.max_len > MAX_PAYLOAD`, and — until FS-4 adds a
+    /// route form for kernel services — every storage attenuation, so every
+    /// storage request today). Refused before hashing, so every declaration
+    /// an id binds is meaningful.
     MalformedRequest,
     /// The runtime has no component for these bytes.
     UnknownCode,
@@ -855,6 +879,52 @@ mod tests {
 
     fn framed(code: &[u8], params: &[u8]) -> Vec<u8> {
         framed_with(code, params, &[], &[])
+    }
+
+    /// Kind 1 in the request frame: `u8(1) ‖ le16(len) ‖ body`, the body
+    /// exactly `StorageAttenuation::encode`'s, and two storage requests that
+    /// differ only in their attenuation frame differently (the argument in
+    /// `frame_requests`' docs, at the production bounds).
+    #[test]
+    fn storage_requests_frame_canonically() {
+        use crate::cap::storage::{
+            BlobScope, Quota, StorageAttenuation, StoragePath, Tree, KIND, MAX_ENCODED_LEN,
+        };
+        let att = |p: &[u8]| StorageAttenuation {
+            tree: Tree::Live,
+            prefix: StoragePath::parse(p).unwrap(),
+            blobs: BlobScope::None,
+            quota: Quota::UNLIMITED,
+        };
+        let req = |a: StorageAttenuation| CapRequest {
+            target: crate::cap::ServiceName::new("sentinel.storage/1").unwrap(),
+            ops: OpSet::of(&[Op::Read]),
+            attenuation: Attenuation::Storage(a),
+            need: CapNeed::Optional,
+        };
+        let frame = |r: CapRequest| {
+            let mut sink = VecSink(Vec::new());
+            frame_requests(&[r], &mut sink);
+            sink.0
+        };
+        let a = att(b"/app/foo");
+        let f = frame(req(a));
+        let mut body = [0u8; MAX_ENCODED_LEN];
+        let n = a.encode(&mut body).unwrap();
+        // le64(1) ‖ service[32] ‖ le32(ops) ‖ need ‖ kind ‖ le16(len) ‖ body
+        let head = 8 + 32 + 4 + 1;
+        assert_eq!(f[head], KIND);
+        assert_eq!(u16::from_le_bytes([f[head + 1], f[head + 2]]) as usize, n);
+        assert_eq!(&f[head + 3..], &body[..n]);
+        assert_eq!(StorageAttenuation::decode(&f[head + 3..]), Ok(a));
+        assert_ne!(f, frame(req(att(b"/app/foobar"))));
+        assert_ne!(f, frame(req(att(b"/app"))));
+        // And a kind-0 request never frames like a kind-1 one.
+        let message = CapRequest {
+            attenuation: Attenuation::UNRESTRICTED_MESSAGE,
+            ..req(a)
+        };
+        assert_ne!(frame(message)[head], KIND);
     }
 
     fn framed_with(

@@ -283,6 +283,16 @@ pub fn kmain() -> ! {
     // only while it is parked, which it is unless it has work.
     bus::proof::prove_caps();
 
+    // SentinelFS FS-1c boot proof (docs/specs/2026-09-18-sentinelfs-design.md
+    // §11): the storage-capability lattice on the same host. The kernel grants
+    // the probe alice a storage capability; a narrower delegation to bob is
+    // installed and checked, and a wider prefix, a sibling prefix, `Rollback`
+    // added to `Write`, a blob domain from a blob set, a larger quota and a
+    // later expiry are each refused and logged. After `prove_caps` (same
+    // probes, mono-clock expiry) and, like it, ahead of `sfs::prove_mount`: it
+    // drives instances on this core and spawns nothing.
+    bus::storage_proof::prove_storage_caps();
+
     // SentinelFS FS-1a boot proof (docs/specs/2026-09-18-sentinelfs-design.md
     // §11): start the `sfs-commit` task — pinned to this core, the only code
     // that touches the device — which mounts the SentinelFS window of the IDE

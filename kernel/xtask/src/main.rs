@@ -795,6 +795,25 @@ fn cap_proof_passed(line: &str) -> bool {
         .and_then(|n| n.parse::<u64>().ok())
         .is_some_and(|n| n >= 1)
 }
+/// SentinelFS FS-1c (`docs/specs/2026-09-18-sentinelfs-design.md` §11): the
+/// storage-capability lattice on the kernel-wide host. A narrower storage
+/// delegation is installed and checked; a wider prefix, a sibling prefix
+/// (`/app/foobar` from `/app/foo`), `Rollback` added to `Write`, a blob domain
+/// from a blob set, a larger quota, a later expiry and a snapshot tree from
+/// the live tree are each refused and logged. Asserted exactly:
+/// [`sfs_cap_proof_passed`].
+const SFS_CAP_PREFIX: &str = "[sfs] cap: ";
+
+/// The one line [`SFS_CAP_PREFIX`] must be (`kernel::bus::storage_proof`).
+const SFS_CAP_LINE: &str = "[sfs] cap: narrow=ok wider-prefix=refused sibling-prefix=refused \
+                            rollback-from-write=refused blobs-widen=refused quota-raise=refused \
+                            expiry-extend=refused tree-from-live=refused ok";
+
+/// Whether `line` is exactly [`SFS_CAP_LINE`] (a trailing `\r` tolerated).
+fn sfs_cap_proof_passed(line: &str) -> bool {
+    line.trim_end() == SFS_CAP_LINE
+}
+
 /// The `[ml]` `active=` values that mean a *vector* tier is live — a real SIMD
 /// int8-GEMM kernel runs (its boot self-test passed), not the scalar fallback. We
 /// accept **any** implemented vector tier because the runner fleet is heterogeneous:
@@ -2363,6 +2382,25 @@ fn check_boot_log(kvm: bool, log: &str, found: bool, interactive: bool) -> ExitC
         println!("IOAPIC routing proven: '{IOAPIC_LINE}' (keystroke phase: boot 1 only)");
     }
 
+    // SentinelFS FS-1c: the storage-capability lattice — the exact line.
+    let Some(sfs_cap_line) = log.lines().find(|l| l.starts_with(SFS_CAP_PREFIX)) else {
+        eprintln!(
+            "TEST FAILED: storage-capability proof line '{}…' missing (did \
+             `kernel::bus::storage_proof::prove_storage_caps` run?).",
+            SFS_CAP_PREFIX
+        );
+        return ExitCode::FAILURE;
+    };
+    if !sfs_cap_proof_passed(sfs_cap_line) {
+        eprintln!(
+            "TEST FAILED: the storage-capability proof did not pass (expected exactly \
+             '{}'): '{}'",
+            SFS_CAP_LINE, sfs_cap_line
+        );
+        return ExitCode::FAILURE;
+    }
+    println!("SentinelFS FS-1c proven: '{}'", sfs_cap_line.trim_end());
+
     // A vector int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is a
     // real SIMD kernel — proving the hand-written `asm!` kernels execute and compute
     // correctly. `-cpu Haswell` (TCG) exposes avx2; `-cpu host` (KVM) exposes avx2
@@ -3043,6 +3081,37 @@ ffffffff80105000 <isr_common>:\n\
             };
             assert!(!cap_proof_passed(&line), "{line}");
         }
+    }
+
+    #[test]
+    fn sfs_cap_proof_passed_accepts_only_the_exact_line() {
+        use super::sfs_cap_proof_passed;
+
+        let good = "[sfs] cap: narrow=ok wider-prefix=refused sibling-prefix=refused \
+                    rollback-from-write=refused blobs-widen=refused quota-raise=refused \
+                    expiry-extend=refused tree-from-live=refused ok";
+        assert!(sfs_cap_proof_passed(good));
+        assert!(sfs_cap_proof_passed(&format!("{good}\r")));
+        for (from, to) in [
+            ("narrow=ok", "narrow=FAIL"),
+            ("wider-prefix=refused", "wider-prefix=ACCEPTED"),
+            ("sibling-prefix=refused", "sibling-prefix=ACCEPTED"),
+            (
+                "rollback-from-write=refused",
+                "rollback-from-write=ACCEPTED",
+            ),
+            ("blobs-widen=refused", "blobs-widen=ACCEPTED"),
+            ("quota-raise=refused", "quota-raise=ACCEPTED"),
+            ("expiry-extend=refused", "expiry-extend=ACCEPTED"),
+            ("tree-from-live=refused", "tree-from-live=ACCEPTED"),
+            (" ok", " FAIL"),
+            ("[sfs] cap: ", " [sfs] cap: "),
+        ] {
+            let bad = good.replacen(from, to, 1);
+            assert!(!sfs_cap_proof_passed(&bad), "{bad}");
+        }
+        assert!(!sfs_cap_proof_passed(&format!("{good} x")));
+        assert!(!sfs_cap_proof_passed(""));
     }
 
     #[test]
