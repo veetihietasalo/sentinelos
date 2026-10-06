@@ -4,11 +4,15 @@
 //!
 //! All safe Rust, zero `hal` delta.
 //!
-//! - **Identity** ([`ComponentId`], §6): `SHA-256(TAG ‖ le64(|code|) ‖ code ‖
-//!   le64(|params|) ‖ params)`. The framing is *injective* (Kani:
-//!   `proofs::framing_is_injective_bounded`), which unframed `H(code ‖ params)`
-//!   is not (amendment A1). [`InstanceId`] is per boot, per instantiation, and
-//!   never reused.
+//! - **Identity** ([`ComponentId`], §6, v2 since PR-2b, amendment A12):
+//!   `SHA-256(TAG ‖ le64(|code|) ‖ code ‖ le64(|params|) ‖ params ‖ le64(n) ‖
+//!   req₁ … reqₙ ‖ le64(m) ‖ prov₁ … provₘ)` — the id binds the component's
+//!   **declarations** (what it asks for, in manifest order, and the services
+//!   it provides), so an edited manifest is refused as `IdMismatch` before
+//!   anything runs (threat T-MAN-1). The framing is *injective* (Kani: three
+//!   harnesses in `proofs`, composed in its module docs), which unframed
+//!   `H(code ‖ params)` is not (amendment A1). [`InstanceId`] is per boot, per
+//!   instantiation, and never reused.
 //! - **The runtime seam** ([`ComponentRuntime`]): the only thing the host sees
 //!   of whatever executes a component. [`native::NativeRuntime`] is the first
 //!   implementation; the memory-boundary gate (spec §12) adds the second before
@@ -18,13 +22,16 @@
 //!   mismatch *before* the runtime sees them. Instantiation takes the
 //!   [`Verified`] token only `verify` mints, so the order is a type, not a
 //!   convention.
-//! - **Grants** (PR-2, spec §8, amendment A8): a manifest lists the
-//!   capabilities it asks for, each `Required` or `Optional`. Each is bound to
-//!   the oldest live instance of the named component and granted as
-//!   `request ∧ policy` ([`crate::cap::Policy`], deny by default). Every request
-//!   is resolved **before** anything changes; a required one that cannot be
-//!   granted refuses the instantiation ([`InstantiateError::MissingRequiredCap`]),
-//!   an optional one is skipped and the refusal logged.
+//! - **Grants** (PR-2, spec §8, amendment A8; services since PR-2b, A12): a
+//!   manifest lists the capabilities it asks for, each naming a **service**
+//!   and each `Required` or `Optional`. Each resolves service → the policy's
+//!   route → provider id → the provider's oldest live instance — honoured
+//!   only if that provider's own id-bound manifest provides the service — and
+//!   is granted as `request ∧ policy` ([`crate::cap::Policy`], deny by
+//!   default). Every request is resolved **before** anything changes; a
+//!   required one that cannot be granted refuses the instantiation
+//!   ([`InstantiateError::MissingRequiredCap`]), an optional one is skipped
+//!   and the refusal logged.
 //! - **Kernel-wide** (PR-2): the host lives in `crate::bus::HOST`, behind one
 //!   lock; component code never runs while it is held. Every instance's inbox
 //!   arena, every capability table and the denial log are part of this fixed
@@ -45,7 +52,9 @@ pub mod seen;
 
 use crate::cap::deny::{Action, DenyLog, DenyRecord, DenyTotals, DENY_LOG_LEN};
 use crate::cap::table::{CapSpace, MAX_CAPS};
-use crate::cap::{CapIndex, CapNeed, CapRequest, Capability, DenyReason, Policy, Target, Tick};
+use crate::cap::{
+    CapIndex, CapNeed, CapRequest, Capability, DenyReason, Policy, ServiceName, Target, Tick,
+};
 use crate::hash::{Digest, Sha256};
 use codec::{DecodeError, Envelope, Sender, Wire};
 use inbox::InboxRing;
@@ -63,10 +72,13 @@ pub const MAX_MANIFEST_CAPS: usize = 8;
 pub const DENY_BUCKETS: usize = MAX_INSTANCES + 1;
 /// The bucket for refusals with no instance.
 pub const UNBOUND_BUCKET: usize = MAX_INSTANCES;
-/// Domain-separation tag that opens every framed id input (spec §6).
-pub const ID_DOMAIN_TAG: &[u8] = b"sentinelos:component:v1";
+/// Domain-separation tag that opens every framed id input (spec §6). `v2`
+/// since PR-2b (A12): the frame binds the declarations, so no v1 id can equal
+/// a v2 one by construction of the input.
+pub const ID_DOMAIN_TAG: &[u8] = b"sentinelos:component:v2";
 
-/// *What* a component is: the framed hash of its code and parameters.
+/// *What* a component is: the framed hash of its code, its parameters and its
+/// declarations (v2, spec §6).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ComponentId(pub Digest);
 
@@ -75,10 +87,17 @@ impl ComponentId {
     /// anything (no preimage is expected to reach it).
     pub const KERNEL: ComponentId = ComponentId([0; 32]);
 
-    /// `SHA-256(frame(code, params))` — see [`frame_into`].
-    pub fn derive(code: &[u8], params: &[u8]) -> ComponentId {
+    /// `SHA-256(frame(code, params, requests, provides))` — see
+    /// [`frame_into`]. Total: it hashes whatever it is given; canonical
+    /// `provides` is [`Manifest::verify`]'s check.
+    pub fn derive(
+        code: &[u8],
+        params: &[u8],
+        requests: &[CapRequest],
+        provides: &[ServiceName],
+    ) -> ComponentId {
         let mut h = Sha256::new();
-        frame_into(code, params, &mut h);
+        frame_into(code, params, requests, provides, &mut h);
         ComponentId(h.finalize())
     }
 
@@ -122,12 +141,43 @@ impl FrameSink for Sha256 {
     }
 }
 
-/// Feed `TAG ‖ le64(|code|) ‖ code ‖ le64(|params|) ‖ params` to `sink`.
+/// Feed the v2 id frame (spec §6, amendment A12) to `sink`:
 ///
-/// Length prefixes bind the split: `("a", "bc")` and `("ab", "c")` frame to
-/// different byte strings, so they get different ids. The tag separates this
-/// hash from every other use of SHA-256 in the kernel.
-pub fn frame_into(code: &[u8], params: &[u8], sink: &mut impl FrameSink) {
+/// ```text
+/// TAG ‖ le64(|code|) ‖ code ‖ le64(|params|) ‖ params
+///     ‖ le64(n) ‖ req₁ ‖ … ‖ reqₙ          (requests, manifest order)
+///     ‖ le64(m) ‖ prov₁ ‖ … ‖ provₘ         (provided services)
+/// req  = service[32] ‖ le32(ops) ‖ u8(need) ‖ u8(attenuation kind)
+///        ‖ le16(len) ‖ attenuation[len]
+/// prov = service[32]
+/// ```
+///
+/// Length prefixes bind every split: `("a", "bc")` and `("ab", "c")` frame to
+/// different byte strings, and so do a request moved between the lists, a
+/// request dropped, added, reordered or edited (`need` included). The tag
+/// separates this hash from every other use of SHA-256 in the kernel. One
+/// function feeds both the hasher and the Kani harnesses' byte sinks, so what
+/// is proven injective is what is hashed.
+///
+/// It is exactly [`frame_head`], [`frame_requests`] and [`frame_provides`]
+/// into the same sink, in that order — the split the injectivity proof
+/// composes (`proofs`).
+pub fn frame_into(
+    code: &[u8],
+    params: &[u8],
+    requests: &[CapRequest],
+    provides: &[ServiceName],
+    sink: &mut impl FrameSink,
+) {
+    frame_head(code, params, sink);
+    frame_requests(requests, sink);
+    frame_provides(provides, sink);
+}
+
+/// The frame's head: `TAG ‖ le64(|code|) ‖ code ‖ le64(|params|) ‖ params`
+/// (the v1 fields under the v2 tag). Prefix-free: its own bytes say where it
+/// ends.
+fn frame_head(code: &[u8], params: &[u8], sink: &mut impl FrameSink) {
     sink.absorb(ID_DOMAIN_TAG);
     sink.absorb(&(code.len() as u64).to_le_bytes());
     sink.absorb(code);
@@ -135,32 +185,81 @@ pub fn frame_into(code: &[u8], params: &[u8], sink: &mut impl FrameSink) {
     sink.absorb(params);
 }
 
-/// What a requester hands the host: the bytes, the parameters, the id it
-/// *claims* they hash to, and the capabilities the component asks for. The
-/// host checks the claim; it never trusts it. The requests bound nothing by
+/// The frame's requests, in manifest order: `le64(n) ‖ req₁ … reqₙ`, each
+/// `service[32] ‖ le32(ops) ‖ u8(need) ‖ u8(kind) ‖ le16(len) ‖
+/// attenuation[len]`. Prefix-free: its own bytes say where it ends.
+fn frame_requests(requests: &[CapRequest], sink: &mut impl FrameSink) {
+    sink.absorb(&(requests.len() as u64).to_le_bytes());
+    for req in requests {
+        let (kind, bytes, len) = req.attenuation.id_encoding();
+        sink.absorb(req.target.as_bytes());
+        sink.absorb(&req.ops.bits().to_le_bytes());
+        sink.absorb(&[req.need.id_byte(), kind]);
+        sink.absorb(&(len as u16).to_le_bytes());
+        sink.absorb(&bytes[..len]);
+    }
+}
+
+/// The frame's provided services: `le64(m) ‖ prov₁ … provₘ`, each
+/// `service[32]`.
+fn frame_provides(provides: &[ServiceName], sink: &mut impl FrameSink) {
+    sink.absorb(&(provides.len() as u64).to_le_bytes());
+    for service in provides {
+        sink.absorb(service.as_bytes());
+    }
+}
+
+/// Whether `provides` is canonical: strictly ascending, so no duplicates and
+/// one encoding per set (spec §6).
+pub fn provides_is_canonical(provides: &[ServiceName]) -> bool {
+    provides.windows(2).all(|w| w[0] < w[1])
+}
+
+/// What a requester hands the host: the bytes, the parameters, the
+/// declarations — the capabilities the component asks for and the services
+/// it provides — and the id it *claims* all of that hashes to. The host
+/// checks the claim; it never trusts it. The requests bound nothing by
 /// themselves — the policy does (`grant = request ∧ policy`).
 ///
-/// The capability requests are not part of the id yet (threat T-MAN-1: today
-/// every manifest is compiled into the image and only the kernel
-/// instantiates). Decided as component amendment A12, landing in PR-2b before
-/// PR-3: the v2 framing binds them into the id, and they name services.
+/// Since PR-2b (v2, A12) the declarations are part of the id: stripping a
+/// `Required`, adding an op, dropping or swapping a request, or editing
+/// `provides` changes the hash, and [`Manifest::verify`] refuses the result
+/// (threat T-MAN-1).
 #[derive(Clone, Copy, Debug)]
 pub struct Manifest {
     /// The component's code (for a native component, its descriptor).
     pub code: &'static [u8],
     /// Its instantiation parameters.
     pub params: &'static [u8],
-    /// The id the requester claims `(code, params)` hash to.
+    /// The id the requester claims the frame of everything below hashes to.
     pub id: ComponentId,
-    /// Capabilities it asks for, each required or optional (A8).
+    /// Capabilities it asks for, in order (`Ctx::granted(i)` indexes by it),
+    /// each naming a service, each required or optional (A8).
     pub caps: &'static [CapRequest],
+    /// Services it answers, strictly ascending (a set has one encoding). A
+    /// route to this component is honoured only for a service named here.
+    pub provides: &'static [ServiceName],
 }
 
 impl Manifest {
-    /// Hash what would run and compare with the claimed id. The only way to
-    /// obtain a [`Verified`] token, which instantiation requires.
+    /// The v2 id of this manifest's code, params and declarations.
+    pub fn derived_id(&self) -> ComponentId {
+        ComponentId::derive(self.code, self.params, self.caps, self.provides)
+    }
+
+    /// Check the declarations are canonical and meaningful, then hash what
+    /// would run and compare with the claimed id. The only way to obtain a
+    /// [`Verified`] token, which instantiation requires. A non-canonical
+    /// `provides` (unsorted or duplicated) and a request that can never mean
+    /// anything ([`CapRequest::is_meaningful`]) are refused before hashing.
     pub fn verify(&self) -> Result<Verified<'_>, InstantiateError> {
-        if ComponentId::derive(self.code, self.params) == self.id {
+        if !provides_is_canonical(self.provides) {
+            return Err(InstantiateError::NonCanonicalProvides);
+        }
+        if !self.caps.iter().all(CapRequest::is_meaningful) {
+            return Err(InstantiateError::MalformedRequest);
+        }
+        if self.derived_id() == self.id {
             Ok(Verified { manifest: self })
         } else {
             Err(InstantiateError::IdMismatch)
@@ -179,8 +278,17 @@ pub struct Verified<'m> {
 /// Why the host refused to instantiate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InstantiateError {
-    /// `derive(code, params) != manifest.id`. Nothing ran.
+    /// The v2 frame of the manifest's code, params and declarations does not
+    /// hash to `manifest.id`. Nothing ran.
     IdMismatch,
+    /// The manifest's `provides` is not strictly ascending (unsorted or a
+    /// duplicate): one set, one encoding. Refused before hashing.
+    NonCanonicalProvides,
+    /// A capability request that can never mean anything: no operation, an
+    /// operation bit no `Op` names (FS-1c's reserved 8..=12 included), or an
+    /// attenuation that never fits (`Message.max_len > MAX_PAYLOAD`). Refused
+    /// before hashing, so every declaration an id binds is meaningful.
+    MalformedRequest,
     /// The runtime has no component for these bytes.
     UnknownCode,
     /// The host's or the runtime's instance table is full.
@@ -199,6 +307,8 @@ impl InstantiateError {
     pub fn label(self) -> &'static str {
         match self {
             InstantiateError::IdMismatch => "id-mismatch",
+            InstantiateError::NonCanonicalProvides => "non-canonical-provides",
+            InstantiateError::MalformedRequest => "malformed-request",
             InstantiateError::UnknownCode => "unknown-code",
             InstantiateError::TooManyInstances => "too-many-instances",
             InstantiateError::RuntimeRejected => "runtime-rejected",
@@ -300,14 +410,17 @@ pub(crate) struct Instance {
     pub(crate) id: InstanceId,
     /// What it runs.
     pub(crate) component: ComponentId,
+    /// The services its verified (id-bound) manifest provides — what a route
+    /// to it may name (threat T-ROUTE-1).
+    pub(crate) provides: &'static [ServiceName],
     /// The runtime's name for it.
     pub(crate) handle: RuntimeHandle,
     /// Its inbox.
     pub(crate) inbox: InboxRing<Wire, MAX_INBOX>,
     /// Next correlation tag for its own requests (never 0).
-    pub(crate) next_reply_tag: u32,
+    pub(crate) next_reply_tag: u64,
     /// Next tag for kernel calls into it.
-    pub(crate) next_kernel_tag: u32,
+    pub(crate) next_kernel_tag: u64,
     /// The index granted for each manifest request, in manifest order.
     pub(crate) grants: [Option<CapIndex>; MAX_MANIFEST_CAPS],
     /// Its code is running now (a delivered envelope's handler or a kernel
@@ -421,28 +534,42 @@ impl<R: ComponentRuntime> Host<R> {
         })
     }
 
-    /// The oldest live instance of `component` — how a manifest's request,
-    /// which names an id, is bound to an instance (spec §6).
-    fn oldest_instance_of(&self, component: &ComponentId) -> Option<InstanceId> {
+    /// The oldest live instance of `component` — how a routed provider id is
+    /// bound to an instance (spec §6, §8).
+    fn oldest_instance_of(&self, component: &ComponentId) -> Option<&Instance> {
         self.instances
             .iter()
             .flatten()
             .filter(|i| i.component == *component)
-            .map(|i| i.id)
-            .min()
+            .min_by_key(|i| i.id)
     }
 
     /// What `holder` would be granted for `req` now: `(request, bound)`, whose
-    /// meet `grant` installs; or why not.
+    /// meet `grant` installs; or why not (spec §8, A12):
+    ///
+    /// 1. the policy routes the service to exactly one provider id, else
+    ///    [`DenyReason::NoRoute`];
+    /// 2. a provider instance is live (the oldest), else
+    ///    [`DenyReason::NoProvider`];
+    /// 3. the provider's own verified, id-bound manifest provides the
+    ///    service — a route is honoured only then — else
+    ///    [`DenyReason::NotProvided`] (threat T-ROUTE-1);
+    /// 4. the holder's allow-list names the service, and the rule and the
+    ///    request share something, else [`DenyReason::PolicyRefused`].
     fn plan_grant(
         &self,
         holder: &ComponentId,
         req: &CapRequest,
         now: Tick,
     ) -> Result<(Capability, Capability), DenyReason> {
-        let target = self
-            .oldest_instance_of(&req.target)
-            .ok_or(DenyReason::TargetGone)?;
+        let provider = self.policy.route(&req.target).ok_or(DenyReason::NoRoute)?;
+        let inst = self
+            .oldest_instance_of(&provider)
+            .ok_or(DenyReason::NoProvider)?;
+        if !inst.provides.contains(&req.target) {
+            return Err(DenyReason::NotProvided);
+        }
+        let target = inst.id;
         let bound = self
             .policy
             .bound(holder, &req.target, target, now)
@@ -458,6 +585,23 @@ impl<R: ComponentRuntime> Host<R> {
             return Err(DenyReason::Malformed);
         }
         Ok((requested, bound))
+    }
+
+    /// Log a start refused for a `Required` request: first the precise
+    /// `cause` (`no-route`, `no-provider`, `not-provided`, `policy-refused`,
+    /// `table-full`, …), then `missing-required` — both in the kernel's
+    /// bucket, under the unborn component's name.
+    fn refuse_start(&mut self, now: Tick, unborn: Sender, cause: DenyReason) {
+        for reason in [cause, DenyReason::MissingRequired] {
+            self.deny.record(
+                now,
+                UNBOUND_BUCKET,
+                unborn,
+                CapIndex::KERNEL,
+                Action::Grant,
+                reason,
+            );
+        }
     }
 
     /// Verify, then instantiate — [`Self::instantiate_verified`] after
@@ -530,15 +674,8 @@ impl<R: ComponentRuntime> Host<R> {
                         room -= 1;
                     }
                 }
-                if planned.is_err() && need == CapNeed::Required {
-                    self.deny.record(
-                        now,
-                        UNBOUND_BUCKET,
-                        unborn,
-                        CapIndex::KERNEL,
-                        Action::Grant,
-                        DenyReason::MissingRequired,
-                    );
+                if let (Err(cause), CapNeed::Required) = (planned, need) {
+                    self.refuse_start(now, unborn, cause);
                     return Err(InstantiateError::MissingRequiredCap);
                 }
                 plan[i] = planned;
@@ -582,14 +719,7 @@ impl<R: ComponentRuntime> Host<R> {
                         // undo everything, and log it as a refused start.
                         self.caps.clear_table(slot);
                         self.runtime.release(handle);
-                        self.deny.record(
-                            now,
-                            UNBOUND_BUCKET,
-                            unborn,
-                            CapIndex::KERNEL,
-                            Action::Grant,
-                            DenyReason::MissingRequired,
-                        );
+                        self.refuse_start(now, unborn, reason);
                         return Err(InstantiateError::MissingRequiredCap);
                     }
                     // Instantiation is the kernel's act: rate-limited in the
@@ -610,6 +740,7 @@ impl<R: ComponentRuntime> Host<R> {
         self.instances[slot] = Some(Instance {
             id,
             component: m.id,
+            provides: m.provides,
             handle,
             inbox: InboxRing::new(),
             next_reply_tag: 1,
@@ -711,7 +842,7 @@ mod tests {
     use super::native::{NativeRuntime, BOOT_POLICY, HELLO_DESCRIPTOR, HELLO_MANIFEST, REGISTRY};
     use super::*;
     use crate::bus;
-    use crate::cap::{Attenuation, Op, OpSet};
+    use crate::cap::{Attenuation, Op, OpSet, ReplyTag};
     use alloc::vec::Vec;
     use hal::sync::SpinMutex;
 
@@ -723,8 +854,17 @@ mod tests {
     }
 
     fn framed(code: &[u8], params: &[u8]) -> Vec<u8> {
+        framed_with(code, params, &[], &[])
+    }
+
+    fn framed_with(
+        code: &[u8],
+        params: &[u8],
+        requests: &[CapRequest],
+        provides: &[ServiceName],
+    ) -> Vec<u8> {
         let mut s = VecSink(Vec::new());
-        frame_into(code, params, &mut s);
+        frame_into(code, params, requests, provides, &mut s);
         s.0
     }
 
@@ -732,18 +872,32 @@ mod tests {
         SpinMutex::new(Host::new(NativeRuntime::new(REGISTRY), BOOT_POLICY))
     }
 
+    const S1: ServiceName = crate::cap::service_literal("test.one/1");
+    const S2: ServiceName = crate::cap::service_literal("test.two/1");
+
+    const fn req(target: ServiceName, ops: &[Op], max_len: u16, need: CapNeed) -> CapRequest {
+        CapRequest {
+            target,
+            ops: OpSet::of(ops),
+            attenuation: Attenuation::Message { max_len },
+            need,
+        }
+    }
+
     #[test]
     fn framing_binds_the_split_and_the_tag() {
         // The classic collision unframed concatenation allows.
         assert_ne!(framed(b"a", b"bc"), framed(b"ab", b"c"));
         assert_ne!(
-            ComponentId::derive(b"a", b"bc"),
-            ComponentId::derive(b"ab", b"c")
+            ComponentId::derive(b"a", b"bc", &[], &[]),
+            ComponentId::derive(b"ab", b"c", &[], &[])
         );
         assert_ne!(framed(b"", b""), Vec::<u8>::new());
         assert!(framed(b"x", b"y").starts_with(ID_DOMAIN_TAG));
+        assert_eq!(ID_DOMAIN_TAG, b"sentinelos:component:v2");
         let f = framed(b"abc", b"de");
-        assert_eq!(f.len(), ID_DOMAIN_TAG.len() + 8 + 3 + 8 + 2);
+        // Two empty lists still frame their (zero) counts.
+        assert_eq!(f.len(), ID_DOMAIN_TAG.len() + 8 + 3 + 8 + 2 + 8 + 8);
         assert_eq!(
             &f[ID_DOMAIN_TAG.len()..ID_DOMAIN_TAG.len() + 8],
             &3u64.to_le_bytes()
@@ -751,9 +905,107 @@ mod tests {
     }
 
     #[test]
+    fn the_v2_frame_layout_is_exact() {
+        let r = req(S1, &[Op::Send, Op::Delegate], 0x0102, CapNeed::Optional);
+        let f = framed_with(b"c", b"p", &[r], &[S1, S2]);
+        let mut want = Vec::new();
+        want.extend_from_slice(b"sentinelos:component:v2");
+        want.extend_from_slice(&1u64.to_le_bytes());
+        want.push(b'c');
+        want.extend_from_slice(&1u64.to_le_bytes());
+        want.push(b'p');
+        want.extend_from_slice(&1u64.to_le_bytes());
+        want.extend_from_slice(S1.as_bytes());
+        want.extend_from_slice(&(Op::Send.bit() | Op::Delegate.bit()).to_le_bytes());
+        want.push(1); // Optional
+        want.push(0); // Message
+        want.extend_from_slice(&2u16.to_le_bytes());
+        want.extend_from_slice(&0x0102u16.to_le_bytes());
+        want.extend_from_slice(&2u64.to_le_bytes());
+        want.extend_from_slice(S1.as_bytes());
+        want.extend_from_slice(S2.as_bytes());
+        assert_eq!(f, want);
+    }
+
+    #[test]
+    fn every_declaration_edit_changes_the_id() {
+        let a = req(S1, &[Op::Send, Op::Request], 64, CapNeed::Required);
+        let b = req(S2, &[Op::Send], 32, CapNeed::Optional);
+        let base = ComponentId::derive(b"code", b"", &[a, b], &[S1]);
+        let edits: [(&[CapRequest], &[ServiceName]); 9] = [
+            (
+                &[req(S1, &[Op::Send, Op::Request], 64, CapNeed::Optional), b],
+                &[S1],
+            ),
+            (&[b, a], &[S1]),
+            (
+                &[
+                    req(
+                        S1,
+                        &[Op::Send, Op::Request, Op::Delegate],
+                        64,
+                        CapNeed::Required,
+                    ),
+                    b,
+                ],
+                &[S1],
+            ),
+            (&[a], &[S1]),
+            (&[a, b, b], &[S1]),
+            (
+                &[req(S1, &[Op::Send, Op::Request], 65, CapNeed::Required), b],
+                &[S1],
+            ),
+            (
+                &[req(S2, &[Op::Send, Op::Request], 64, CapNeed::Required), b],
+                &[S1],
+            ),
+            (&[a, b], &[]),
+            (&[a, b], &[S1, S2]),
+        ];
+        for (i, (caps, provides)) in edits.iter().enumerate() {
+            assert_ne!(
+                ComponentId::derive(b"code", b"", caps, provides),
+                base,
+                "edit {i} kept the id"
+            );
+        }
+        assert_eq!(ComponentId::derive(b"code", b"", &[a, b], &[S1]), base);
+    }
+
+    #[test]
+    fn a_non_canonical_provides_list_is_refused_before_hashing() {
+        assert!(provides_is_canonical(&[]));
+        assert!(provides_is_canonical(&[S1]));
+        assert!(provides_is_canonical(&[S1, S2]));
+        assert!(!provides_is_canonical(&[S2, S1]), "unsorted");
+        assert!(!provides_is_canonical(&[S1, S1]), "duplicate");
+        static UNSORTED: [ServiceName; 2] = [S2, S1];
+        static DUPLICATE: [ServiceName; 2] = [S1, S1];
+        for provides in [&UNSORTED[..], &DUPLICATE[..]] {
+            // Even with an id that matches the hash of these exact bytes.
+            let m = Manifest {
+                code: HELLO_DESCRIPTOR,
+                params: b"",
+                id: ComponentId::derive(HELLO_DESCRIPTOR, b"", &[], provides),
+                caps: &[],
+                provides,
+            };
+            assert_eq!(
+                m.verify().err(),
+                Some(InstantiateError::NonCanonicalProvides)
+            );
+            assert_eq!(
+                bus::instantiate(&hello_host(), &m),
+                Err(InstantiateError::NonCanonicalProvides)
+            );
+        }
+    }
+
+    #[test]
     fn derive_is_deterministic_and_short_hex_is_lowercase() {
-        let a = ComponentId::derive(HELLO_DESCRIPTOR, b"");
-        assert_eq!(a, ComponentId::derive(HELLO_DESCRIPTOR, b""));
+        let a = ComponentId::derive(HELLO_DESCRIPTOR, b"", &[], &[]);
+        assert_eq!(a, ComponentId::derive(HELLO_DESCRIPTOR, b"", &[], &[]));
         assert_ne!(a, ComponentId::KERNEL);
         let hex = ComponentId([
             0xAB, 0xCD, 0x01, 0x2F, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -794,8 +1046,9 @@ mod tests {
         let m = Manifest {
             code,
             params: b"",
-            id: ComponentId::derive(code, b""),
+            id: ComponentId::derive(code, b"", &[], &[]),
             caps: &[],
+            provides: &[],
         };
         assert_eq!(
             bus::instantiate(&cell, &m),
@@ -828,10 +1081,10 @@ mod tests {
             }
         );
         assert_eq!(reply.to, InstanceId::KERNEL);
-        assert_eq!(reply.kind, Kind::Reply { reply_tag: 1 });
+        assert_eq!(reply.kind, Kind::Reply { tag: ReplyTag(1) });
         // Reply tags advance per request.
         let again = bus::call_envelope(&cell, inst, "greet", b"x").unwrap();
-        assert_eq!(again.kind, Kind::Reply { reply_tag: 2 });
+        assert_eq!(again.kind, Kind::Reply { tag: ReplyTag(2) });
 
         let mut out = [0u8; 64];
         let n = bus::call(&cell, inst, "greet", b"world", &mut out).unwrap();
@@ -898,13 +1151,15 @@ mod tests {
     #[test]
     fn manifest_caps_are_bounded() {
         static MANY: [CapRequest; MAX_MANIFEST_CAPS + 1] = [CapRequest {
-            target: ComponentId([9; 32]),
+            target: S1,
             ops: OpSet::of(&[Op::Send]),
             attenuation: Attenuation::UNRESTRICTED_MESSAGE,
             need: CapNeed::Optional,
         }; MAX_MANIFEST_CAPS + 1];
+        // An honest id: the bound is checked after the hash.
         let m = Manifest {
             caps: &MANY,
+            id: ComponentId::derive(HELLO_DESCRIPTOR, b"", &MANY, HELLO_MANIFEST.provides),
             ..HELLO_MANIFEST
         };
         assert_eq!(
@@ -926,9 +1181,55 @@ mod tests {
 }
 
 /// Kani proof harnesses. Compiled only under `cargo kani`.
+///
+/// **The v2 frame is injective** on bounded inputs (spec §6, A1, A12; threat
+/// T-MAN-1). `frame_into` is exactly `frame_head`, `frame_requests` and
+/// `frame_provides` into one sink, so a frame is the byte string
+/// `H(code, params) ‖ R(requests) ‖ P(provides)`. Three harnesses:
+///
+/// - [`framing_is_injective_bounded`]: `H` is injective and **prefix-free** —
+///   if `H(a)` is a prefix of `H(b)`, then `a = b`.
+/// - [`request_framing_is_self_delimiting_bounded`]: `R` is injective and
+///   **self-delimiting** — a decoder reading `R(r)` followed by arbitrary
+///   bytes recovers `r` (every field, `need` included, in manifest order) and
+///   reads exactly `|R(r)|` bytes, never one more; so `R` is prefix-free too.
+/// - [`provides_framing_is_injective_bounded`]: `P` is injective — a decoder
+///   reading only the bytes recovers every service.
+///
+/// Composition (the standard prefix-free-code argument): let
+/// `H(a) ‖ R(r) ‖ P(s) = H(b) ‖ R(r') ‖ P(s')` and say `|H(a)| ≤ |H(b)|`. Both
+/// sides start with `H(a)` and with `H(b)`, so `H(a)` is a prefix of `H(b)`:
+/// `a = b`, and removing `H(a)` leaves `R(r) ‖ P(s) = R(r') ‖ P(s')`. The
+/// self-delimiting decoder reads the same bytes from both and returns `r` and
+/// `r'` after `|R(r)| = |R(r')|` bytes: `r = r'`. What remains is
+/// `P(s) = P(s')`: `s = s'`. The collision resistance of SHA-256 then lifts
+/// frame injectivity to `ComponentId`.
+///
+/// **What is machine-checked:** Kani proves the three lemmas; the
+/// composition is the paper argument above, not a Kani run.
+///
+/// The self-delimiting lemma is checked with `TAIL = 8` arbitrary trailing
+/// bytes — the shortest real tail, an empty `P` (`le64(0)`). For longer tails
+/// it rests on the decoder being **causal**: `Cursor` reads bytes strictly in
+/// order, each read advancing `pos`, and uses `b.len` only to detect the end
+/// (a read at `pos >= len` fails). Its result therefore depends only on the
+/// first `pos` bytes; on `R(r)` followed by anything, `pos` stops at
+/// `|R(r)|` (the harness checks this), so no byte of the tail is ever read,
+/// whatever the tail's length.
+///
+/// Why three harnesses: one over the whole frame (up to 209 bytes, 128 of
+/// them symbolic service names) did not fit — two symbolic frames compared
+/// byte for byte ran CBMC out of memory (15 GiB), a whole-frame round trip
+/// with every length dispatched to a constant took ~4.5 s of symbolic
+/// execution per branch over 144 branches, and the declarations alone as one
+/// round trip took 437 s. Split along the frame's own fields, each harness
+/// stays under the 60 s budget.
 #[cfg(kani)]
 mod proofs {
-    use super::{frame_into, FrameSink, ID_DOMAIN_TAG};
+    use super::{frame_head, frame_provides, frame_requests, FrameSink, ID_DOMAIN_TAG};
+    use crate::cap::{Attenuation, CapNeed, CapRequest, OpSet, ServiceName};
+
+    // ── H: the head is injective and prefix-free ───────────────────────────
 
     /// A fixed byte buffer that absorbs framed input (never more than `N`).
     struct ByteSink<const N: usize> {
@@ -944,11 +1245,12 @@ mod proofs {
         }
     }
 
-    /// The framing is injective on bounded inputs: if two `(code, params)`
-    /// pairs frame to the same bytes, they are the same pair — lengths and
-    /// contents. This is the property unframed `H(code ‖ params)` lacks
-    /// (spec §6, amendment A1) and the one the hash's collision resistance
-    /// then lifts to `ComponentId`.
+    /// The head's injectivity and prefix-freeness on bounded inputs: if the
+    /// head of `(code, params)` is a prefix of the head of `(code', params')`
+    /// — equal bytes included — then the lengths and contents are the same.
+    /// Unframed `H(code ‖ params)` lacks this (A1: `("a", "bc")` and
+    /// `("ab", "c")` collide). One third of the v2 frame's injectivity (module
+    /// docs). Code and params ≤ 3 bytes, lengths and contents symbolic.
     #[kani::proof]
     fn framing_is_injective_bounded() {
         const MAX: usize = 3;
@@ -973,17 +1275,27 @@ mod proofs {
             buf: [0; CAP],
             len: 0,
         };
-        frame_into(&a[..la], &ap[..pa], &mut sa);
+        frame_head(&a[..la], &ap[..pa], &mut sa);
         let mut sb = ByteSink::<CAP> {
             buf: [0; CAP],
             len: 0,
         };
-        frame_into(&b[..lb], &bp[..pb], &mut sb);
+        frame_head(&b[..lb], &bp[..pb], &mut sb);
 
         assert!(sa.len == 23 + 8 + la + 8 + pa);
-        if sa.len == sb.len && sa.buf == sb.buf {
+        assert!(sb.len == 23 + 8 + lb + 8 + pb);
+        // `H(a)` is a prefix of `H(b)` (equal heads are the case
+        // `sa.len == sb.len`).
+        let mut prefix = sa.len <= sb.len;
+        for i in 0..CAP {
+            if i < sa.len {
+                prefix &= sa.buf[i] == sb.buf[i];
+            }
+        }
+        if prefix {
             assert!(la == lb);
             assert!(pa == pb);
+            assert!(sa.len == sb.len);
             for i in 0..MAX {
                 if i < la {
                     assert!(a[i] == b[i]);
@@ -992,6 +1304,274 @@ mod proofs {
                     assert!(ap[i] == bp[i]);
                 }
             }
+        }
+    }
+
+    // ── R and P: round trips through decoders that read only the bytes ─────
+
+    /// Requests (spec: ≤ 2).
+    const REQS: usize = 2;
+    /// Provided services (spec: ≤ 2).
+    const PROVS: usize = 2;
+    /// One framed request with today's only attenuation (2 bytes).
+    const REQ_LEN: usize = 32 + 4 + 1 + 1 + 2 + 2;
+    /// Arbitrary bytes after the requests, for the self-delimiting check: 8,
+    /// the shortest tail a real frame has (`P` with no services is
+    /// `le64(0)`). Longer tails: the causality argument in the module docs.
+    const TAIL: usize = 8;
+    /// The buffer is `CHUNKS` arrays of 32 bytes, not one long array: CBMC
+    /// tracks the cells of an array of at most 64 elements one by one (field
+    /// sensitivity), so bytes written at constant positions stay constants
+    /// the decoders can fold; a longer array is opaque to it.
+    const CHUNKS: usize = (8 + REQS * REQ_LEN + TAIL).div_ceil(32);
+
+    /// Bytes absorbed one at a time (a `memcpy` would hide them from constant
+    /// propagation too).
+    struct Bytes {
+        chunks: [[u8; 32]; CHUNKS],
+        len: usize,
+    }
+
+    impl Bytes {
+        const EMPTY: Bytes = Bytes {
+            chunks: [[0; 32]; CHUNKS],
+            len: 0,
+        };
+
+        /// Byte `i` (`0` past the buffer).
+        fn at(&self, i: usize) -> u8 {
+            if i < CHUNKS * 32 {
+                self.chunks[i / 32][i % 32]
+            } else {
+                0
+            }
+        }
+    }
+
+    impl FrameSink for Bytes {
+        fn absorb(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                if self.len < CHUNKS * 32 {
+                    self.chunks[self.len / 32][self.len % 32] = b;
+                    self.len += 1;
+                }
+            }
+        }
+    }
+
+    /// A cursor over the bytes: sequential reads only; a read past the end
+    /// clears `ok`. `pos` after decoding is how many bytes were read — the
+    /// decoders never look at a byte without moving past it.
+    struct Cursor<'a> {
+        b: &'a Bytes,
+        pos: usize,
+        ok: bool,
+    }
+
+    impl Cursor<'_> {
+        fn byte(&mut self) -> u8 {
+            let v = if self.pos < self.b.len {
+                self.b.at(self.pos)
+            } else {
+                self.ok = false;
+                0
+            };
+            self.pos += 1;
+            v
+        }
+
+        /// A little-endian integer of `k <= 8` bytes.
+        fn le(&mut self, k: usize) -> u64 {
+            let mut v = 0u64;
+            for j in 0..8 {
+                if j < k {
+                    v |= u64::from(self.byte()) << (8 * j);
+                }
+            }
+            v
+        }
+
+        /// A `le64` count; above `max` clears `ok` (and reads as 0).
+        fn count(&mut self, max: usize) -> usize {
+            let v = self.le(8);
+            if v > max as u64 {
+                self.ok = false;
+                0
+            } else {
+                v as usize
+            }
+        }
+
+        fn service(&mut self) -> ServiceName {
+            let mut s = [0u8; 32];
+            for x in s.iter_mut() {
+                *x = self.byte();
+            }
+            ServiceName::from_raw(s)
+        }
+    }
+
+    const NO_SERVICE: ServiceName = ServiceName::from_raw([0; 32]);
+    const NO_REQUEST: CapRequest = CapRequest {
+        target: NO_SERVICE,
+        ops: OpSet::EMPTY,
+        attenuation: Attenuation::Message { max_len: 0 },
+        need: CapNeed::Required,
+    };
+
+    /// A symbolic request: any service bytes (canonical or not — the claim is
+    /// stronger for it), any op bits, either need, any `Message` limit (the
+    /// one attenuation kind; its encoding is 2 bytes).
+    fn any_request() -> CapRequest {
+        CapRequest {
+            target: ServiceName::any_bytes(),
+            ops: OpSet::from_bits(kani::any()),
+            attenuation: Attenuation::Message {
+                max_len: kani::any(),
+            },
+            need: if kani::any() {
+                CapNeed::Required
+            } else {
+                CapNeed::Optional
+            },
+        }
+    }
+
+    /// Decode a request list from the front of `b` — a function of the bytes
+    /// alone. Returns the requests, their count and the bytes read; `None`
+    /// for anything that is not a request list of the bounded shape.
+    fn decode_requests(b: &Bytes) -> Option<([CapRequest; REQS], usize, usize)> {
+        let mut c = Cursor {
+            b,
+            pos: 0,
+            ok: true,
+        };
+        let mut reqs = [NO_REQUEST; REQS];
+        let n = c.count(REQS);
+        for (i, slot) in reqs.iter_mut().enumerate() {
+            if i < n {
+                let target = c.service();
+                let ops = OpSet::from_bits(c.le(4) as u32);
+                let need = match c.byte() {
+                    0 => CapNeed::Required,
+                    1 => CapNeed::Optional,
+                    _ => {
+                        c.ok = false;
+                        CapNeed::Required
+                    }
+                };
+                // Kind 0 (`Message`) is the only attenuation; its length is 2.
+                if c.byte() != 0 || c.le(2) != 2 {
+                    c.ok = false;
+                }
+                let max_len = c.le(2) as u16;
+                *slot = CapRequest {
+                    target,
+                    ops,
+                    attenuation: Attenuation::Message { max_len },
+                    need,
+                };
+            }
+        }
+        if c.ok {
+            Some((reqs, n, c.pos))
+        } else {
+            None
+        }
+    }
+
+    /// `N` requests (a constant: `frame_requests` loops over a slice, which a
+    /// symbolic count would leave unbounded), then `TAIL` arbitrary bytes:
+    /// the decoder recovers the requests and reads exactly their frame.
+    fn requests_round_trip<const N: usize>(reqs: &[CapRequest; REQS], tail: [u8; TAIL]) {
+        let mut b = Bytes::EMPTY;
+        frame_requests(&reqs[..N], &mut b);
+        let framed = b.len;
+        assert!(framed == 8 + N * REQ_LEN);
+        b.absorb(&tail);
+        let Some((d, n, read)) = decode_requests(&b) else {
+            panic!("a request list failed to decode");
+        };
+        assert!(n == N && read == framed);
+        for i in 0..N {
+            assert!(d[i] == reqs[i]);
+        }
+    }
+
+    /// The request half of the declarations is injective and
+    /// self-delimiting on bounded inputs: from `R(r)` followed by arbitrary
+    /// bytes, a decoder that reads the bytes in order recovers every request
+    /// — service, ops, `need`, attenuation — **in manifest order**, and stops
+    /// after exactly `|R(r)|` bytes (it never reads a byte without counting
+    /// it, so what follows cannot change the result). This is what makes a
+    /// stripped `Required`, a swap, an added op or a dropped request change
+    /// the frame (threat T-MAN-1). One third of the v2 frame's injectivity
+    /// (module docs). ≤ 2 requests (attenuation 2 bytes); count dispatched to
+    /// a constant; every byte, field and trailing byte symbolic.
+    #[kani::proof]
+    fn request_framing_is_self_delimiting_bounded() {
+        let reqs = [any_request(), any_request()];
+        let tail: [u8; TAIL] = kani::any();
+        let n: usize = kani::any();
+        kani::assume(n <= REQS);
+        match n {
+            0 => requests_round_trip::<0>(&reqs, tail),
+            1 => requests_round_trip::<1>(&reqs, tail),
+            _ => requests_round_trip::<2>(&reqs, tail),
+        }
+    }
+
+    /// Decode a provides list filling `b` exactly — a function of the bytes
+    /// alone.
+    fn decode_provides(b: &Bytes) -> Option<([ServiceName; PROVS], usize)> {
+        let mut c = Cursor {
+            b,
+            pos: 0,
+            ok: true,
+        };
+        let mut provs = [NO_SERVICE; PROVS];
+        let m = c.count(PROVS);
+        for (i, slot) in provs.iter_mut().enumerate() {
+            if i < m {
+                *slot = c.service();
+            }
+        }
+        if c.ok && c.pos == b.len {
+            Some((provs, m))
+        } else {
+            None
+        }
+    }
+
+    /// `M` services (a constant, as for requests): the decoder recovers them.
+    fn provides_round_trip<const M: usize>(provs: &[ServiceName; PROVS]) {
+        let mut b = Bytes::EMPTY;
+        frame_provides(&provs[..M], &mut b);
+        assert!(b.len == 8 + M * 32);
+        let Some((d, m)) = decode_provides(&b) else {
+            panic!("a provides list failed to decode");
+        };
+        assert!(m == M);
+        for i in 0..M {
+            assert!(d[i] == provs[i]);
+        }
+    }
+
+    /// The provides half of the declarations is injective on bounded inputs:
+    /// a decoder that reads only the bytes recovers every service, in order —
+    /// so a service added to or dropped from `provides` changes the frame (a
+    /// squat on a routed name is refused as `id-mismatch`, threat T-ROUTE-1).
+    /// One third of the v2 frame's injectivity (module docs). ≤ 2 provides;
+    /// count dispatched to a constant; every byte symbolic.
+    #[kani::proof]
+    fn provides_framing_is_injective_bounded() {
+        let provs = [ServiceName::any_bytes(), ServiceName::any_bytes()];
+        let m: usize = kani::any();
+        kani::assume(m <= PROVS);
+        match m {
+            0 => provides_round_trip::<0>(&provs),
+            1 => provides_round_trip::<1>(&provs),
+            _ => provides_round_trip::<2>(&provs),
         }
     }
 }

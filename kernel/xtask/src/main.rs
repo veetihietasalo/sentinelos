@@ -738,15 +738,18 @@ fn check_persistence_chain(boot1: &str, boot2: &str, fresh: bool) -> Result<Stri
 /// §14): bus + capabilities on the kernel-wide host. `from` is kernel-stamped
 /// on every delivery, a component with no capability is denied by default,
 /// forged indices (never issued, another instance's, revoked, expired) are
-/// refused, and every denial is logged, rate-limited. Asserted exactly, with
-/// `N >= 1`: [`cap_proof_passed`].
+/// refused, every denial is logged, rate-limited, and (PR-2b, A12) a manifest
+/// whose declarations were edited after its id was computed is refused as
+/// `id-mismatch` before anything runs. Asserted exactly, with `N >= 1`:
+/// [`cap_proof_passed`].
 const CAP_PROOF_PREFIX: &str = "[cap] attested-from=";
 
 /// Whether `line` is exactly `[cap] attested-from=yes deny-by-default=yes
-/// forge-attempt=refused denies-logged=N ok` with a decimal `N >= 1`.
+/// forge-attempt=refused manifest-tamper=refused denies-logged=N ok` with a
+/// decimal `N >= 1`.
 fn cap_proof_passed(line: &str) -> bool {
-    const HEAD: &str =
-        "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=";
+    const HEAD: &str = "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused \
+                        manifest-tamper=refused denies-logged=";
     line.trim_end()
         .strip_prefix(HEAD)
         .and_then(|rest| rest.strip_suffix(" ok"))
@@ -2161,8 +2164,8 @@ fn check_boot_log(kvm: bool, log: &str, found: bool) -> ExitCode {
     if !cap_proof_passed(cap_line) {
         eprintln!(
             "TEST FAILED: the capability proof did not pass (expected exactly '[cap] \
-             attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=N ok' \
-             with N >= 1): '{}'",
+             attested-from=yes deny-by-default=yes forge-attempt=refused \
+             manifest-tamper=refused denies-logged=N ok' with N >= 1): '{}'",
             cap_line
         );
         return ExitCode::FAILURE;
@@ -2798,20 +2801,30 @@ ffffffff80105000 <isr_common>:\n\
         use super::cap_proof_passed;
 
         let good = "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused \
-                    denies-logged=13 ok";
+                    manifest-tamper=refused denies-logged=13 ok";
         assert!(cap_proof_passed(good));
         assert!(cap_proof_passed(&format!("{good}\r")));
+        const A: &str = "[cap] attested-from=";
         for bad in [
-            "[cap] attested-from=no deny-by-default=yes forge-attempt=refused denies-logged=13 ok",
-            "[cap] attested-from=yes deny-by-default=no forge-attempt=refused denies-logged=13 ok",
-            "[cap] attested-from=yes deny-by-default=yes forge-attempt=ACCEPTED denies-logged=13 ok",
-            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=0 ok",
-            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged= ok",
-            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=13 FAIL",
-            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=1x ok",
-            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=13 ok x",
+            // The PR-2 line, without the tamper field, no longer passes.
+            "[cap] attested-from=yes deny-by-default=yes forge-attempt=refused denies-logged=13 ok",
+            "no deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged=13 ok",
+            "yes deny-by-default=no forge-attempt=refused manifest-tamper=refused denies-logged=13 ok",
+            "yes deny-by-default=yes forge-attempt=ACCEPTED manifest-tamper=refused denies-logged=13 ok",
+            "yes deny-by-default=yes forge-attempt=refused manifest-tamper=ACCEPTED denies-logged=13 ok",
+            "yes deny-by-default=yes forge-attempt=refused denies-logged=13 manifest-tamper=refused ok",
+            "yes deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged=0 ok",
+            "yes deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged= ok",
+            "yes deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged=13 FAIL",
+            "yes deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged=1x ok",
+            "yes deny-by-default=yes forge-attempt=refused manifest-tamper=refused denies-logged=13 ok x",
         ] {
-            assert!(!cap_proof_passed(bad), "{bad}");
+            let line = if bad.starts_with('[') {
+                bad.to_string()
+            } else {
+                format!("{A}{bad}")
+            };
+            assert!(!cap_proof_passed(&line), "{line}");
         }
     }
 
