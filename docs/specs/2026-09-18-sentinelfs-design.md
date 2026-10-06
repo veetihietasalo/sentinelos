@@ -646,15 +646,21 @@ FS-1 splits in two, and attestation waits for the identity spec.
   and the toy `kernel::fs` flushes once per save through `blk::ata`. Status waits end at a TSC
   deadline (not a count of reads, which QEMU's asynchronous completion under host write
   pressure outlasted), and a timed-out command resets the channel before `Timeout` returns.
-- *Kani (A19), each measured alone.* `Node<4>`: split occupancy/order/separator 37.3 s, split
-  key-set preservation 17.7 s, append preservation 24.7 s, merge 44.0 s, re-cut 39.3 s / 41.2 s
-  (left / right underflow); codec over shrunken blocks: leaf decode totality 7.0 s, internal
-  decode totality 18.8 s, one-item leaf packing round trip 45.8 s. Getting there changed code,
-  not only harnesses: `Node` stores entries in inline arrays and every node and codec loop runs
-  over a constant bound (the capacity, or the block length) and stops early at the count — the
-  first versions sat in CBMC for minutes or ran out of 16 GB on symbolic-length moves. **Not
-  gating:** the two-item packing harness verifies but takes ~195 s; it is behind
-  `cfg(kani_slow)` and the host round-trip tests cover multi-item packing. `Node<6>` was not
+- *Kani (A19), each measured alone (2026-10-06).* `Node<4>`: split occupancy/order/separator
+  32.8 s, split key-set preservation 15.3 s, append preservation 19.4 s, merge 43.9 s, re-cut
+  34.6 s / 37.7 s (left / right underflow); codec over shrunken blocks: leaf decode totality
+  7.0 s, internal decode totality 17.1 s, one-item leaf packing round trip 42.5 s. Getting there
+  changed code, not only harnesses: `Node` stores entries in inline arrays and every node and
+  codec loop runs over a constant bound (the capacity, or the block length) and stops early at
+  the count — the first versions sat in CBMC for minutes or ran out of 16 GB on symbolic-length
+  moves. **Packing at the real block:** `leaf_packing_is_total_at_4k` (1.3 s) proves the
+  arithmetic of `place` — the one placement rule encode and decode share — at the real 4 KiB
+  block for n ≤ 4 items: every item that passes the weight check is placed, ranges are
+  consecutive from the block end and clear of the item table. It is not an encode/decode round
+  trip. `leaf_packing_invariant_is_inductive` (0.7 s) lifts that to **any** n ≤ `LEAF_CAP` by
+  induction over the placement loop (base: the weight check establishes "the gap holds all
+  remaining data"; step: `place` succeeds and re-establishes it). The byte-level end-to-end
+  round trip with two or more items is covered by the host tests, not Kani. `Node<6>` was not
   attempted (the `Node<4>` harnesses already needed splitting to fit), so the real fan-out
   bound is not earned yet (§15 "minds change on").
 - *Not done here.* A27 (fall back to the older slot when the newer tree is damaged) stays open:
@@ -667,7 +673,8 @@ is; Miri on `sfs::codec` and `blk` (scoped step; honest value on a `forbid(unsaf
 crate is the threaded host model of the cache/task hand-off, which is the race model the
 component review asked for and did not get); Kani harnesses are **merge conditions**, each
 discharged locally and hard-capped at 60 s measured; fmt-free console output; `hal-tcb.md`
-unchanged except FS-1b's amendment to row A2 and one invariant.
+unchanged except FS-1b's amendments to rows A2 and C16 (C16 now shared with the IOAPIC
+liveness wait) and one invariant (16).
 
 ## 12. Threat model
 
