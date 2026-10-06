@@ -209,6 +209,12 @@ trampoline path needs no lock hand-off.
   2. `SCHED` is acquired only with interrupts disabled, and **never held across `switch`**.
   3. `PREEMPT_COUNT` is 0 across every `switch` (both leaving and entering sides).
   4. `ready` never contains `current`; every live `TaskId` is in `tasks`; no id is duplicated across `current`/`ready`/`zombie`.
+     **Extended by park/unpark (2026-10-04):** a `Parked` task is in *none* of
+     `current`/`ready`/`zombies` (only `TASKS` knows it), and has an entry in its
+     core's `sleepers` set exactly when it parked with a deadline. Every other
+     state names exactly one place: `Running` ⇔ `current`, `Ready` ⇔ once in
+     `ready`, `Exited` ⇔ once in `zombies`. The idle is never `Parked`. Kani:
+     `parked_task_is_on_no_ring_inductive` (see "Park / unpark" below).
   5. A task never frees its own running stack: `exit()` parks its TCB in `zombie`, switches away, and the *next* scheduler pass reaps it.
      **As built since the FS-1a review:** no scheduler pass reaps. A reap inside
      `schedule()` runs with interrupts disabled, and freeing takes the heap lock:
@@ -353,3 +359,197 @@ original note predicted, and what changed in the doing:
   distinct=yes ok`, asserted by `cargo xtask test` under TCG and KVM.
 - Still out of scope: load balancing / work stealing, timer preemption on APs
   (phase 3: LAPIC timer + IOAPIC), TLB shootdown.
+
+## Park / unpark — **implemented (2026-10-04, SentinelFS spec §15 A25)**
+
+The blocking primitive the scheduler lacked: the `sfs-commit` task used to wait by
+yield-polling, runnable on the BSP forever. Designed to be reused by component PR-3's
+run-to-completion driver (component spec §18.4); that driver is not built here.
+
+### API (`kernel::sched`, all safe)
+
+```rust
+pub fn park();                                // block until unparked
+pub fn park_until(deadline: u64) -> Woken;    // ... or until mono_ticks() >= deadline
+pub enum Woken { Unparked, Deadline }
+pub fn unpark(id: TaskId) -> UnparkOutcome;   // any core; task or IRQ context
+pub enum UnparkOutcome { Woke, PermitStored, Refused }
+pub fn task_is_parked(id: TaskId) -> bool;    // introspection
+```
+
+- **Wake permit** (`std::thread::park` semantics): an unpark of a task that is
+  running or ready sets its one, uncounted permit; its next park consumes it and
+  returns at once. So a decide-then-park race cannot lose a wakeup: an unpark
+  landing between the caller's check and its park is kept.
+- **Deadline** — the production guarantee, precisely: `park_until(d)` returns
+  `Deadline` at once if `mono_ticks() >= d`; otherwise the deadline **fires on the
+  first tick of the task's own core at which `mono_ticks() >= d` — never early** —
+  unless an unpark comes first (which cancels it). `mono_ticks` is the max over
+  every core's tick count, so it can advance by more than one between two ticks
+  of the owning core (the Kani model ties each clock advance to a tick; production
+  does not — "first owning-core tick at or past `d`" is the claim, not "at `d`").
+  A core
+  that runs with `IF = 0` takes no ticks, so it delays its sleepers' deadlines
+  until it opens interrupts — a yield does not drain deadlines, only the tick
+  does. kmain's `IF = 0` boot sequence is such a span on the BSP: a pacing
+  deadline of `sfs-commit` falling inside it fires once kmain opens interrupts
+  (the yield-poll this replaced would have committed at kmain's next yield).
+  Nothing dirties the volume during boot today, and `request_commit` unparks
+  directly, so no boot path depends on it.
+- **Refused, no-op**: `unpark` of an exited, reaped or never-issued id, or of a
+  core's idle task (it never parks, so a stored permit could never be consumed).
+  Ids come
+  from one `AtomicU64::fetch_add` starting at 1 (0 is the BSP idle; AP idles take
+  fresh ids too) and are never reused within a boot, so a stale id never names a
+  later task.
+- **Refused parks** return `Woken::Unparked` at once and change nothing: from a
+  core's idle task (the fallback that must stay runnable — a non-idle task can
+  always park because its core's idle is then on `ready`), with preemption
+  disabled (it would hand the core on inside an open critical section), and with
+  interrupts disabled (IRQ context or an `IF = 0` section). Each is a caller bug
+  that a `while !done { park() }` loop would turn into a silent hot spin, so each
+  is a `debug_assert!` — the kernel is built in the dev profile, so the boot faults
+  loudly; a release build still returns at once rather than block a core that
+  cannot be switched. Callers loop on their own condition, as with any park.
+- **IRQ context**: `unpark` may be called from IRQ context. It allocates nothing
+  (a ring store and an array swap-remove), takes only the two IRQ-side scheduler
+  locks with `IF = 0` in queue → table order, and sends its IPI with `IF = 0`;
+  `spawn_on`'s IPI is now sent with `IF = 0` as well, so an IRQ can never land
+  between the two xAPIC ICR writes of a send on the same core. It never switches.
+  `park`/`park_until` are task context only. No caller is in IRQ context today.
+- **Local wake latency**: an unpark of a task on the caller's own core sends no
+  IPI. `on_tick` therefore reschedules whenever the core's idle task is current
+  **and halted** (`sched::idle_halt`, which kmain's loop and `ap_idle_loop` halt
+  through; a per-core `in_idle_halt` flag) and `ready` is non-empty, so a local
+  wake while the idle sleeps is picked up on the next tick. An idle doing work is
+  never preempted by this rule — kmain runs the whole desktop loop as the BSP's
+  idle — it hands over at its next halt. Measured
+  at boot (informational `local-wake-ticks=`): **0–1 ticks** with the rule (four boots), **6
+  ticks** without it (two boots; the rest of the idle's 10-tick slice). Otherwise the woken
+  task runs at the current task's next yield, park or slice expiry.
+
+### Data structures — fixed, per core, allocation-free
+
+- `TaskState::Parked`; per task, `permit: bool`, `woken: Woken` (written by the
+  waker, read by the task when its park returns) and `idle: bool`.
+- `CpuSched::sleepers: Sleepers<MAX_TASKS>` — `(TaskId, deadline)` arrays plus a
+  cached `earliest` (invariant: `earliest <=` every stored deadline; production
+  keeps it exact). `on_tick` compares `now < earliest` (O(1)) and otherwise drains
+  every expired entry — one pass over ≤ `MAX_TASKS` entries with a `TaskTable`
+  lookup (≤ `MAX_TASKS` slots) per expired one: about 64 × 64 slot visits in the
+  worst case, bounded and allocation-free, in IRQ context. `unpark` removes its
+  target's entry. Can never fill: it names only parked tasks pinned to that core.
+- `on_tick` reschedules (through `tick_action`, as on a slice expiry) when the
+  slice expired, a deadline woke a task, or the halted idle is current with
+  `ready` non-empty. So deadline wakes **preempt mid-slice**: the round-robin
+  switch happens on that tick, and the woken task runs then if it is at the head
+  of `ready`, otherwise in its turn. Counters: only slice expiries count as
+  `tick_events` (the AP preemption proof's evidence); slice expiries and deadline
+  wakes as `events`; the halted idle making way as `idle_wakes`.
+- `park_step` decides everything before it mutates anything, and the glue does
+  too: both switch handles (the caller's and the ready head's — the only task
+  `park_step` can switch to) are minted before `park_step` runs, and a missing
+  one refuses the park unchanged. A refusal is carried out of the locked section
+  and `debug_assert!`ed after the guards drop, naming its reason (idle caller,
+  unknown caller, empty ready ring, full sleeper set, missing handle). (Both tasks are in the slab by
+  construction — a `debug_assert!` checks it).
+- The pure steps `park_step` / `unpark_step` / `expire_step` (and the existing
+  `pick_next_parking_exits` for yields and exits) are generic over `ReadyQueue` and
+  a `ParkTable` view, so production, the host tests and the Kani model run the same
+  code.
+
+### Cross-core wake-up
+
+A task is resumed only by its own core. Remote `unpark` pushes it onto the target
+core's `ready` under that core's lock and sends the reschedule IPI (vector `0xF0`);
+the target's `on_resched_ipi` switches at the ISR tail. No core touches another's
+`current`. A park leaves `current` and switches away inside one `IF = 0` section;
+a remote unpark that lands between the lock release and the completed register
+save only queues the task on a core that is still mid-switch with `IF = 0` — the
+same argument as a yield's requeue before its switch.
+
+### Lock order
+
+No new lock. Park, unpark and the tick's deadline drain take
+`CPU_SCHED[cpu]` → `TASKS` — the existing **queue → table** order — with `IF = 0`,
+never across a switch or an allocation. `unpark` reads the target's (immutable,
+pinned) core under `TASKS` alone and releases it before taking the queue lock; it
+re-checks the task under both. Both locks stay on the "reachable from IRQ context,
+only taken with `IF = 0`" side of hal-tcb §5e. A parked task is never suspended
+inside the allocator (it parked voluntarily), so §5e's "no other task on this core
+may be suspended inside the allocator" holds for it; it may again once it runs.
+
+### Invariants (Kani, `sched::park::proofs`, induction)
+
+Each harness is an induction step from **any** state satisfying all three
+invariants (rings, sleepers — including the cached `earliest`, which is symbolic
+and constrained only by `earliest <=` every entry — states, permits, ghosts and
+the clock symbolic, then assumed consistent) through one symbolic operation — park (with no deadline or
+`now + 0..=2`), unpark of any id (including a dead one), tick (clock + 0/1, drain,
+then a switch on a wake or symbolically), or exit — over 3 tasks (the idle plus two)
+and capacity-2 rings/sleepers; the base case is its own harness. So the properties
+hold on every trace, not just a bounded one (bounded-trace versions, 3–5 steps from
+boot, were measured at 34–170 s and dropped as subsumed). The clock bounds
+(`now < 2^32`, deadlines `< 2^33`) are an order/translation abstraction: the
+induction holds for every state in that range, and production only compares these
+values (plus a small offset), so a production state with the same order relations
+behaves identically; the bounds only keep the model's own `now + k` from overflowing.
+
+| Harness | Property | Alone, round 2 / round 1 alone / round 1 full suite (shared 4-core host) |
+|---|---|---|
+| `park_invariants_hold_at_boot` | base case; `cover!` that the inductive assumption admits two parked tasks, one with a deadline | 18 s / 18 s / 16 s |
+| `park_transitions_are_reachable` | `cover!`s from the inductive assumption through one step: a park that switches away with a deadline; a tick whose drain wakes a task; an unpark that wakes a task and drops its sleeper entry (all satisfied) | 42 s / 46 s / 39 s |
+| `park_no_lost_wakeup_inductive` | (a) an unparked task is never left parked; a permit survives until a park consumes it; a park with a permit owed returns at once; unpark answers `Woke`/`PermitStored`/`Refused` by state (`Refused` for the idle) | 41 s / 42 s / 42 s |
+| `parked_task_is_on_no_ring_inductive` | (b) Invariant #4 extended, above; only the idle is ever refused a park, and for `Refusal::Idle`; `earliest <=` every sleeper | 55 s / 58 s / 55 s |
+| `deadline_fires_once_never_early_inductive` | (c) a deadline fires at most once, never before its tick, is never missed; `Deadline` is answered at once only when passed; `earliest <=` every sleeper | 51 s / 51 s / 50 s |
+
+The covers live in their own harness rather than in each induction step: the
+`Prop` only selects which assertions are checked and CBMC assertions never prune
+paths, so reachability is the same, and inside the steps the three cover goals
+pushed two of them past 60 s.
+
+Seeded mutants, each run against the harness(es) shown — all fail as they must:
+
+| Mutant | Fails |
+|---|---|
+| `Sleepers::insert` no longer lowers `earliest` (deadlines would never fire) | (b), (c) |
+| `park_step` ignores the permit | (a) |
+| `unpark_step` does not requeue the woken task | (b) |
+| `drain_expired` fires one tick early (`at <= now + 1`) | (c) |
+
+Review round 1 found the first mutant passing every harness: `any_valid` used to
+recompute `earliest` exactly, so no harness checked it. Fixed as above.
+
+### Boot proof (asserted exactly by `cargo xtask test`, both boots)
+
+```text
+[sched] park: target=cpu1 deadline-waited=5/5 local-wake-ticks=1 bsp-window ticks=25 halts=N switches=0
+[sched] park: cross-core=ok permit-before-park=ok deadline=ok dead-unpark=refused sfs-commit=parked bsp-idles=yes ok
+```
+
+A task on the first AP: the BSP unparks it while it runs (`PermitStored`) and its
+next `park` returns at once (nothing else could wake it); it parks again and the
+BSP, seeing it `Parked`, unparks it (`Woke`, by IPI); its `park_until(now + 5)`
+returns `Deadline` at or past the deadline; after it exits and is reaped its id is
+`Refused`. Then, with `sfs-commit` parked, kmain halts until the BSP's own tick
+count advances 25 (≥ two idle-slice expiries) and the BSP must perform **zero**
+switches. With the old yield-poll the same window showed `switches=6
+sfs-commit=runnable bsp-idles=no` (measured by reverting the commit task's park).
+
+### As built: `sfs-commit`
+
+The task decides under the `Sfs` lock and parks with it released: commit if a
+request is pending or a dirty transaction is older than `COMMIT_INTERVAL`; else
+`park_until(last_commit + COMMIT_INTERVAL)` while dirty; else `park()`.
+`with_sfs` kicks it whenever a section changed its decision — `Sfs::next_step`
+at one `now`, before vs after (it kicks after releasing the lock and re-enabling
+preemption); `request_commit` also kicks explicitly. So a new wake reason (FS-1b's
+read requests, scrubs, a released hold) needs no kick of its own **provided
+`next_step` reflects it**: state that `next_step` does not read is not seen.
+`sfs::service::kick` is lock-free (the task id lives in a `sched::TaskIdCell`, one
+`AtomicU64`), so it is safe inside a `with_sfs` section and from IRQ context. No
+periodic backstop wake: it would put a BSP wake every interval into the
+`bsp-idles` window and make that proof flaky, and the structural kick makes it
+unnecessary. The only waiter today is kmain's boot proof — an
+idle task, which may not park — so it still yields; FS-2's blocking callers need a
+waiter list the task unparks on completion.

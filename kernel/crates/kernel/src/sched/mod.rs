@@ -42,6 +42,16 @@
 //! so tasks on an AP are timer-preempted exactly like the BSP's. See
 //! [`prove_pinned`] and [`prove_ap_preemptive`] for the boot proofs.
 //!
+//! # Park / unpark (SentinelFS spec §15 A25)
+//!
+//! [`park`] / [`park_until`] block the calling task — off every ring, state
+//! [`TaskState::Parked`] — until [`unpark`] (from any core, task or IRQ
+//! context) or a mono-tick deadline wakes it; an unpark that finds the task
+//! awake stores its one wake permit, so no wakeup is lost. Deadlines live in a
+//! fixed per-core set drained by [`on_tick`]. No new lock: the same queue →
+//! table order, allocation-free. See the `sched/park.rs` module docs and
+//! [`prove_park`].
+//!
 //! # Locking discipline
 //!
 //! Two kinds of lock, one order. [`CPU_SCHED`]`[cpu]` guards that core's queue;
@@ -100,9 +110,15 @@
 //!    slab, so it can never fill), so that push is a plain array store. The
 //!    zombie list an exit appends to is the same kind of ring.
 //!
+//! 3. **Deadline wakes never allocate.** [`on_tick`]'s park step
+//!    (`park::expire_step`) moves expired entries out of the core's fixed
+//!    [`CpuSched::sleepers`] array onto its fixed ready ring, O(1) when none
+//!    is due and at most [`MAX_TASKS`] entries when some are.
+//!
 //! Net invariant, restated: **the ISR-context scheduler path (`on_tick` /
-//! `on_resched_ipi` → `reschedule_locked_on` → `pick_next` →
-//! `hal::context::switch`) never allocates or frees.**
+//! `on_resched_ipi` → `park::expire_step` / `reschedule_locked_on` →
+//! `pick_next` → `hal::context::switch`) never allocates or frees** — nor
+//! does [`unpark`], which is IRQ-callable.
 //!
 //! # Interrupt-flag discipline (PR-B)
 //!
@@ -150,6 +166,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::smp::MAX_CPUS;
 
+mod park;
+pub use park::{park, park_until, prove_park, task_is_parked, unpark, UnparkOutcome, Woken};
+
 // ── Task identity ───────────────────────────────────────────────────────────
 
 /// A unique, monotonically increasing kernel-thread identifier.
@@ -181,16 +200,57 @@ fn next_task_id() -> TaskId {
     TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// A lock-free cell holding at most one [`TaskId`] — for a subsystem that
+/// must name a service task (e.g. to [`unpark`] it) from any context, IRQ
+/// included, without taking a lock. One `AtomicU64`; `u64::MAX` (an id the
+/// counter never reaches) means empty. It hands out only ids it was given:
+/// there is no way to build a `TaskId` from an integer.
+pub struct TaskIdCell(AtomicU64);
+
+impl TaskIdCell {
+    /// An empty cell.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(u64::MAX))
+    }
+
+    /// Store `id` (Release: pairs with [`TaskIdCell::get`]).
+    pub fn set(&self, id: TaskId) {
+        self.0.store(id.0, Ordering::Release);
+    }
+
+    /// The stored id, if any.
+    #[must_use]
+    pub fn get(&self) -> Option<TaskId> {
+        match self.0.load(Ordering::Acquire) {
+            u64::MAX => None,
+            v => Some(TaskId(v)),
+        }
+    }
+}
+
+impl Default for TaskIdCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Task control block ──────────────────────────────────────────────────────
 
 /// A task's scheduling state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 enum TaskState {
     /// Runnable, waiting in its core's [`CpuSched::ready`].
     Ready,
     /// The task currently executing on its core — exactly one per core, named
     /// by that core's [`CpuSched::current`].
     Running,
+    /// Blocked in [`park`]/[`park_until`]: on **no** ring (not `ready`, not
+    /// `zombies`, not `current`); at most one entry in its core's
+    /// [`CpuSched::sleepers`] if it parked with a deadline. Only an
+    /// [`unpark`] or that core's tick ([`on_tick`]) makes it `Ready` again.
+    Parked,
     /// Departed for good; its id is parked in its core's [`CpuSched::zombies`]
     /// until that core's idle task reaps it ([`idle_reap`]) — always after the
     /// switch that left it has completed.
@@ -258,6 +318,15 @@ struct Task {
     /// task always gets a fresh full quantum for its next turn regardless of
     /// whether this expiry actually triggered a switch (see [`tick_slice`]).
     slice: u32,
+    /// The wake permit ([`unpark`] of a task that is not parked sets it; the
+    /// next [`park`] consumes it and returns at once). One, not counted.
+    permit: bool,
+    /// Why the task last left [`TaskState::Parked`] — set by whoever woke it,
+    /// read by the task when its park returns.
+    woken: Woken,
+    /// Whether this is a core's adopted idle task, which never parks (it is
+    /// the fallback that must always be runnable).
+    idle: bool,
 }
 
 /// Upper bound on live tasks (all cores together): the size of the
@@ -348,6 +417,10 @@ struct CpuSched {
     /// Every id here still owns its [`TASKS`] slot until reaped, so with
     /// capacity [`MAX_TASKS`] the ring can never fill.
     zombies: ReadyRing<MAX_TASKS>,
+    /// Tasks parked here by [`park_until`], with their mono-tick deadlines.
+    /// Drained by this core's [`on_tick`]; an [`unpark`] removes its target's
+    /// entry. Names only `Parked` tasks pinned here, so it can never fill.
+    sleepers: park::Sleepers<MAX_TASKS>,
 }
 
 impl CpuSched {
@@ -356,6 +429,7 @@ impl CpuSched {
             current: TaskId::IDLE,
             ready: ReadyRing::new(),
             zombies: ReadyRing::new(),
+            sleepers: park::Sleepers::new(),
         }
     }
 }
@@ -477,6 +551,21 @@ struct PreemptState {
     /// drains. Read by [`prove_ap_preemptive`], where the two proof tasks also
     /// arrive by IPI and those switches must not count as timer evidence.
     tick_events: AtomicU64,
+    /// Every switch this core performed, voluntary or not (yield, exit, park,
+    /// tick, IPI). [`prove_park`]'s idle-window evidence: zero over a window
+    /// of ticks means nothing but the idle ran.
+    switches: AtomicU64,
+    /// Scheduler ticks ([`on_tick`] calls) this core has taken.
+    ticks: AtomicU64,
+    /// Set by [`idle_halt`] for exactly the span this core's idle task is
+    /// halted waiting for an interrupt. [`on_tick`] reschedules a current
+    /// idle with a non-empty `ready` only while it is set — never while the
+    /// idle is doing work (kmain runs the whole desktop loop as the BSP's
+    /// idle; a ready task must not preempt it on every tick).
+    in_idle_halt: AtomicBool,
+    /// Switches [`on_tick`] made only because the halted idle had work (a
+    /// local unpark): counted here, not in `events`/`tick_events`.
+    idle_wakes: AtomicU64,
 }
 
 impl PreemptState {
@@ -486,6 +575,10 @@ impl PreemptState {
             need_resched: AtomicBool::new(false),
             events: AtomicU64::new(0),
             tick_events: AtomicU64::new(0),
+            switches: AtomicU64::new(0),
+            ticks: AtomicU64::new(0),
+            in_idle_halt: AtomicBool::new(false),
+            idle_wakes: AtomicU64::new(0),
         }
     }
 
@@ -576,6 +669,28 @@ pub fn preempt_enable() {
 /// [`PreemptState::count`] `== 0`) or defers to [`PreemptState::need_resched`] for the next
 /// [`preempt_enable`] to drain.
 ///
+/// First, under the same locks, it wakes every task parked on this core by
+/// [`park_until`] whose deadline is `<= crate::clock::mono_ticks()`
+/// (`park::expire_step`). Cost in IRQ context: one compare when nothing is
+/// due; otherwise one pass over this core's sleeper set (≤ [`MAX_TASKS`]
+/// entries) with a [`TaskTable`] lookup (≤ [`MAX_TASKS`] slots) per expired
+/// entry — about 64 × 64 slot visits in the worst case, bounded and
+/// allocation-free.
+///
+/// Then it reschedules — as on a slice expiry, through [`tick_action`] — if
+/// the slice expired, **or** a deadline woke a task, **or** this core's idle
+/// task is **halted** ([`idle_halt`]) while `ready` is non-empty (a task woken
+/// on this core by an [`unpark`], which sends no IPI to its own core). An idle
+/// doing work — kmain runs the desktop loop — is not preempted by this rule;
+/// it hands over at its next halt. So deadline and local
+/// unpark wakes **preempt mid-slice**: the round-robin switch happens on this
+/// tick, and the woken task runs on it if it is at the head of `ready` —
+/// otherwise in its turn behind the tasks ahead of it. Only a slice expiry
+/// counts as [`PreemptState::tick_events`] (the AP preemption proof's
+/// evidence); a slice expiry or deadline wake counts as
+/// [`PreemptState::events`]; the halted idle making way counts as
+/// [`PreemptState::idle_wakes`].
+///
 /// # Interrupt-flag discipline
 ///
 /// This function — and everything it calls transitively, including
@@ -587,31 +702,51 @@ pub fn preempt_enable() {
 /// "Interrupt-flag discipline" section.
 pub fn on_tick() {
     let cpu = local_cpu();
-    let expired = {
+    PREEMPT[cpu].ticks.fetch_add(1, Ordering::Relaxed);
+    let now = crate::clock::mono_ticks();
+    let halted = PREEMPT[cpu].in_idle_halt.load(Ordering::Relaxed);
+    let (expired, woke, idle_work) = {
         // Lock order: this core's queue, then the task table.
-        let queue = CPU_SCHED[cpu].lock();
-        let current = queue.current;
+        let mut queue = CPU_SCHED[cpu].lock();
+        let state: &mut CpuSched = &mut queue;
         let mut tasks = TASKS.lock();
-        match tasks.get_mut(current) {
-            Some(t) => tick_slice(&mut t.slice),
-            None => false,
-        }
+        // `park_until` deadlines due on this core: O(1) when none is.
+        let woke = park::expire_step(&mut state.ready, &mut state.sleepers, &mut *tasks, now);
+        let (expired, idle) = match tasks.get_mut(state.current) {
+            Some(t) => (tick_slice(&mut t.slice), t.idle),
+            None => (false, false),
+        };
+        (expired, woke > 0, halted && idle && state.ready.len() > 0)
     };
-    if !expired {
+    // A wake (a deadline here, or an unpark while the idle sat halted) is
+    // handled like a slice expiry, so the switch happens on this tick rather
+    // than at the end of the current task's quantum.
+    if !expired && !woke && !idle_work {
         return;
     }
+    // A slice expiry or a deadline wake is a real involuntary switch
+    // (`events`); the halted idle making way is not.
+    let involuntary = expired || woke;
 
     match tick_action(
         COOP_PROOF_NO_PREEMPT.load(Ordering::Relaxed),
         PREEMPT[cpu].count.load(Ordering::Relaxed),
     ) {
         TickAction::Suppress => {
-            COOP_PROOF_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            if expired {
+                COOP_PROOF_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         TickAction::Switch => {
             if reschedule_locked_on(cpu, false) {
-                PREEMPT[cpu].events.fetch_add(1, Ordering::Relaxed);
-                PREEMPT[cpu].tick_events.fetch_add(1, Ordering::Relaxed);
+                if involuntary {
+                    PREEMPT[cpu].events.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    PREEMPT[cpu].idle_wakes.fetch_add(1, Ordering::Relaxed);
+                }
+                if expired {
+                    PREEMPT[cpu].tick_events.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         TickAction::Defer => PREEMPT[cpu].need_resched.store(true, Ordering::Relaxed),
@@ -902,6 +1037,7 @@ fn reschedule_locked_on(cpu: usize, exiting: bool) -> bool {
 
     let switched = switch_pair.is_some();
     if let Some((prev_h, next_h)) = switch_pair {
+        PREEMPT[cpu].switches.fetch_add(1, Ordering::Relaxed);
         hal::context::switch(prev_h, next_h);
     }
     switched
@@ -1000,6 +1136,9 @@ fn adopt_idle(cpu: usize, id: TaskId) {
         stack: None,
         xsave,
         slice: TIME_SLICE_TICKS,
+        permit: false,
+        woken: Woken::Unparked,
+        idle: true,
     });
 
     with_interrupts_disabled(|| {
@@ -1177,6 +1316,9 @@ fn spawn_with_id(
         stack: Some(stack),
         xsave,
         slice: TIME_SLICE_TICKS,
+        permit: false,
+        woken: Woken::Unparked,
+        idle: false,
     });
 
     let placed: Result<(), Box<Task>> = with_interrupts_disabled(|| {
@@ -1192,10 +1334,14 @@ fn spawn_with_id(
     }
 
     // A remote core may be asleep in `sti; hlt`: tell it. The push above is
-    // ordered before the IPI by the queue lock's release.
+    // ordered before the IPI by the queue lock's release. Sent with `IF = 0`:
+    // `unpark` may send one from IRQ context, and an IRQ must never land
+    // between the two xAPIC ICR writes of a send on the same core.
     if cpu as usize != local_cpu() {
         if let Some(lapic) = crate::smp::lapic_id_of(cpu) {
-            let _sent = hal::apic::send_ipi(lapic, crate::interrupts::VECTOR_RESCHED_IPI);
+            let _sent = with_interrupts_disabled(|| {
+                hal::apic::send_ipi(lapic, crate::interrupts::VECTOR_RESCHED_IPI)
+            });
         }
     }
     Ok(())
@@ -1381,10 +1527,28 @@ pub fn idle_reap() {
 /// after [`init_ap`]; the `sti` inside is the AP's first (after its
 /// `simd::enable`, structurally — see `hal::smp`). Never returns.
 pub fn ap_idle_loop() -> ! {
+    let cpu = local_cpu();
     loop {
         idle_reap();
+        PREEMPT[cpu].in_idle_halt.store(true, Ordering::Relaxed);
         hal::cpu::enable_interrupts_and_halt();
+        PREEMPT[cpu].in_idle_halt.store(false, Ordering::Relaxed);
     }
+}
+
+/// A core's idle task waiting for the next interrupt: `hlt`, with this
+/// core's "idle is halted" flag set around it, so [`on_tick`] may switch to a
+/// task woken locally (by an [`unpark`], which sends no IPI to its own core)
+/// on the next tick instead of after the idle's slice. kmain's idle loop
+/// halts through this; [`ap_idle_loop`] sets the same flag around its
+/// `sti; hlt`. Call with interrupts enabled, from a core's idle task only
+/// (from any other task the flag has no effect: the rule needs the idle
+/// current).
+pub fn idle_halt() {
+    let cpu = local_cpu();
+    PREEMPT[cpu].in_idle_halt.store(true, Ordering::Relaxed);
+    hal::cpu::halt();
+    PREEMPT[cpu].in_idle_halt.store(false, Ordering::Relaxed);
 }
 
 // ── PR-A boot proof: cooperative interleave ─────────────────────────────────
@@ -2488,6 +2652,9 @@ mod tests {
                 stack: None,
                 xsave,
                 slice: TIME_SLICE_TICKS,
+                permit: false,
+                woken: super::Woken::Unparked,
+                idle: false,
             })
         }
 
