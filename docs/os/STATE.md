@@ -116,6 +116,7 @@ arena outside the heap), wrap both the tree key and the KeyAgent key from one un
 (resolving component §18.1), and decide the rollback anchor. The superblock already reserves
 the KDF params at [352,384) and a `keys` pointer at [392,440) to a kind-6 keyring block
 (spec §7.1), so login needs no format bump.
+**Identity/login spec proposed 2026-10-04** (`docs/specs/2026-10-04-identity-login-design.md`; review round 1 complete, conditions in its §19; first PR ID-0).
 
 0. **Component-model PR-2b** identity v2 + wide indices (decided 2026-10-03, component spec
    A12/A13; **merges before PR-3 is opened**): manifest declarations bound into `ComponentId`
