@@ -94,3 +94,34 @@ pub fn usable_regions() -> impl Iterator<Item = UsableRegion> {
         }
     })
 }
+
+/// Whether any byte of the physical range `[phys, phys + len)` lies in memory
+/// the kernel owns or may own: `USABLE` (frame allocator), `BOOTLOADER_RECLAIMABLE`
+/// (live Limine structures, the boot stack), `EXECUTABLE_AND_MODULES` (the kernel
+/// image) or `FRAMEBUFFER`. Firmware-described physical addresses (ACPI tables,
+/// an IOAPIC register window) are only ever mapped by `hal` after this returns
+/// `false`, so a lying firmware table can never make `hal` read memory a Rust
+/// writer may be using, or write device registers over kernel RAM.
+///
+/// Fails closed: without a memory map, or on an overflowing range, it reports
+/// an overlap.
+#[must_use]
+pub fn overlaps_kernel_owned(phys: u64, len: u64) -> bool {
+    let Some(end) = phys.checked_add(len) else {
+        return true;
+    };
+    // SAFETY: same contract as `usable_regions` — `get_response()` is `Some`
+    // only after Limine populated our `#[used]` request before `_start`; the
+    // borrowed entry slice is read-only and copied out per entry.
+    let Some(response) = MEMORY_MAP_REQUEST.get_response() else {
+        return true;
+    };
+    response.entries().iter().any(|e| {
+        let owned = e.entry_type == EntryType::USABLE
+            || e.entry_type == EntryType::BOOTLOADER_RECLAIMABLE
+            || e.entry_type == EntryType::EXECUTABLE_AND_MODULES
+            || e.entry_type == EntryType::FRAMEBUFFER;
+        let e_end = e.base.saturating_add(e.length);
+        owned && phys < e_end && e.base < end
+    })
+}

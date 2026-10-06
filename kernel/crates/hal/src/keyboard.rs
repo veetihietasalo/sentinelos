@@ -51,6 +51,12 @@ const PS2_STATUS_CMD: u16 = 0x64;
 const STATUS_OUT_FULL: u8 = 1 << 0;
 /// Status-register bit 1: input buffer full (do **not** write a port until clear).
 const STATUS_IN_FULL: u8 = 1 << 1;
+/// Status bit 5: the byte in the output buffer came from the auxiliary (mouse)
+/// port.
+const STATUS_AUX_DATA: u8 = 1 << 5;
+/// Bytes one IRQ1 may drain (the i8042 holds one at a time; the bound only
+/// keeps a wedged controller from pinning the handler).
+const DRAIN_LIMIT: usize = 16;
 
 /// Controller command: read the "command byte" (configuration) → output buffer.
 const CMD_READ_CONFIG: u8 = 0x20;
@@ -208,15 +214,50 @@ pub fn poll_scancode() -> Option<u8> {
 /// the TCB while the kernel handler remains `unsafe`-free.
 #[inline]
 pub fn on_irq() {
-    // SAFETY: reads the PS/2 controller data port (`0x60`), the documented place a
-    // keyboard scancode is delivered for IRQ1. Draining it is mandatory (the i8042
-    // stops raising IRQ1 until read) and is a pure device read that cannot alias or
-    // corrupt Rust memory. `inb`'s safety contract (valid, read-safe port) holds.
-    let scancode = unsafe { inb(PS2_DATA) };
-    ring_push(scancode);
-    // IRQ1 → master-PIC vector PIC1_OFFSET + 1 (0x21). EOI lets the PIC deliver
-    // the next keystroke.
-    crate::pic::end_of_interrupt(VECTOR_KEYBOARD);
+    // Drain every keyboard byte the controller holds, bounded. Each read is
+    // gated on the status register: output-buffer-full set (there is a byte)
+    // and AUX clear (it is the keyboard's, not the mouse's — a mouse byte is
+    // left for the IRQ12 handler). A spurious or late IRQ1 therefore reads
+    // nothing rather than a stale or foreign byte.
+    for _ in 0..DRAIN_LIMIT {
+        // SAFETY: (K5) reads the i8042 status port (`0x64`) — a pure device
+        // read. `inb`'s contract holds.
+        let status = unsafe { inb(PS2_STATUS_CMD) };
+        if status & STATUS_OUT_FULL == 0 || status & STATUS_AUX_DATA != 0 {
+            break;
+        }
+        // SAFETY: (K5) reads the PS/2 data port (`0x60`), which the status read
+        // just showed holds a keyboard byte. Draining it is mandatory (the i8042
+        // stops raising IRQ1 until read) and is a pure device read that cannot
+        // alias or corrupt Rust memory. `inb`'s contract holds.
+        let scancode = unsafe { inb(PS2_DATA) };
+        ring_push(scancode);
+    }
+    // IRQ1 → vector 0x21: EOI whichever controller delivered it (the LAPIC
+    // once IOAPIC-routed, the 8259 on the legacy path).
+    crate::ioapic::device_eoi(VECTOR_KEYBOARD);
+}
+
+/// Discard a byte left in the i8042 output buffer, if any; returns whether one
+/// was discarded.
+///
+/// Called once when device IRQs move from the 8259 to the IOAPIC (SMP 3b-ii):
+/// IRQ1/IRQ12 are edge-triggered, so an edge raised while the old route was
+/// masked and the new one not yet open is lost — and the i8042 raises no
+/// further edge until its buffer is drained. Draining it here (the same policy
+/// as `init`'s stale-byte drain) re-arms delivery at the cost of at most one
+/// boot-time byte.
+pub fn drain_stale_output() -> bool {
+    // SAFETY: (K6) reads the i8042 status port (`0x64`) and, if its output
+    // buffer is full, the data port (`0x60`) — pure device reads, exactly
+    // `init`'s drain. Cannot alias Rust memory. `inb`'s contract holds.
+    unsafe {
+        if inb(PS2_STATUS_CMD) & STATUS_OUT_FULL != 0 {
+            let _ = inb(PS2_DATA);
+            return true;
+        }
+    }
+    false
 }
 
 /// Program the i8042 controller to deliver keyboard interrupts, then unmask IRQ1.

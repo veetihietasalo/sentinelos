@@ -520,6 +520,27 @@ const COMP_HELLO_REQUIRED: &[&str] = &[
     "runtime=native",
     "reply=ok",
 ];
+/// SMP phase 3b-ii: the routing summary `kernel::ioapic::report` prints once the
+/// NIC's line is routed — **exact match** (same on TCG and KVM: QEMU builds the
+/// q35 MADT itself — one 24-pin IOAPIC at GSI 0, five overrides, IRQ0 on GSI 2 —
+/// and the e1000 sits on legacy line 11). `pic=masked`/`lint0=masked` are read
+/// back from the 8259 IMRs and the BSP's LVT; `pit-live=yes` means the PIT
+/// ticked through the IOAPIC after the switch.
+const IOAPIC_LINE: &str = "[ioapic] madt: ioapics=1 overrides=5 gsi-base=0 pins=24 \
+     pic=masked lint0=masked routed=pit,kbd,mouse,nic irq0-gsi=2 dest=apic0 pit-live=yes ok";
+/// The first keystroke the boot test injects over QMP: the keyboard handler ran
+/// while the 8259 and LINT0 read back masked — only the IOAPIC can have
+/// delivered vector 33. Exact match.
+const IOAPIC_KBD_LINE: &str =
+    "[ioapic] kbd: irq1 -> gsi1 vector=33 irqs>=1 pic=masked lint0=masked via=ioapic ok";
+/// The shell ran the `about` the boot test typed: IOAPIC-routed keystrokes reach
+/// the desktop shell end to end. Exact match.
+const SHELL_ABOUT_LINE: &str = "[shell] ran: about";
+/// The WM reached the desktop after the injected right-arrow unlock.
+const WM_DESKTOP_READY: &str = "[wm] desktop ready";
+/// Keys typed once the desktop is up (QMP `qcode`s): `about` + Enter.
+const ABOUT_KEYS: [&str; 6] = ["a", "b", "o", "u", "t", "ret"];
+
 /// SentinelFS FS-1a (`docs/specs/2026-09-18-sentinelfs-design.md` §11): the
 /// `sfs-commit` task mounted the SentinelFS window of the IDE disk (formatting
 /// it first only on a blank image), every block it read verified, and the line
@@ -1844,12 +1865,19 @@ fn boot_test(kvm: bool) -> ExitCode {
         let boot = i + 1;
         println!("=== boot {boot} of {} (serial log: {rel}) ===", BOOT_TEST_LOGS.len());
         let started = Instant::now();
-        let (log, found) = run_boot(kvm, &iso, &disk, &kr(rel));
+        // The QMP keystroke phase (~20 s under TCG) runs on boot 1 only.
+        let interactive = boot == 1;
+        let (log, found) = run_boot(kvm, &iso, &disk, &kr(rel), interactive);
         println!(
-            "boot {boot}: {} ms from QEMU launch to the end marker (200 ms polling)",
-            started.elapsed().as_millis()
+            "boot {boot}: {} ms from QEMU launch to {} (200 ms polling)",
+            started.elapsed().as_millis(),
+            if interactive {
+                "the end of the QMP keystroke phase"
+            } else {
+                "the end marker"
+            }
         );
-        if check_boot_log(kvm, &log, found) != ExitCode::SUCCESS {
+        if check_boot_log(kvm, &log, found, interactive) != ExitCode::SUCCESS {
             eprintln!(
                 "TEST FAILED on boot {boot} of {} (serial log: kernel/{rel}).",
                 BOOT_TEST_LOGS.len()
@@ -1874,7 +1902,13 @@ fn boot_test(kvm: bool) -> ExitCode {
 /// COM1 goes to `serial_log`, polled every 200 ms until [`END_MARKER`] appears
 /// or [`BOOT_TIMEOUT_SECS`] pass, then QEMU is killed. Returns the final log and
 /// whether the marker appeared.
-fn run_boot(kvm: bool, iso: &Path, disk: &Path, serial_log: &Path) -> (String, bool) {
+fn run_boot(
+    kvm: bool,
+    iso: &Path,
+    disk: &Path,
+    serial_log: &Path,
+    interactive: bool,
+) -> (String, bool) {
     let pcap = kr("target/net.pcap");
 
     // Remove stale log + pcap from a previous run.
@@ -1893,10 +1927,16 @@ fn run_boot(kvm: bool, iso: &Path, disk: &Path, serial_log: &Path) -> (String, b
     // Spawn QEMU in the background; direct COM1 to a file so we can poll it. The
     // e1000 NIC + SLIRP backend + filter-dump pcap let the test confirm the NIC
     // brings up and frames cross the wire (inspect target/net.pcap).
+    // QMP control socket (system temp dir: unix socket paths are length-limited)
+    // so the keystroke phase below can inject `send-key` events.
+    let qmp_sock = std::env::temp_dir().join(format!("sos-boot-qmp-{}.sock", std::process::id()));
+    let _ = fs::remove_file(&qmp_sock);
     let mut child = Command::new("qemu-system-x86_64")
         .args(&qargs)
         .args(e1000_args(pcap.to_str().unwrap()))
         .args(ide_disk_args(disk))
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
         .spawn()
         .expect("failed to spawn qemu-system-x86_64");
 
@@ -1914,9 +1954,20 @@ fn run_boot(kvm: bool, iso: &Path, disk: &Path, serial_log: &Path) -> (String, b
         }
     }
 
+    // SMP 3b-ii keystroke evidence: once the kernel is idle, unlock the lock
+    // screen and type `about` over QMP; the kernel logs the first keystroke's
+    // delivery path and the shell logs the command (asserted in check_boot_log).
+    // `interactive` is set for the first boot only.
+    if found && interactive {
+        if let Err(e) = qmp_type_about(&qmp_sock, serial_log) {
+            eprintln!("keystroke injection: {e}");
+        }
+    }
+
     // Always kill QEMU after we're done polling (it halts forever in `halt_loop`).
     let _ = child.kill();
     let _ = child.wait();
+    let _ = fs::remove_file(&qmp_sock);
 
     // Read final log (may have grown slightly after the last poll).
     let log = fs::read_to_string(serial_log).unwrap_or_default();
@@ -1929,9 +1980,84 @@ fn run_boot(kvm: bool, iso: &Path, disk: &Path, serial_log: &Path) -> (String, b
     (log, found)
 }
 
+/// Wait until `serial_log` contains `needle`, polling every 100 ms.
+fn wait_for_serial(serial_log: &Path, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if fs::read_to_string(serial_log).unwrap_or_default().contains(needle) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Drive the booted guest over QMP: press Right (unlock), wait for the desktop,
+/// type [`ABOUT_KEYS`], and wait for [`SHELL_ABOUT_LINE`]. A dependency-free
+/// QMP client: one JSON command per line, reading until its `return`/`error`
+/// (asynchronous events may interleave and are skipped).
+fn qmp_type_about(sock: &Path, serial_log: &Path) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        match UnixStream::connect(sock) {
+            Ok(s) => break s,
+            Err(e) if Instant::now() >= deadline => return Err(format!("QMP connect: {e}")),
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).map_err(|e| format!("QMP greeting: {e}"))?;
+
+    let mut command = |cmd: &str| -> Result<(), String> {
+        writer
+            .write_all(format!("{cmd}\n").as_bytes())
+            .map_err(|e| format!("QMP write: {e}"))?;
+        loop {
+            let mut reply = String::new();
+            if reader.read_line(&mut reply).map_err(|e| format!("QMP read: {e}"))? == 0 {
+                return Err("QMP closed".into());
+            }
+            if reply.contains("\"return\"") {
+                return Ok(());
+            }
+            if reply.contains("\"error\"") {
+                return Err(format!("QMP error for {cmd}: {}", reply.trim()));
+            }
+        }
+    };
+    let key = |k: &str| {
+        format!(r#"{{"execute":"send-key","arguments":{{"keys":[{{"type":"qcode","data":"{k}"}}]}}}}"#)
+    };
+
+    command(r#"{"execute":"qmp_capabilities"}"#)?;
+    command(&key("right"))?;
+    if !wait_for_serial(serial_log, WM_DESKTOP_READY, Duration::from_secs(30)) {
+        return Err(format!("'{WM_DESKTOP_READY}' did not appear after the unlock key"));
+    }
+    for k in ABOUT_KEYS {
+        command(&key(k))?;
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    // Each keystroke repaints the terminal window in software (debug build);
+    // under TCG on a loaded host the six keys take ~20 s end to end, so the
+    // budget is generous — a real delivery failure never produces the line.
+    if !wait_for_serial(serial_log, SHELL_ABOUT_LINE, Duration::from_secs(120)) {
+        return Err(format!("'{SHELL_ABOUT_LINE}' did not appear after typing"));
+    }
+    Ok(())
+}
+
 /// Every per-boot assertion over one boot's serial `log` (`found`: whether the
 /// end marker appeared in time). [`boot_test`] runs it on both boots.
-fn check_boot_log(kvm: bool, log: &str, found: bool) -> ExitCode {
+fn check_boot_log(kvm: bool, log: &str, found: bool, interactive: bool) -> ExitCode {
     if !found {
         eprintln!(
             "TEST FAILED: end-marker '{}' not found within {} s.",
@@ -2203,6 +2329,38 @@ fn check_boot_log(kvm: bool, log: &str, found: bool) -> ExitCode {
             cap_line
         );
         return ExitCode::FAILURE;
+    }
+
+    // SMP phase 3b-ii: device IRQs routed through the IOAPIC, the 8259 and
+    // LINT0 masked (read back), the PIT live on GSI 2 — and keystrokes injected
+    // over QMP after the end marker arrive through the IOAPIC and run `about`.
+    let keystroke_lines: &[(&str, &str)] = if interactive {
+        &[
+            (IOAPIC_KBD_LINE, "IOAPIC keyboard-delivery evidence (injected keystroke)"),
+            (SHELL_ABOUT_LINE, "shell `about` run from injected keystrokes"),
+        ]
+    } else {
+        &[]
+    };
+    for &(line, what) in [(IOAPIC_LINE, "IOAPIC routing summary")]
+        .iter()
+        .chain(keystroke_lines)
+    {
+        if !log.lines().any(|l| l.trim_end() == line) {
+            let near = log
+                .lines()
+                .find(|l| l.starts_with(&line[..line.len().min(12)]))
+                .unwrap_or("<none>");
+            eprintln!("TEST FAILED: {what}: expected exactly '{line}', nearest: '{near}'");
+            return ExitCode::FAILURE;
+        }
+    }
+    if interactive {
+        println!(
+            "IOAPIC routing proven: '{IOAPIC_LINE}'; '{IOAPIC_KBD_LINE}'; '{SHELL_ABOUT_LINE}'"
+        );
+    } else {
+        println!("IOAPIC routing proven: '{IOAPIC_LINE}' (keystroke phase: boot 1 only)");
     }
 
     // A vector int8-GEMM self-test must pass (both TCG and KVM), so the ML tier is a

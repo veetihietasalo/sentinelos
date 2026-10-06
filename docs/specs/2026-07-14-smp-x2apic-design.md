@@ -1,6 +1,6 @@
 # SMP Bring-up via x2APIC — Design
 
-Status: **phase 1 implemented; AP bring-up, per-CPU scheduler + IPIs, and the per-core LAPIC timer implemented (see the 2026-09-18 note at the end); IOAPIC routing proposed** · Track A (Intel/AMD CPU +
+Status: **phase 1 implemented; AP bring-up, per-CPU scheduler + IPIs, the per-core LAPIC timer (see the 2026-09-18 note at the end) and IOAPIC routing (3b-ii, see the 2026-10-04 note) implemented** · Track A (Intel/AMD CPU +
 security), step 3 · Author: scheduler / hal track
 Depends on: `hal::pic` (8259 remap + EOI), `hal::pit` (100 Hz IRQ0),
 `hal::cpu` MSR primitives (`read_msr`/`write_msr`, shipped), `hal::cpuid`
@@ -92,7 +92,7 @@ hardware). Under CI's TCG emulation x2APIC is unavailable, so the probe branch i
 skipped and the fallback line is shown instead — see the Testing section for why,
 and why the test still meaningfully guards against regression.
 
-## Phase 2 — IOAPIC: route device IRQs through the APIC (proposed)
+## Phase 2 — IOAPIC: route device IRQs through the APIC (implemented 2026-10-04, SMP 3b-ii)
 
 Fully mask the 8259 PIC and take LINT0 out of ExtINT; program the IOAPIC
 redirection-table entries to deliver the timer / keyboard / mouse / NIC IRQs to the
@@ -214,10 +214,66 @@ plan; the work shipped in a different order):
   them (hal-tcb invariant 4.15 retired as a hazard). Proof: `[clock] mono: …
   pit-frozen=yes bsp-stalled-advance=yes rate-ok=yes ok`. The PIT stays the
   wall clock for uptime and the LAPIC calibration reference.
-- **Phase 2 (IOAPIC, 3b-ii)**: still proposed. Device IRQs remain PIC-routed to
-  the BSP through LINT0 = ExtINT. Needs an ACPI MADT walk for the IOAPIC
-  base/GSIs (a pure `&[u8] -> Result` parser in the safe kernel, Kani + fuzz).
-  Sequenced after component PR-3 (2026-09-18 consensus).
+- **Phase 2 (IOAPIC, 3b-ii)**: shipped 2026-10-04 — see the note below.
 - **Phase 5 (SMP-safe kernel)**: partially shipped alongside — cross-core console
   lock, the no-allocation-under-IRQ-lock rule, per-core preempt state; the
   input/mouse rings and driver locks are still unaudited for real concurrency.
+
+## Status note — 2026-10-04 (SMP 3b-ii: IOAPIC routing)
+
+Shipped ahead of component PR-3 (the 2026-09-18 sequencing put it after; it
+blocks nothing and touches none of PR-2b/PR-3's files).
+
+- **ACPI walk (`kernel::acpi`, safe).** `&[u8] -> Result` decoders for the RSDP
+  (v1 → RSDT, v2 → XSDT when its extended checksum holds), SDT headers and
+  checksums, root-table entries, and the MADT — types 0/9 (CPUs), **1 (IOAPIC)**,
+  **2 (Interrupt Source Override)**, 3 (NMI source), 4/0xA (LAPIC NMI) — into a
+  fixed-size `MadtInfo` (no heap growth on firmware input). Malformed or
+  truncated tables are `Err`; loops are bounded by the table length. One fetch
+  walker (`discover_madt`) sequences reads through `hal::acpi::read_phys`, which
+  copies into two fixed buffers (4 KiB root, 8 KiB MADT). QEMU's q35 firmware
+  (SeaBIOS) hands out a revision-0 RSDP, so the RSDT path is the one exercised at
+  boot; the salvaged 2026-07-17 draft supported only the XSDT and would have
+  failed here. Kani, compositional (each harness < 60 s): the structure walk
+  `for_each_entry` is total and exactly tiles the table
+  (`madt_walk_is_total_and_tiles`), each structure decodes totally and exactly
+  (`one_entry_decode_is_total_and_exact`), `push` respects capacity
+  (`push_respects_capacity`), plus a composed 46-byte smoke
+  (`madt_body_smoke_46`), `rsdp_decode_is_total` and `root_entry_is_total`; host tests use QEMU's real MADT and RSDT bytes,
+  captured from this kernel's boot, plus a 200 000-mutant deterministic fuzz test.
+- **`hal`.** `hal::acpi` (RSDP + bounded copy-out reader, AC1–AC2),
+  `hal::ioapic` (validated mapping, indirect register access under one lock
+  per sequence, redirection entries with Kani-proved packing — unmasked entries
+  are fixed delivery of a vector ≥ 0x20 only, IO1–IO4),
+  `apic::eoi_if_in_service` / `apic::mask_lint0` (AP8–AP9), `pic::mask_all`
+  (P6). Every mapped physical span is checked first, for every caller: no
+  overflow, below the usable address width (`MAXPHYADDR`, minus the AMD SME
+  C-bit/reduction; TME-MK KeyID bits are a documented residual) — page-table
+  leaves are `phys | flags` unmasked, so high bits would otherwise alias a
+  kernel frame — and, page-rounded, outside kernel-owned memory
+  (`mm::phys_span` + `overlaps_kernel_owned` in `map_window`, Kani). The EOI decision is made
+  per interrupt from the LAPIC's in-service register: a LAPIC message (IOAPIC)
+  EOIs the LAPIC, a virtual-wire ExtINT EOIs the 8259 — no flag to fall out of
+  step.
+- **Policy (`kernel::ioapic`).** PIT (ISA 0 → GSI 2 under QEMU), keyboard (1),
+  mouse (12) and the e1000's legacy line (11, level/active-high per the
+  override — a PCI line is routed only when an ISA override declares it level
+  and its GSI is free, else the NIC stays polled) are routed fixed/physical to
+  the **BSP**, vectors unchanged; no GSI carries two routes. BSP
+  because the PIT is the wall clock and the input rings/NIC frames are consumed
+  by the BSP idle loop; balancing is a product decision. 8259 fully masked,
+  LINT0 masked, both read back. If the PIT is not seen ticking through the
+  IOAPIC within a bounded spin the switch is rolled back to the virtual wire.
+- **Boot proof** (exact match, TCG and KVM):
+  `[ioapic] madt: ioapics=1 overrides=5 gsi-base=0 pins=24 pic=masked lint0=masked routed=pit,kbd,mouse,nic irq0-gsi=2 dest=apic0 pit-live=yes ok`.
+  On the first of its two boots the boot test then unlocks the lock screen and
+  types `about` over QMP and asserts `[ioapic] kbd: irq1 -> gsi1 vector=33 irqs>=1 pic=masked lint0=masked via=ioapic ok`
+  and `[shell] ran: about`. The LAPIC-timer calibration now counts
+  IOAPIC-routed PIT ticks; every pre-existing line still passes.
+- **Found on the way (by inspection):** `hal::e1000`'s driver lock is taken in
+  the NIC handler and, with interrupts enabled, by the idle loop when the Net app
+  reads `net::status` — a latent same-core deadlock. The lock now masks
+  interrupts for its critical section (hal-tcb N7). No boot hit it.
+- **Not done:** `_PRT`/AML (the NIC line relies on QEMU's PIRQ steering also
+  driving the IOAPIC pin), MSI, interrupt remapping (destinations > 255), load
+  balancing, a coverage-guided fuzz lane.
