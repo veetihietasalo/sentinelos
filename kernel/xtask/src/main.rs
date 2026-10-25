@@ -193,7 +193,15 @@ fn disk_args() -> Vec<String> {
 fn ide_disk_args(img: &Path) -> Vec<String> {
     vec![
         "-drive".into(),
-        format!("if=none,id=sosdisk,file={},format=raw", img.display()),
+        // `cache=writeback` pinned (QEMU's default, stated): the guest sees a
+        // volatile write cache, writes land in the host page cache and only
+        // the guest's FLUSH CACHE fsyncs them — the §8 durability model the
+        // SentinelFS torn-commit stage tests. Never `cache=unsafe` (which
+        // ignores flushes).
+        format!(
+            "if=none,id=sosdisk,file={},format=raw,cache=writeback",
+            img.display()
+        ),
         "-device".into(),
         "isa-ide,id=soside".into(),
         "-device".into(),
@@ -230,19 +238,23 @@ fn run_cmd(cmd: &mut Command) -> bool {
 
 /// Build the boot ELF for x86_64-unknown-none. Returns path to the ELF.
 fn build_kernel() -> Option<PathBuf> {
+    build_kernel_with(false)
+}
+
+/// Build the kernel; `test_hooks` enables the `test-hooks` feature (the boot
+/// tests' kernel only: the SentinelFS test-control sector is honoured only
+/// there, so a production kernel never halts on a disk that carries it).
+fn build_kernel_with(test_hooks: bool) -> Option<PathBuf> {
     let root = kernel_root();
-    println!("Building kernel for x86_64-unknown-none ...");
-    let ok = run_cmd(
-        Command::new("cargo")
-            .args([
-                "build",
-                "--package",
-                "boot",
-                "--target",
-                "x86_64-unknown-none",
-            ])
-            .current_dir(&root),
+    println!(
+        "Building kernel for x86_64-unknown-none{} ...",
+        if test_hooks { " (feature test-hooks)" } else { "" }
     );
+    let mut args = vec!["build", "--package", "boot", "--target", "x86_64-unknown-none"];
+    if test_hooks {
+        args.extend(["--features", "test-hooks"]);
+    }
+    let ok = run_cmd(Command::new("cargo").args(&args).current_dir(&root));
     if !ok {
         return None;
     }
@@ -266,11 +278,23 @@ fn build_kernel() -> Option<PathBuf> {
 ///   limine-uefi-cd.bin
 ///   EFI/BOOT/BOOTX64.EFI
 fn build_iso(kernel_elf: &Path) -> Option<PathBuf> {
+    build_iso_named(kernel_elf, "sentinelos")
+}
+
+/// [`build_iso`] into `target/<name>.iso` (staged in `target/<name>-iso_root`
+/// for any name but the default). The boot tests' `test-hooks` kernel goes to
+/// `sentinelos-test.iso`, so `target/sentinelos.iso` — what `run`, the
+/// screenshot and the demo tooling boot — is never the hooked kernel.
+fn build_iso_named(kernel_elf: &Path, name: &str) -> Option<PathBuf> {
     let limine_dir = kr("limine");
     let limine_bin = limine_dir.join("limine");
     let limine_conf = kr("limine.conf");
-    let iso_root = kr("target/iso_root");
-    let iso_path = kr("target/sentinelos.iso");
+    let iso_root = if name == "sentinelos" {
+        kr("target/iso_root")
+    } else {
+        kr(&format!("target/{name}-iso_root"))
+    };
+    let iso_path = kr(&format!("target/{name}.iso"));
 
     // Verify limine host tool exists.
     if !limine_bin.exists() {
@@ -640,6 +664,100 @@ const SFS_TEST_TOTAL_BLOCKS: u64 = 3840;
 /// Printed only by a boot that formatted a blank (`Unformatted`) window:
 /// `[sfs] format: window lba=2048 blocks=3840 groups=1 gen=1 sb=<8 hex> (was unformatted)`.
 const SFS_FORMAT_PREFIX: &str = "[sfs] format: ";
+
+/// SentinelFS FS-1b: the boot ledger check, `[sfs] ledger: gen=M items=K
+/// data-intact=yes ok` ([`parse_sfs_ledger`]).
+const SFS_LEDGER_PREFIX: &str = "[sfs] ledger: ";
+/// FS-1b: `[sfs] scrub: blocks=N hashed=N bad=0 ok` ([`parse_sfs_scrub`]).
+const SFS_SCRUB_PREFIX: &str = "[sfs] scrub: ";
+/// FS-1b: the torn-commit lines (`… halting` on the cut boot, `… recovered-gen=…
+/// ok` on the recovery boot).
+const SFS_TORN_PREFIX: &str = "[sfs] torn-commit: ";
+/// Fewest blocks a ledger commit writes: a leaf, the group bitmap, the group
+/// index and the superblock (the kernel's ledger splits, so it writes more).
+const SFS_MIN_COMMIT_BLOCKS: u64 = 4;
+/// Disk sector of the SentinelFS test-control block (`kernel::sfs::proof::
+/// CONTROL_LBA`): between the toy FS image and the SentinelFS window.
+const SFS_CONTROL_LBA: u64 = 1024;
+/// Block writes the torn-commit stage lets through before the cut.
+const SFS_TORN_CUT_AFTER: u64 = 2;
+
+/// Parse exactly `[sfs] ledger: gen=M items=K data-intact=yes ok` into
+/// `(M, K)`.
+fn parse_sfs_ledger(line: &str) -> Option<(u64, u64)> {
+    let mut it = line.trim_end().strip_prefix(SFS_LEDGER_PREFIX)?.split(' ');
+    let gen = sfs_dec(it.next()?.strip_prefix("gen=")?)?;
+    let items = sfs_dec(it.next()?.strip_prefix("items=")?)?;
+    (it.next()? == "data-intact=yes" && it.next()? == "ok" && it.next().is_none())
+        .then_some((gen, items))
+}
+
+/// Parse exactly `[sfs] scrub: blocks=N hashed=N bad=0 ok` (equal counts, at
+/// least the superblock, index and one bitmap) into `N`.
+fn parse_sfs_scrub(line: &str) -> Option<u64> {
+    let mut it = line.trim_end().strip_prefix(SFS_SCRUB_PREFIX)?.split(' ');
+    let blocks = sfs_dec(it.next()?.strip_prefix("blocks=")?)?;
+    let hashed = sfs_dec(it.next()?.strip_prefix("hashed=")?)?;
+    (it.next()? == "bad=0"
+        && it.next()? == "ok"
+        && it.next().is_none()
+        && blocks == hashed
+        && blocks >= 3)
+        .then_some(blocks)
+}
+
+/// Parse exactly `[sfs] torn-commit: cut-after=K gen=N dirty=D halting` into
+/// `(K, N, D)`.
+fn parse_sfs_torn_cut(line: &str) -> Option<(u64, u64, u64)> {
+    let mut it = line.trim_end().strip_prefix(SFS_TORN_PREFIX)?.split(' ');
+    let k = sfs_dec(it.next()?.strip_prefix("cut-after=")?)?;
+    let gen = sfs_dec(it.next()?.strip_prefix("gen=")?)?;
+    let dirty = sfs_dec(it.next()?.strip_prefix("dirty=")?)?;
+    (it.next()? == "halting" && it.next().is_none()).then_some((k, gen, dirty))
+}
+
+/// Parse exactly `[sfs] torn-commit: cut-after=K recovered-gen=G
+/// data-intact=yes ok` into `(K, G)`.
+fn parse_sfs_torn_recovered(line: &str) -> Option<(u64, u64)> {
+    let mut it = line.trim_end().strip_prefix(SFS_TORN_PREFIX)?.split(' ');
+    let k = sfs_dec(it.next()?.strip_prefix("cut-after=")?)?;
+    let gen = sfs_dec(it.next()?.strip_prefix("recovered-gen=")?)?;
+    (it.next()? == "data-intact=yes" && it.next()? == "ok" && it.next().is_none())
+        .then_some((k, gen))
+}
+
+/// The 512-byte test-control sector: `SFSCTL01 | mode | pad[3] | after u32 |
+/// gen u64`, rest zero (`kernel::sfs::proof::parse_control`). `None` clears
+/// it.
+fn sfs_control_sector(req: Option<(u8, u64, u64)>) -> [u8; 512] {
+    let mut s = [0u8; 512];
+    if let Some((mode, after, gen)) = req {
+        s[..8].copy_from_slice(b"SFSCTL01");
+        s[8] = mode;
+        s[12..16].copy_from_slice(&(after as u32).to_le_bytes());
+        s[16..24].copy_from_slice(&gen.to_le_bytes());
+    }
+    s
+}
+
+/// The SentinelFS window of `disk` (from LBA 2048), for before/after diffs.
+fn sfs_window(disk: &Path) -> Result<Vec<u8>, String> {
+    let img = fs::read(disk).map_err(|e| format!("read {}: {e}", disk.display()))?;
+    Ok(img.get(2048 * 512..).unwrap_or(&[]).to_vec())
+}
+
+/// Write the test-control sector of `disk` (QEMU is not running).
+fn write_sfs_control(disk: &Path, req: Option<(u8, u64, u64)>) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .open(disk)
+        .map_err(|e| format!("open {}: {e}", disk.display()))?;
+    f.seek(SeekFrom::Start(SFS_CONTROL_LBA * 512))
+        .and_then(|_| f.write_all(&sfs_control_sector(req)))
+        .and_then(|()| f.sync_all())
+        .map_err(|e| format!("write the control sector of {}: {e}", disk.display()))
+}
 /// The toy `kernel::fs`'s line on a disk it has never written.
 const FS_FIRST_BOOT_PREFIX: &str = "[fs] persistence: first boot";
 /// The toy `kernel::fs`'s line once the previous boot's marker file survived.
@@ -685,7 +803,9 @@ fn parse_sfs_format(line: &str) -> Option<SfsFormat> {
 /// one-line summary.
 fn check_persistence_chain(boot1: &str, boot2: &str, fresh: bool) -> Result<String, String> {
     fn find<'a>(log: &'a str, prefix: &str) -> Option<&'a str> {
-        log.lines().find(|l| l.starts_with(prefix)).map(str::trim_end)
+        log.lines()
+            .find(|l| l.starts_with(prefix))
+            .map(str::trim_end)
     }
     fn text(sb: &[u8; 8]) -> String {
         String::from_utf8_lossy(sb).into_owned()
@@ -761,7 +881,11 @@ fn check_persistence_chain(boot1: &str, boot2: &str, fresh: bool) -> Result<Stri
         "PERSISTENCE CHAIN PROVEN across two boots{}: SentinelFS boot 1 mounted gen={} slot={} \
          and committed gen={} slot={} sb={}; boot 2 mounted exactly that and committed gen={} \
          slot={}; toy FS: '{proven}'",
-        if fresh { " on a blank disk" } else { " (kept disk)" },
+        if fresh {
+            " on a blank disk"
+        } else {
+            " (kept disk)"
+        },
         m1.gen,
         m1.slot,
         c1.gen,
@@ -1361,9 +1485,8 @@ fn find_ata_references(src: &str) -> Vec<usize> {
             i += 1;
         }
     }
-    let is_ident = |t: Option<&(usize, Tok)>, name: &str| {
-        matches!(t, Some((_, Tok::Ident(s))) if s == name)
-    };
+    let is_ident =
+        |t: Option<&(usize, Tok)>, name: &str| matches!(t, Some((_, Tok::Ident(s))) if s == name);
     let mut lines = Vec::new();
     for i in 0..toks.len() {
         if !is_ident(toks.get(i), "hal") || toks.get(i + 1).map(|t| &t.1) != Some(&Tok::PathSep) {
@@ -1471,7 +1594,6 @@ fn do_check_ata_callers() -> ExitCode {
         ExitCode::FAILURE
     }
 }
-
 
 // ── check-component-imports ────────────────────────────────────────────────────
 
@@ -1864,10 +1986,10 @@ const BOOT_TEST_LOGS: [&str; 2] = ["target/serial.log", "target/serial-boot2.log
 /// requires the x2APIC **enable** line (proving the SMP AP1 write sequence
 /// executed on real silicon).
 fn boot_test(kvm: bool) -> ExitCode {
-    let Some(elf) = build_kernel() else {
+    let Some(elf) = build_kernel_with(true) else {
         return ExitCode::FAILURE;
     };
-    let Some(iso) = build_iso(&elf) else {
+    let Some(iso) = build_iso_named(&elf, "sentinelos-test") else {
         return ExitCode::FAILURE;
     };
     let fresh = match prepare_test_disk() {
@@ -1882,7 +2004,10 @@ fn boot_test(kvm: bool) -> ExitCode {
     let mut logs: Vec<String> = Vec::with_capacity(BOOT_TEST_LOGS.len());
     for (i, rel) in BOOT_TEST_LOGS.iter().enumerate() {
         let boot = i + 1;
-        println!("=== boot {boot} of {} (serial log: {rel}) ===", BOOT_TEST_LOGS.len());
+        println!(
+            "=== boot {boot} of {} (serial log: {rel}) ===",
+            BOOT_TEST_LOGS.len()
+        );
         let started = Instant::now();
         // The QMP keystroke phase (~20 s under TCG) runs on boot 1 only.
         let interactive = boot == 1;
@@ -1906,15 +2031,165 @@ fn boot_test(kvm: bool) -> ExitCode {
         logs.push(log);
     }
     match check_persistence_chain(&logs[0], &logs[1], fresh) {
+        Ok(summary) => println!("{summary}"),
+        Err(e) => {
+            eprintln!("TEST FAILED: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match torn_commit_stage(kvm, &iso, &disk, &logs[1]) {
         Ok(summary) => {
             println!("{summary}");
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("TEST FAILED: {e}");
+            eprintln!("TEST FAILED (torn-commit stage): {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Serial logs of the torn-commit stage's two boots, relative to `kernel/`.
+const TORN_LOGS: [&str; 2] = ["target/serial-torn.log", "target/serial-recover.log"];
+
+/// SentinelFS FS-1b's QEMU torn-commit proof (spec §11), on the disk the
+/// double boot left (its last commit is in `prev_log`):
+///
+/// 1. The test-control sector asks for a cut after [`SFS_TORN_CUT_AFTER`]
+///    block writes; the kernel mounts, stages the next ledger generation N,
+///    and halts inside that commit's dirty set (`… gen=N dirty=D halting`,
+///    `K ≤ D`, no commit line). xtask SIGKILLs QEMU at once. With
+///    `cache=writeback` the K writes QEMU completed reach the image (through
+///    the host page cache); nothing after them does.
+///
+/// **What this proves, and what it does not.** A SIGKILLed QEMU is not a
+/// power cut: the host keeps every write QEMU made, in order, so this stage
+/// cannot reorder or drop unflushed writes. It proves that the first K
+/// copy-on-write writes of a commit land only in blocks free in the committed
+/// state (exactly K window blocks change, neither superblock slot does) and
+/// that the next boot mounts generation N − 1 byte-exactly (same slot and
+/// superblock hash, ledger intact). Flush ordering — any subset of unflushed
+/// writes, in any order, torn superblock sectors — is proven on the host by
+/// `kernel::sfs::crash`'s crash matrix, which is the real durability evidence.
+/// 2. The control sector asks the next boot to verify: it must mount
+///    **exactly** the previous boot's commit (generation N − 1, same slot and
+///    superblock hash), find its ledger intact, and print
+///    `[sfs] torn-commit: cut-after=K recovered-gen=N-1 data-intact=yes ok`;
+///    every other boot assertion holds too (it then commits N normally).
+///
+/// The control sector is cleared before returning, success or not.
+fn torn_commit_stage(kvm: bool, iso: &Path, disk: &Path, prev_log: &str) -> Result<String, String> {
+    let r = torn_commit_boots(kvm, iso, disk, prev_log);
+    let cleared = write_sfs_control(disk, None);
+    let summary = r?;
+    cleared?;
+    Ok(summary)
+}
+
+fn torn_commit_boots(kvm: bool, iso: &Path, disk: &Path, prev_log: &str) -> Result<String, String> {
+    let prev = prev_log
+        .lines()
+        .find(|l| l.starts_with(SFS_COMMIT_PREFIX))
+        .and_then(parse_sfs_commit)
+        .ok_or("the previous boot has no well-formed commit line")?;
+    let k = SFS_TORN_CUT_AFTER;
+    write_sfs_control(disk, Some((1, k, 0)))?;
+    let before = sfs_window(disk)?;
+    println!(
+        "=== torn-commit stage: cut after {k} block writes (serial log: {}) ===",
+        TORN_LOGS[0]
+    );
+    let cut_marker = |log: &str| {
+        log.lines().any(|l| {
+            l.starts_with(SFS_TORN_PREFIX) && (l.ends_with("halting") || l.ends_with("FAIL"))
+        })
+    };
+    let (log, found) = run_boot_until(kvm, iso, disk, &kr(TORN_LOGS[0]), false, cut_marker);
+    if !found {
+        return Err(format!(
+            "the cut boot never reached its cut (kernel/{})",
+            TORN_LOGS[0]
+        ));
+    }
+    let line = log
+        .lines()
+        .find(|l| l.starts_with(SFS_TORN_PREFIX))
+        .unwrap_or("");
+    let Some((got_k, n, dirty)) = parse_sfs_torn_cut(line) else {
+        return Err(format!(
+            "expected `[sfs] torn-commit: cut-after={k} gen=N dirty=D halting`: '{line}'"
+        ));
+    };
+    if got_k != k || n != prev.gen + 1 || dirty < k {
+        return Err(format!(
+            "cut line '{line}': expected cut-after={k}, gen={} (the previous boot committed {}), \
+             dirty >= {k}",
+            prev.gen + 1,
+            prev.gen
+        ));
+    }
+    if let Some(c) = log.lines().find(|l| l.starts_with(SFS_COMMIT_PREFIX)) {
+        return Err(format!("the cut boot completed a commit: '{c}'"));
+    }
+    // The cut must have torn something: exactly the K block writes it let
+    // through reached the image (unflushed, in the host page cache), and
+    // neither superblock slot changed.
+    let after = sfs_window(disk)?;
+    let changed: Vec<usize> = (0..before.len().min(after.len()) / 4096)
+        .filter(|&b| before[b * 4096..(b + 1) * 4096] != after[b * 4096..(b + 1) * 4096])
+        .collect();
+    if changed.len() as u64 != k || changed.iter().any(|&b| b < 2) {
+        return Err(format!(
+            "the cut boot changed SentinelFS blocks {changed:?}: expected exactly {k} \
+             block(s), none of them a superblock slot"
+        ));
+    }
+
+    write_sfs_control(disk, Some((2, k, n)))?;
+    println!(
+        "=== torn-commit stage: recovery boot (serial log: {}) ===",
+        TORN_LOGS[1]
+    );
+    let (log, found) = run_boot(kvm, iso, disk, &kr(TORN_LOGS[1]), false);
+    if check_boot_log(kvm, &log, found, false) != ExitCode::SUCCESS {
+        return Err(format!(
+            "the recovery boot failed its boot assertions (kernel/{})",
+            TORN_LOGS[1]
+        ));
+    }
+    let mount = log
+        .lines()
+        .find(|l| l.starts_with(SFS_MOUNT_PREFIX))
+        .and_then(parse_sfs_mount)
+        .ok_or("recovery boot: no mount line")?;
+    if (mount.gen, mount.slot, mount.sb) != (prev.gen, prev.slot, prev.sb) {
+        return Err(format!(
+            "the recovery boot mounted gen={} slot={}, not exactly the last intact commit \
+             gen={} slot={} (torn commit N={n})",
+            mount.gen, mount.slot, prev.gen, prev.slot
+        ));
+    }
+    let torn = log
+        .lines()
+        .find(|l| l.starts_with(SFS_TORN_PREFIX))
+        .unwrap_or("");
+    match parse_sfs_torn_recovered(torn) {
+        Some((got_k, g)) if got_k == k && g == n - 1 => {}
+        _ => {
+            return Err(format!(
+                "expected `[sfs] torn-commit: cut-after={k} recovered-gen={} data-intact=yes ok`: \
+                 '{torn}'",
+                n - 1
+            ))
+        }
+    }
+    Ok(format!(
+        "TORN COMMIT PROVEN: cut after {k} of {dirty} dirty block writes of gen {n} \
+         (cache=writeback, SIGKILL; {k} torn block(s) on disk, both slots untouched); the next boot mounted gen {} with the same superblock and \
+         an intact ledger: '{}'",
+        n - 1,
+        torn.trim_end()
+    ))
 }
 
 /// One headless boot of `iso` with `disk` attached as the IDE primary master:
@@ -1927,6 +2202,22 @@ fn run_boot(
     disk: &Path,
     serial_log: &Path,
     interactive: bool,
+) -> (String, bool) {
+    run_boot_until(kvm, iso, disk, serial_log, interactive, |log| {
+        log.contains(END_MARKER)
+    })
+}
+
+/// [`run_boot`] with another stop condition: poll until `done(log)` or the
+/// timeout, then kill QEMU (SIGKILL: nothing in the guest or QEMU gets to
+/// flush).
+fn run_boot_until(
+    kvm: bool,
+    iso: &Path,
+    disk: &Path,
+    serial_log: &Path,
+    interactive: bool,
+    done: impl Fn(&str) -> bool,
 ) -> (String, bool) {
     let pcap = kr("target/net.pcap");
 
@@ -1967,7 +2258,7 @@ fn run_boot(
     while Instant::now() < deadline {
         std::thread::sleep(poll_interval);
         let log = fs::read_to_string(serial_log).unwrap_or_default();
-        if log.contains(END_MARKER) {
+        if done(&log) {
             found = true;
             break;
         }
@@ -1990,9 +2281,10 @@ fn run_boot(
 
     // Read final log (may have grown slightly after the last poll).
     let log = fs::read_to_string(serial_log).unwrap_or_default();
-    let name = serial_log
-        .file_name()
-        .map_or_else(|| serial_log.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let name = serial_log.file_name().map_or_else(
+        || serial_log.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     println!("--- {name} ---");
     println!("{}", log);
     println!("--- end {name} ---");
@@ -2310,17 +2602,37 @@ fn check_boot_log(kvm: bool, log: &str, found: bool, interactive: bool) -> ExitC
         .lines()
         .find(|l| l.starts_with(SFS_COMMIT_PREFIX))
         .unwrap_or("");
+    // FS-1b: the ledger the mounted generation holds is intact, the boot's
+    // commit carries the next generation's ledger changes (tree blocks +
+    // bitmap + index + superblock), and the scrub of that generation hashed
+    // every reachable block and found none bad.
+    let ledger_line = log
+        .lines()
+        .find(|l| l.starts_with(SFS_LEDGER_PREFIX))
+        .unwrap_or("");
+    match parse_sfs_ledger(ledger_line) {
+        Some((gen, _)) if gen == sfs_mount.gen => {}
+        _ => {
+            eprintln!(
+                "TEST FAILED: expected `[sfs] ledger: gen={} items=K data-intact=yes ok` \
+                 after the mount: '{ledger_line}'",
+                sfs_mount.gen
+            );
+            return ExitCode::FAILURE;
+        }
+    }
     match parse_sfs_commit(sfs_commit_line) {
         Some(c)
             if c.gen == sfs_mount.gen + 1
                 && c.slot == 1 - sfs_mount.slot
-                && c.blocks == 1
+                && c.blocks >= SFS_MIN_COMMIT_BLOCKS
                 && c.flushes == 2 => {}
         _ => {
             eprintln!(
-                "TEST FAILED: expected `[sfs] commit: gen={} slot={} sb=<8 hex> blocks=1 \
-                 flushes=2 ok` after the mount (the boot's empty commit: the next generation, \
-                 in the other slot, only the superblock written, both flushes): '{}'",
+                "TEST FAILED: expected `[sfs] commit: gen={} slot={} sb=<8 hex> blocks=B \
+                 flushes=2 ok` with B >= {SFS_MIN_COMMIT_BLOCKS} after the mount (the boot's \
+                 ledger commit: the next generation, in the other slot, tree nodes + bitmap + \
+                 index + superblock, both flushes): '{}'",
                 sfs_mount.gen + 1,
                 1 - sfs_mount.slot,
                 sfs_commit_line
@@ -2328,7 +2640,21 @@ fn check_boot_log(kvm: bool, log: &str, found: bool, interactive: bool) -> ExitC
             return ExitCode::FAILURE;
         }
     }
-    println!("SentinelFS FS-1a proven: '{sfs_mount_line}' then '{sfs_commit_line}'");
+    let scrub_line = log
+        .lines()
+        .find(|l| l.starts_with(SFS_SCRUB_PREFIX))
+        .unwrap_or("");
+    if parse_sfs_scrub(scrub_line).is_none() {
+        eprintln!(
+            "TEST FAILED: expected `[sfs] scrub: blocks=N hashed=N bad=0 ok` after the \
+             commit: '{scrub_line}'"
+        );
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "SentinelFS proven: '{sfs_mount_line}', '{ledger_line}', '{sfs_commit_line}', \
+         '{scrub_line}'"
+    );
 
     // Component model PR-2: attested `from`, deny by default, forgeries refused,
     // denials logged — the exact line, with denies-logged >= 1.
@@ -3210,6 +3536,63 @@ ffffffff80105000 <isr_common>:\n\
     }
 
     #[test]
+    fn sfs_fs1b_lines_parse_only_the_exact_shape() {
+        use super::{
+            parse_sfs_ledger, parse_sfs_scrub, parse_sfs_torn_cut, parse_sfs_torn_recovered,
+            sfs_control_sector,
+        };
+        assert_eq!(
+            parse_sfs_ledger("[sfs] ledger: gen=3 items=12 data-intact=yes ok"),
+            Some((3, 12))
+        );
+        assert_eq!(
+            parse_sfs_ledger("[sfs] ledger: gen=3 items=12 data-intact=no FAIL"),
+            None
+        );
+        assert_eq!(
+            parse_sfs_ledger("[sfs] ledger: gen=3 items=12 data-intact=yes ok x"),
+            None
+        );
+        assert_eq!(
+            parse_sfs_scrub("[sfs] scrub: blocks=8 hashed=8 bad=0 ok\r"),
+            Some(8)
+        );
+        for bad in [
+            "[sfs] scrub: blocks=8 hashed=7 bad=0 ok",
+            "[sfs] scrub: blocks=8 hashed=8 bad=1 FAIL",
+            "[sfs] scrub: blocks=2 hashed=2 bad=0 ok",
+            "[sfs] scrub: TIMEOUT FAIL",
+        ] {
+            assert_eq!(parse_sfs_scrub(bad), None, "{bad}");
+        }
+        assert_eq!(
+            parse_sfs_torn_cut("[sfs] torn-commit: cut-after=2 gen=4 dirty=6 halting"),
+            Some((2, 4, 6))
+        );
+        assert_eq!(
+            parse_sfs_torn_cut("[sfs] torn-commit: cut-after=9 outside dirty=6 FAIL"),
+            None
+        );
+        assert_eq!(
+            parse_sfs_torn_recovered(
+                "[sfs] torn-commit: cut-after=2 recovered-gen=3 data-intact=yes ok"
+            ),
+            Some((2, 3))
+        );
+        assert_eq!(
+            parse_sfs_torn_recovered(
+                "[sfs] torn-commit: cut-after=2 recovered-gen=3 data-intact=no FAIL"
+            ),
+            None
+        );
+        let s = sfs_control_sector(Some((2, 2, 4)));
+        assert_eq!(&s[..8], b"SFSCTL01");
+        assert_eq!((s[8], s[12], s[16]), (2, 2, 4));
+        assert!(s[24..].iter().all(|&b| b == 0));
+        assert!(sfs_control_sector(None).iter().all(|&b| b == 0));
+    }
+
+    #[test]
     fn sfs_mount_line_parses_only_the_exact_shape() {
         use super::{parse_sfs_mount, SfsLine};
 
@@ -3286,7 +3669,10 @@ ffffffff80105000 <isr_common>:\n\
 
         let (b1, b2) = chain_logs();
         let summary = check_persistence_chain(&b1, &b2, true).unwrap();
-        assert!(summary.contains("committed gen=2 slot=0 sb=22222222"), "{summary}");
+        assert!(
+            summary.contains("committed gen=2 slot=0 sb=22222222"),
+            "{summary}"
+        );
         // A kept disk drops the absolute values but not the chain.
         let (k1, k2) = (
             b1.replace("gen=1 slot=1", "gen=7 slot=1")
@@ -3295,7 +3681,10 @@ ffffffff80105000 <isr_common>:\n\
                 .replace("gen=3 slot=1", "gen=9 slot=1"),
         );
         assert!(check_persistence_chain(&k1, &k2, false).is_ok());
-        assert!(check_persistence_chain(&k1, &k2, true).is_err(), "not a blank disk");
+        assert!(
+            check_persistence_chain(&k1, &k2, true).is_err(),
+            "not a blank disk"
+        );
     }
 
     #[test]
@@ -3415,9 +3804,16 @@ ffffffff80105000 <isr_common>:\n\
         use super::{find_ata_references, kernel_root, ATA_DOOR};
 
         let door = std::fs::read_to_string(kernel_root().join(ATA_DOOR)).unwrap();
-        assert!(!find_ata_references(&door).is_empty(), "the door names hal::ata");
+        assert!(
+            !find_ata_references(&door).is_empty(),
+            "the door names hal::ata"
+        );
         let fs = std::fs::read_to_string(kernel_root().join("crates/kernel/src/fs.rs")).unwrap();
-        assert_eq!(find_ata_references(&fs), Vec::<usize>::new(), "kernel::fs goes through the door");
+        assert_eq!(
+            find_ata_references(&fs),
+            Vec::<usize>::new(),
+            "kernel::fs goes through the door"
+        );
     }
 }
 

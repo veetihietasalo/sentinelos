@@ -127,7 +127,7 @@ the safe `SpinMutex` API (§5e).
 | C12 | `cpu.rs` · `xsetbv()` (`pub(crate) unsafe`) | `xsetbv` (XCR[ecx] ← edx:eax) | Enable AVX (`YMM`) — and, where present, AVX-512 (`ZMM`) — state in `XCR0` so `avx`/`avx2`/`avx512f` don't `#UD` | Driven only by `simd::enable`, which sets `CR4.OSXSAVE` first (so no `#UD`) and writes `XCR0` with the x87\|SSE\|AVX component bits, plus — **only** when `cpuid` advertises `avx512f` — the `opmask`\|`ZMM_Hi256`\|`Hi16_ZMM` bits. Each bit is `cpuid`-confirmed supported before being set (so no `#GP`; AVX requires SSE, and the three AVX-512 bits are all supported iff `avx512f` and enabled together). Enabling vector state only makes `YMM`/`ZMM` usable/saveable — it changes no Rust-visible memory. `nostack`/`preserves_flags`; `nomem` omitted as a barrier. | **AVX path:** Reasoned + QEMU (`[simd] AVX enabled …` on every boot). **AVX-512 path OBSERVED:** the `opmask\|ZMM_Hi256\|Hi16_ZMM` bits are set only when `avx512f` is advertised (never under TCG). The `kvm-smp` CI job landed a VNNI-capable KVM `-cpu host` runner and booted with `[ml] … active=avx512-vnni; int8 GEMM ok` (serial log archived as artifact) — which requires the AVX-512 `XCR0` write to have executed at CPL-0 and the ZMM state to be live, so this path is now dynamically confirmed on real silicon (the archived `[simd]` line also shows `avx512f=ok`). Runner assignment is non-deterministic, so it is not guaranteed every run, but it has been observed. |
 | C13 | `cpu.rs` · `xsave()` (`pub(crate) unsafe`) | `xsave [mem]` (save the `XCR0`-enabled vector/FPU state components to memory) | Save vector state: the boot `xsave`/`xrstor` round-trip self-test (`simd::xsave_roundtrip_ok`), and — **live, second caller** — `hal::context::switch`'s eager per-task vector save (§9, CX4), gated on `crate::idt::vector_state_armed`. (The per-IRQ save in `isr_common`, I1, uses the same instruction **inline** in `global_asm!`, not this fn.) | Requires `CR4.OSXSAVE` (set by `simd::enable` before any caller) so no `#UD`; the caller's `# Safety` requires a 64-byte-aligned area of ≥ `cpuid`-leaf-`0xD` bytes whose 64-byte header is zeroed (`XCOMP_BV = 0` ⇒ standard format), so no `#GP`. Writes only the save area (no `nomem`), `nostack`, `preserves_flags`. Saving register state to a valid buffer cannot create UB. **The round-trip self-test (`simd::xsave_roundtrip_ok`) also contains three VEX `asm!` blocks** — `vmovdqu`/`vpxor` on `xmm0` to stage and read back a known pattern — which are additional vector asm in the TCB; they are legal (VEX needs only `OSXSAVE`+`XCR0`, both set; legacy SSE would need `OSFXSR`), touch only `xmm0` + bounded `[known]`/`[got]` buffers, and are Miri/Kani-opaque like SM1–SM3. `context::switch`'s call passes `hal::context::XsaveArea`'s runtime-aligned window (§9, CX6) — 64-byte aligned, `XSAVE_AREA_SIZE` bytes, header-zeroed by `new_init`/`zeroize` — satisfying this fn's precondition identically to the self-test's on-stack buffer. | Reasoned + QEMU (the boot round-trip self-test passes on every boot, gating the per-IRQ save; the scheduler's live call is exercised on every `hal::context::switch`, asserted by the PR-A cooperative boot-proof interleave) |
 | C15 | `cpu.rs` · `enable_interrupts_and_halt()` | `sti; hlt` (one asm block) | The race-free idle step for an application processor waiting for a reschedule IPI | `sti`'s interrupt shadow defers recognition to after the next instruction, so with both in one block a pending wake-up is taken **after** `hlt` is entered and wakes the core; as two separate blocks (C2 then C3) an IPI could land in between and the core would sleep through it. Neither instruction touches memory or GP registers (`nomem`, `nostack`); IF is modified (no `preserves_flags`). Cannot create UB. | Reasoned + QEMU (`-smp 4`: each AP idles on it in `kernel::sched::ap_idle_loop` and is woken by the pinned-task proof's IPI) |
-| C16 | `cpu.rs` · `rdtsc()` | `rdtsc` | A coarse bound for boot-time waits on one core (`kernel::ioapic`'s PIT-liveness check: the PIT is the thing being tested, so it cannot time itself; 2^35 cycles so a starved TCG host cannot falsely fail it) | Always legal at CPL 0 (`CR4.TSD` restricts only CPL > 0); monotonic per core only — no cross-core use; reads EDX:EAX only, `nomem`/`nostack`/`preserves_flags`. Never used as a calibrated clock. | Reasoned + QEMU (the liveness wait completes on PIT ticks; the TSC bound is the failure path) |
+| C16 | `cpu.rs` · `rdtsc()` | `rdtsc` (EDX:EAX ← time-stamp counter; inline `asm!`) | A coarse, uncalibrated bound on waits that stay on one core. **Two callers:** (1) `kernel::ioapic`'s boot-time PIT-liveness check — the PIT is the thing being tested, so it cannot time itself; 2^35 cycles so a starved TCG host cannot falsely fail it; (2) since SentinelFS FS-1b, `hal::ata`'s status-wait deadlines (A1–A4 callers: generous TSC-cycle budgets instead of a count of status reads) | Always legal at CPL 0 (`CR4.TSD` restricts only CPL > 0; the host build runs it in user mode, which TSD-clear Linux allows); reads EDX:EAX only — `nomem`/`nostack`/`preserves_flags`, no side effect, no input to get wrong. Never a calibrated clock. **Premises of its use as a bound:** the TSC is monotonic **per core only** — no cross-core use: the IOAPIC wait runs with IF = 1 for the wait only (it counts PIT ticks); it runs inline on the BSP and never migrates, and an ATA wait never changes core mid-wait (the scheduler does not migrate tasks; `sfs-commit` is `spawn_on(0)`, the toy FS's caller is `kmain` on the BSP). A stopped or slow TSC only *lengthens* a wait (the ATA read-count backstop bounds it; the IOAPIC wait ends on PIT ticks first); a forward jump only ends a wait early — for ATA an early `Timeout`, which resets the channel and returns an error, for the IOAPIC a failed liveness check, which keeps the 8259 — safe either way, never a wrong success. The budgets are wall time, so preemption of a waiting task counts against them (ATA budgets are seconds; a slice is 10 ms). | Reasoned + QEMU (the IOAPIC liveness wait completes on PIT ticks — the TSC bound is the failure path; every boot's ATA waits run on it) + host tests of the ATA wait logic it clocks (`ata::wait_tests`, also under Miri) and Kani `poll_until_is_a_deadline` |
 | C14 | `cpu.rs` · `xrstor()` (`pub(crate) unsafe`) | `xrstor [mem]` (restore vector/FPU state from a saved image) | Restore vector state; pairs with C13 (self-test + — **live, second caller** — `hal::context::switch`'s eager per-task vector restore, §9 CX4; `isr_common` uses the instruction inline) | Requires `CR4.OSXSAVE` (no `#UD`); the caller's `# Safety` requires a 64-byte-aligned standard-format `XSAVE` image (e.g. one `xsave` just wrote, or an all-zero [`hal::context::XsaveArea`] — the architectural init image, §9 CX4 req. #2), so no `#GP`. Reads the image (`readonly`), loads the vector registers, writes no other memory, `nostack`, `preserves_flags`. Loading register state from a valid image cannot create UB in Rust-managed memory. | Reasoned + QEMU (round-trip self-test: state survives save → zero → restore; the scheduler's live call is exercised on every `hal::context::switch`) |
 
 `cpu_security::enable` (safe) drives the SMEP/SMAP/UMIP path of C8 (the `OSXSAVE`
@@ -853,7 +853,8 @@ filesystem persistence in `kernel::fs` (so files survive a reboot). The primary
 channel uses the standard PC legacy ports: command block `0x1F0..=0x1F7` and the
 control-block Alternate Status register `0x3F6`. Addressing is 28-bit LBA
 (LBA28). The public surface (`identify`, `read_sectors`, `write_sectors`,
-`DiskInfo`, `AtaError`) is **safe** and returns `Result` so the kernel degrades
+`flush` — split out of `write_sectors` in SentinelFS FS-1b — `DiskInfo`,
+`AtaError`) is **safe** and returns `Result` so the kernel degrades
 to an in-memory filesystem when no disk is attached. All hardware access is
 funnelled through four private primitives — `inb`/`outb` (8-bit) and `inw`/`outw`
 (16-bit) — each with a `# Safety` rustdoc section. The serialiser, CRC, and tree
@@ -862,7 +863,7 @@ walk all live in `kernel::fs` under `#![forbid(unsafe_code)]`, **not** the TCB.
 | # | Location | Unsafe op | Why needed | Soundness argument | Verification |
 |---|----------|-----------|------------|--------------------|--------------|
 | A1 | `ata.rs` · `inb()` | `in al, dx` (8-bit port read) | Read the ATA status (`0x1F7`) / alternate-status (`0x3F6`) / LBA-mid/hi registers | `unsafe fn` whose `# Safety` requires a read-safe ATA register; all callers pass a primary-channel command/control-block port. Pure device read, `nomem`/`nostack`. | Reasoned + QEMU |
-| A2 | `ata.rs` · `outb()` | `out dx, al` (8-bit port write) | Program the seccount/LBA/drive-select registers and issue command bytes (`IDENTIFY`/`READ`/`WRITE`/`FLUSH`) | `unsafe fn` whose `# Safety` requires a write-safe ATA register; all callers pass a primary command-block port (`0x1F2..=0x1F7`) with a defined LBA/seccount/command byte. Sets up/starts a device operation only; device-only effect, `nomem`/`nostack`. | Reasoned + QEMU |
+| A2 | `ata.rs` · `outb()` | `out dx, al` (8-bit port write) | Program the seccount/LBA/drive-select registers and issue command bytes (`IDENTIFY`/`READ`/`WRITE`/`FLUSH CACHE`). **Amended in SentinelFS FS-1b:** `FLUSH CACHE` is no longer issued at the end of every `write_sectors`; it is the separate public `flush()` (select master → `wait_not_busy` → `FLUSH CACHE` → `wait_not_busy` → ERR/DF check), and `write_sectors` now ends by waiting for BSY to clear and checking ERR/DF. The pre-FS-1b code wrote `FLUSH CACHE` straight after the data phase without waiting for BSY (a command written to a busy drive is ignored); fixed. One new call site of this primitive: `flush()`'s drive select (`0x1F6` ← `0xE0`). **Amended again in FS-1b (time-bounded waits):** BSY/DRQ waits end at a TSC deadline (C16; ≥ 0.8 s per sector, ≥ 8 s per `FLUSH CACHE`, at any plausible TSC rate, plus a read-count backstop) instead of after 100 000 status reads — under host write pressure QEMU's asynchronous IDE completion outlasted the count (FS-1c CI, reproduced on main 1/18 under `dd`). After any `Timeout` the channel is **software-reset** before the error returns (`reset_channel`: Device Control `0x3F6` ← `SRST | nIEN` (`0x06`), hold ≥ 25 000 TSC cycles (≥ 5 µs at ≤ 5 GHz), ← `nIEN` (`0x02`), wait ≥ 10 M cycles (≥ 2 ms), then a BSY wait bounded by ≥ 31 s — the ATA limit), because a timed-out command can still be running or stopped mid-transfer with DRQ pending, and the next command must not start against it. Two new call sites: those two Device Control writes. | `unsafe fn` whose `# Safety` requires a write-safe ATA register; all callers pass a primary command-block port (`0x1F2..=0x1F7`) with a defined LBA/seccount/command byte, or the control-block Device Control register (`0x3F6`) with `SRST | nIEN` or `nIEN` — after a reset the driver states "no device interrupts" (it polls; nothing in the kernel handles IRQ14) instead of inheriting whatever firmware left. Sets up/starts a device operation only; device-only effect, `nomem`/`nostack`. The FS-1b flush split changes *when* the command byte `0xE7` is written and adds one drive-select write with the value `select_lba`/`identify` already write. The timeout recovery adds a **new port and values** — Device Control `0x3F6` with `0x06` then `0x02` — whose effect is likewise device-only (a drive reset; interrupt gating of a line the kernel never services), so the argument is the same: no write here can alias or corrupt Rust-managed memory. What the split weakens is **durability**, not memory safety: a `write_sectors` that returns `Ok` may sit in the drive's cache until the next `flush()`; SentinelFS's commit protocol and the toy `kernel::fs` both call `flush()` where they need durability (invariant 16), and the evidence that the protocol tolerates exactly that is the host crash matrix (`kernel::sfs::crash`: every write index × unflushed subsets in any order × torn superblock sectors); the QEMU torn-commit stage (`cache=writeback`, SIGKILL mid-commit — not a power cut: QEMU's writes survive in order) adds that on the real transport a commit's first writes land only in free blocks and the previous generation mounts byte-exactly. | Reasoned + QEMU (incl. the FS-1b torn-commit stage) |
 | A3 | `ata.rs` · `inw()` | `in ax, dx` (16-bit port read) | Pull one PIO data word from the data register (`0x1F0`) during a sector read | `unsafe fn` whose `# Safety` requires the read-safe data port; the sole caller (`read_sectors`, and the IDENTIFY block) reads `0x1F0` **only after DRQ is asserted** (the drive is offering a word). Pure device read, `nomem`/`nostack`. | Reasoned + QEMU |
 | A4 | `ata.rs` · `outw()` | `out dx, ax` (16-bit port write) | Push one PIO data word into the data register (`0x1F0`) during a sector write | `unsafe fn` whose `# Safety` requires the write-safe data port; the sole caller (`write_sectors`) writes `0x1F0` **only after DRQ is asserted** (the drive is ready for a word). Device-only effect, `nomem`/`nostack`. | Reasoned + QEMU |
 
@@ -879,8 +880,9 @@ walk all live in `kernel::fs` under `#![forbid(unsafe_code)]`, **not** the TCB.
 > (`#![forbid(unsafe_code)]`): pure byte arithmetic over slices and `Vec`s, with
 > co-located host unit tests (round-trip, truncation/bad-tag rejection, CRC
 > known-vectors). The TCB's job is only to move 512-byte sectors to/from the
-> media (A1–A4). `write_sectors` ends with a `FLUSH CACHE` so data reaches the
-> backing image before the guest can power off.
+> media (A1–A4). Since SentinelFS FS-1b `write_sectors` is **unflushed** and
+> `flush()` (`FLUSH CACHE`) is a separate public call; `kernel::fs`'s save
+> ends with one `flush()`, and SentinelFS issues two per commit (spec §8).
 >
 > **Command serialisation moved to the kernel (SentinelFS FS-1a).** A command
 > is a request→poll→transfer sequence that must not interleave with another on
@@ -892,6 +894,32 @@ walk all live in `kernel::fs` under `#![forbid(unsafe_code)]`, **not** the TCB.
 > could only corrupt a transfer, never memory, so rows A1–A4 are unchanged —
 > still `nomem` port I/O whose soundness never depended on the caller being
 > single-threaded. (Doc-only change; `hal::ata`'s code is untouched.)
+>
+> **FS-1b API split (row A2 amended).** `hal::ata` gained a public `flush()`
+> and `write_sectors` stopped flushing; `CHANNEL` serialises `flush()` like
+> every other command (one command per lock hold), and invariant 16 (§4) makes
+> the command-serialisation rule part of the registry rather than a convention
+> recorded in a note. Evidence: `cargo +nightly miri test -p hal` and the hal
+> Kani suite green — the flush split itself is port I/O, Miri/Kani-opaque like
+> A1–A4; the time-bounded waits that came with it add a pure helper,
+> `poll_until`, with host tests (also under Miri) and a Kani harness (below) — `make test`'s double boot (the toy FS's
+> `persistence PROVEN` line now depends on its explicit `flush()`), and the
+> torn-commit stage (QEMU `cache=writeback`, the kernel halted after the
+> k-th block write of a commit, QEMU SIGKILLed, the next boot mounts
+> generation N−1 intact — which proves the CoW writes land only in free
+> blocks; SIGKILL keeps QEMU's writes in order, so flush ordering is proven
+> by the host crash matrix, not by this stage). As built: `[sfs] torn-commit: cut-after=2
+> recovered-gen=3 data-intact=yes ok` with exactly the 2 cut blocks changed on
+> disk and both superblock slots untouched.
+>
+> **FS-1b time-bounded waits (rows A2 and C16).** The status waits end at a TSC
+> deadline instead of after 100 000 reads, and a timed-out command resets the
+> channel (SRST) before returning. Evidence: host tests of the pure wait loop
+> (`hal::ata::wait_tests`, also under Miri), Kani `poll_until_is_a_deadline`
+> (0.4 s: a timeout is always a passed deadline or the backstop, a ready drive is
+> never reported as one), and `make test` green, also under concurrent host
+> `dd … conv=fdatasync` load — the condition that made the read-count bound fail
+> in FS-1c's CI (one run here; the reported rate was 1/18 on main).
 
 ## 8. `hal::cpuid` — CPU identification (hardware report)
 
@@ -1133,6 +1161,25 @@ Context` — see the design doc's "sealed capability" argument, mirrored in
     yet, so only the BSP's own tick can carry either clock there. The PIT
     remains the wall clock for uptime display and the LAPIC calibration
     reference (invariant 14).
+16. **ATA commands are serialised by `kernel::blk::ata`'s `CHANNEL` lock, and
+    durability needs an explicit `flush()`.** (SentinelFS FS-1b.) Every
+    `hal::ata` entry point — `identify`, `read_sectors`, `write_sectors`,
+    `flush` — is one command sequence that must not interleave with another on
+    the primary channel; `hal::ata` does not lock, the kernel does:
+    `kernel::blk::ata` holds `CHANNEL` (a `hal::sync::SpinMutex`, waiters
+    yield instead of spinning, §5e) around exactly one call, and it is the only
+    kernel file that may name `hal::ata` (`cargo xtask check-ata-callers`, a CI
+    step). Interleaving would corrupt a transfer, never memory (rows A1–A4 stay
+    sound regardless). `write_sectors` returning `Ok` means the drive accepted
+    the data, possibly only into its write cache; only a later successful
+    `flush()` makes it durable, and between two flushes the drive may persist
+    any subset of the sectors written (a single sector is atomic). Callers that
+    promise durability flush: `kernel::fs` once per save, SentinelFS twice per
+    commit (dirty blocks → flush → superblock → flush). Every status wait ends
+    at a TSC deadline (C16), and a command that times out leaves the channel
+    **reset** (SRST) before `Timeout` is returned, so a timeout never leaves a
+    half-finished command or a pending DRQ for the next caller of the lock;
+    the lock is held across the reset (it is part of the command's call).
 17. **Device-IRQ routing (SMP 3b-ii).** (Numbered 17: FS-1b adds invariant 16, the ATA channel lock.) Once `kernel::ioapic::init` succeeds,
     every device IRQ the kernel uses reaches the CPU by exactly one path: an
     IOAPIC redirection entry, fixed delivery, physical destination = the BSP's

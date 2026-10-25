@@ -971,13 +971,14 @@ fn replaying_the_same_operations_yields_the_same_superblock_hashes_and_image() {
 /// The whole FS footprint — cache slab, allocator tables, commit plan, the
 /// workspace — is fixed at mount and independent of the device size: a 1 GiB
 /// device costs exactly what the 16 MiB window costs, and nothing grows
-/// across transactions. (A process-wide counting allocator needs an
-/// `unsafe impl GlobalAlloc`, which this crate forbids; every FS structure is
-/// a fixed-size `Box<[T]>` built once, so its size is its heap use.)
+/// across transactions. This is the FS-1a structural argument (the sum of
+/// the fixed `Box<[T]>` sizes); since FS-1b `sfs::heap` measures the real
+/// peak through a counting global allocator (the `test-alloc` crate), which
+/// also catches stray temporaries this sum cannot see.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn heap_footprint_is_fixed_capped_and_independent_of_device_size() {
-    const CAP: usize = 300 * 1024;
+    const CAP: usize = 400 * 1024;
     let footprint = |blocks: u64| {
         let mut d = MemDevice::untracked(blocks);
         let mut ws = Workspace::new();

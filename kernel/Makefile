@@ -14,6 +14,8 @@
 #   make test        # build ISO + boot headless in QEMU (TCG) twice on a fresh
 #                    #   test disk; assert every boot line + the persistence chain
 #                    #   (SENTINELOS_KEEP_TEST_DISK=1 keeps the test disk)
+#                    #   then the SentinelFS torn-commit stage: a boot cut mid-
+#                    #   commit (cache=writeback, SIGKILL) + a recovery boot
 #   make test-kvm    # build ISO + boot under KVM (-cpu host), assert the x2APIC
 #                    #   ENABLE path ran — the C1 evidence TCG cannot produce.
 #                    #   Requires /dev/kvm (real hardware or a KVM-capable runner).

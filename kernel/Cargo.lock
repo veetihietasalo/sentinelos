@@ -29,6 +29,7 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "hal",
+ "test-alloc",
  "ui",
 ]
 
@@ -40,6 +41,10 @@ checksum = "af6d2ee42712e7bd2c787365cd1dab06ef59a61becbf87bec7b32b970bd2594b"
 dependencies = [
  "bitflags",
 ]
+
+[[package]]
+name = "test-alloc"
+version = "0.1.0"
 
 [[package]]
 name = "ui"

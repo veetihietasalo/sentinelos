@@ -744,7 +744,9 @@ mod disk {
             .map_err(|_| ())?;
             done += chunk;
         }
-        Ok(())
+        // Since SentinelFS FS-1b `write_sectors` is unflushed: one FLUSH CACHE
+        // makes the whole image durable before `save` reports success.
+        ata::flush().map_err(|_| ())
     }
 
     // ── Serialisation (pure; exercised by the host unit tests) ──────────────────
