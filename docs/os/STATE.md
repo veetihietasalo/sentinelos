@@ -111,6 +111,17 @@ Follow-ups owned in the spec as A25–A31. **A25 shipped (2026-10-04):** `sched:
 the commit task's yield-poll — it is now a normal blocked task and the BSP idles after boot
 (`[sched] park: … sfs-commit=parked bsp-idles=yes ok`); FS-2's blocking callers still need a
 waiter list the task unparks.
+**FS-1c (storage-cap lattice) rebased onto PR-2b (2026-10-06), PR open, not yet merged:**
+`kernel::cap::storage` (tree / component-wise prefix / blob scope / lineage-charged quota
+ceiling; storage op bits 8–12 on `Target::Service(ServiceId::Storage)`), boot line
+`[sfs] cap: narrow=ok … tree-from-live=refused ok`. Decisions: the §9 ops and expiry live on
+the capability; trees are pairwise incomparable; quota fan-out (T-STO-6) is charged to the root
+grant's lineage counter in FS-4; storage has a real meet (greatest lower bound, Kani); its
+attenuation is framed as v2 kind 1 (≤ 245 bytes); every storage manifest request is refused and
+storage capabilities are kernel-granted only (`pub(crate) grant_service`) until FS-4 adds a
+route form for kernel services. Open, not FS-1c's: `hal::ata` waits are poll-count bounded
+(100 000 status reads), so a slow host flush under I/O pressure times out a write (`[sfs]
+mount/commit: io FAIL`, reproduced on main) — needs a time-bounded wait and recovery in `hal`.
 Login/identity spec next: it must solve Argon2id's ≥19 MiB vs the 4 MiB heap (a `hal::mm`
 arena outside the heap), wrap both the tree key and the KeyAgent key from one unlock secret
 (resolving component §18.1), and decide the rollback anchor. The superblock already reserves

@@ -1400,15 +1400,38 @@ fn a_restarted_provider_is_bound_by_a_new_holder() {
 
 #[test]
 fn a_meaningless_request_is_refused_before_hashing() {
-    let bad_requests: [CapRequest; 4] = [
+    let storage = Attenuation::Storage(crate::cap::storage::StorageAttenuation {
+        tree: crate::cap::storage::Tree::Live,
+        prefix: crate::cap::storage::StoragePath::ROOT,
+        blobs: crate::cap::storage::BlobScope::None,
+        quota: crate::cap::storage::Quota::UNLIMITED,
+    });
+    let bad_requests: [CapRequest; 7] = [
         // No operation.
         CapRequest {
             ops: OpSet::EMPTY,
             ..probe::ALICE_ASKS_FOR_BOB
         },
-        // An undefined bit (FS-1c's reserved bit 8, not defined yet).
+        // A storage op (bit 8, `Read`, defined since FS-1c) with a bus
+        // attenuation: a storage op means something only with storage.
         CapRequest {
-            ops: OpSet::from_bits(Op::Send.bit() | (1 << 8)),
+            ops: OpSet::from_bits(Op::Send.bit() | Op::Read.bit()),
+            ..probe::ALICE_ASKS_FOR_BOB
+        },
+        // An undefined bit just past the storage ops.
+        CapRequest {
+            ops: OpSet::from_bits(Op::Send.bit() | (1 << 13)),
+            ..probe::ALICE_ASKS_FOR_BOB
+        },
+        // A storage request: storage never fits a component instance, and
+        // no route reaches the kernel's storage service before FS-4.
+        CapRequest {
+            ops: OpSet::of(&[Op::Read]),
+            attenuation: storage,
+            ..probe::ALICE_ASKS_FOR_BOB
+        },
+        CapRequest {
+            attenuation: storage,
             ..probe::ALICE_ASKS_FOR_BOB
         },
         // A bit far outside anything named.
@@ -1432,8 +1455,23 @@ fn a_meaningless_request_is_refused_before_hashing() {
         ops: OpSet::EMPTY,
         ..probe::ALICE_ASKS_FOR_BOB
     }];
-    static UNDEFINED_BIT: [CapRequest; 1] = [CapRequest {
+    // Bit 8 is `Op::Read` since FS-1c: a storage op with a bus attenuation.
+    static STORAGE_OP_ON_BUS: [CapRequest; 1] = [CapRequest {
         ops: OpSet::from_bits(1 << 8),
+        ..probe::ALICE_ASKS_FOR_BOB
+    }];
+    static UNDEFINED_BIT: [CapRequest; 1] = [CapRequest {
+        ops: OpSet::from_bits(1 << 13),
+        ..probe::ALICE_ASKS_FOR_BOB
+    }];
+    static STORAGE_REQUEST: [CapRequest; 1] = [CapRequest {
+        ops: OpSet::of(&[Op::Read]),
+        attenuation: Attenuation::Storage(crate::cap::storage::StorageAttenuation {
+            tree: crate::cap::storage::Tree::Live,
+            prefix: crate::cap::storage::StoragePath::ROOT,
+            blobs: crate::cap::storage::BlobScope::None,
+            quota: crate::cap::storage::Quota::UNLIMITED,
+        }),
         ..probe::ALICE_ASKS_FOR_BOB
     }];
     static TOO_LONG: [CapRequest; 1] = [CapRequest {
@@ -1441,7 +1479,13 @@ fn a_meaningless_request_is_refused_before_hashing() {
         ..probe::ALICE_ASKS_FOR_BOB
     }];
     let cell = fresh();
-    for caps in [&NO_OPS[..], &UNDEFINED_BIT[..], &TOO_LONG[..]] {
+    for caps in [
+        &NO_OPS[..],
+        &STORAGE_OP_ON_BUS[..],
+        &UNDEFINED_BIT[..],
+        &STORAGE_REQUEST[..],
+        &TOO_LONG[..],
+    ] {
         // Even with an honest id for exactly these declarations.
         let m = honest(Manifest {
             caps,

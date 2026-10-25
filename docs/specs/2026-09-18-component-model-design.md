@@ -449,6 +449,25 @@ not change; FS-1c extends the harnesses' symbolic generators (`cap::proofs::any_
 `any_attenuation`, `any_access`) with the new variants and re-runs them, which turns the existing
 "never amplifies" proofs into its own.
 
+**Landing with SentinelFS FS-1c (PR #42)** — additive, as above, with one change of shape:
+the target is `Target::Service(ServiceId::Storage)` (a kernel service; `Target::Service` stays
+reserved for kernel services, and its `allowed_ops` arm is the storage bits 8–12 plus
+`Delegate`), not a separate `Target::Storage`. `Attenuation::Storage(cap::storage::StorageAttenuation)`
+and `Access::Storage(cap::storage::StorageAccess)` carry the lattice and its accesses; the §9
+`ops` and `expires` are the capability's own. No manifest requests it yet (PR-2b's service
+requests); the kernel grants it (`Host::grant_service`) and it is then delegated, revoked and
+checked through the unchanged paths. The generators `any_target`, `any_attenuation` and
+`any_access` produce the storage variants (one constant storage value, enough for every
+cross-kind arm — the lattice itself is proven in `cap::storage::proofs`), and
+`table::proofs::delegate_never_amplifies` is split by the parent's kind
+(`delegate_never_amplifies_storage` for a storage parent over symbolic storage children;
+SentinelFS spec §11 *FS-1c as built*). Rebased onto PR-2b: storage has a real meet (the
+greatest lower bound, Kani `cap::storage::proofs::storage_meet_is_the_greatest_lower_bound`);
+the attenuation's canonical encoding is framed as v2 attenuation kind 1 (`cap::storage::KIND`,
+`ATTENUATION_ENCODING_MAX` = 245); `OpSet::DEFINED` includes bits 8–12, but
+`CapRequest::is_meaningful` refuses every storage request, since no route reaches a kernel
+service — `Target::Service` stays kernel-granted only until FS-4 adds such a route form.
+
 ## 9. Delegates
 
 A delegate is a component with two extras: a **secrets store** and a **message policy**.

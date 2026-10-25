@@ -86,6 +86,8 @@
 #![deny(missing_docs)]
 
 pub mod proof;
+mod service;
+pub mod storage_proof;
 
 use crate::cap::deny::Action;
 use crate::cap::table::MAX_PENDING_REPLIES;

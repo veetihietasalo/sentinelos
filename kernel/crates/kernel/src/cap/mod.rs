@@ -19,24 +19,23 @@
 //! (`proofs::attenuation_order_is_sound_and_transitive`,
 //! `table::proofs::delegate_never_amplifies`).
 //!
-//! # Extension point (SentinelFS FS-1c)
+//! # Storage (SentinelFS FS-1c, shipped)
 //!
-//! Storage arrives as a purely additive change, written against the same
-//! predicate (spec §8 "extension point"):
-//!
-//! 1. a [`Target`] variant (`Target::Storage(..)`) and its [`Target::allowed_ops`]
-//!    arm, using new [`Op`] bits (`Read`, `Write`, `Snapshot`, `Rollback`,
-//!    `Format`) — existing bits never move;
-//! 2. an [`Attenuation`] variant carrying the storage lattice (tree, path
-//!    prefix by components, blob set, quota) with its arms of
-//!    [`Attenuation::is_attenuation_of`], [`Attenuation::admits`] and
-//!    [`Attenuation::fits`];
-//! 3. an [`Access`] variant (`Access::Storage { op, path, bytes }`).
-//!
-//! [`Attenuation::meet`] (used by `grant`), `delegate`, `revoke`, the tables
-//! and every Kani harness are written against `⊑`/`admits` only, so none of
-//! them changes; FS-1c extends the harnesses' symbolic generators
-//! (`any_capability`, `any_access`) with the new variants and re-runs them.
+//! Storage arrived as a purely additive change, written against the same
+//! predicate (spec §8 "extension point"): `Target::Service(ServiceId::Storage)`
+//! with its [`Target::allowed_ops`] arm and the storage [`Op`] bits 8–12
+//! (`Read`, `Write`, `Snapshot`, `Rollback`, `Format`; existing bits never
+//! moved); `Attenuation::Storage` carrying the lattice of [`storage`] (tree,
+//! path prefix by components, blob scope, quota) with its arms of
+//! [`Attenuation::is_attenuation_of`], [`Attenuation::admits`] and
+//! [`Attenuation::fits`]; and `Access::Storage`. [`Attenuation::meet`],
+//! `delegate`, `revoke` and the tables did not change in code. The harness
+//! generators did: `any_target` names the storage service, `any_attenuation`
+//! and `any_access` add one constant storage value (every cross-kind arm),
+//! and `table::proofs::delegate_never_amplifies` is split by the parent's
+//! kind (its storage half over symbolic storage children; unwind 4 → 7).
+//! The storage lattice's own laws are `storage::proofs`. Enforcement on the
+//! filesystem is FS-4.
 //!
 //! # Layout
 //!
@@ -52,6 +51,7 @@
 #![deny(missing_docs)]
 
 pub mod deny;
+pub mod storage;
 pub mod table;
 
 use crate::host::codec::MAX_PAYLOAD;
@@ -213,8 +213,9 @@ pub type Tick = u64;
 ///
 /// Each is one bit of an [`OpSet`]. Bit positions are stable — they appear in
 /// audit records — and new operations take new bits, so adding one never
-/// changes what an existing set means. Bits 8..=12 are reserved for storage
-/// (FS-1c: `Read`, `Write`, `Snapshot`, `Rollback`, `Format`).
+/// changes what an existing set means. Bits 8..=12 are storage (FS-1c,
+/// [`storage`]); only a `Target::Service(ServiceId::Storage)` capability
+/// carries them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
 pub enum Op {
@@ -226,6 +227,17 @@ pub enum Op {
     Reply = 1 << 2,
     /// Derive an attenuated (or equal) copy for another instance.
     Delegate = 1 << 3,
+    /// Storage: read files and blobs.
+    Read = 1 << 8,
+    /// Storage: write files and blobs. Implies neither `Snapshot` nor `Rollback`.
+    Write = 1 << 9,
+    /// Storage: take a snapshot of the live tree (volume-wide).
+    Snapshot = 1 << 10,
+    /// Storage: roll the live tree back to a snapshot (volume-wide; resurrects
+    /// what was revoked or removed since).
+    Rollback = 1 << 11,
+    /// Storage: format the volume — the strongest operation (volume-wide).
+    Format = 1 << 12,
 }
 
 impl Op {
@@ -241,6 +253,11 @@ impl Op {
             Op::Request => "request",
             Op::Reply => "reply",
             Op::Delegate => "delegate",
+            Op::Read => "read",
+            Op::Write => "write",
+            Op::Snapshot => "snapshot",
+            Op::Rollback => "rollback",
+            Op::Format => "format",
         }
     }
 }
@@ -255,9 +272,20 @@ impl OpSet {
     /// No operations.
     pub const EMPTY: OpSet = OpSet(0);
 
-    /// Every bit an [`Op`] names today. Bits outside it are undefined (FS-1c
-    /// will define 8..=12); a manifest that asks for one is refused.
-    pub const DEFINED: OpSet = OpSet::of(&[Op::Send, Op::Request, Op::Reply, Op::Delegate]);
+    /// Every bit an [`Op`] names today: the bus ops (bits 0..=3) and the
+    /// storage ops (bits 8..=12, FS-1c). Bits outside it are undefined; a
+    /// manifest that asks for one is refused.
+    pub const DEFINED: OpSet = OpSet::of(&[
+        Op::Send,
+        Op::Request,
+        Op::Reply,
+        Op::Delegate,
+        Op::Read,
+        Op::Write,
+        Op::Snapshot,
+        Op::Rollback,
+        Op::Format,
+    ]);
 
     /// The set holding exactly `ops`.
     pub const fn of(ops: &[Op]) -> OpSet {
@@ -314,6 +342,19 @@ pub enum Target {
         /// The requester's own correlation tag, restored on the answer.
         tag: ReplyTag,
     },
+    /// A kernel service (reserved for kernel services; component services are
+    /// reached through routes to instances). Its attenuation is the service's
+    /// own lattice. Granted only by the kernel (`bus::service`, `pub(crate)`);
+    /// no manifest request can name one until FS-4 adds a route form for
+    /// kernel services.
+    Service(ServiceId),
+}
+
+/// A service the kernel itself provides, designated by `Target::Service`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ServiceId {
+    /// SentinelFS storage (FS-1c lattice: [`storage`]; enforcement FS-4).
+    Storage,
 }
 
 impl Target {
@@ -323,6 +364,7 @@ impl Target {
         match self {
             Target::Instance(_) => OpSet::of(&[Op::Send, Op::Request, Op::Delegate]),
             Target::Reply { .. } => OpSet::of(&[Op::Reply]),
+            Target::Service(ServiceId::Storage) => storage::STORAGE_ALLOWED_OPS,
         }
     }
 
@@ -332,17 +374,27 @@ impl Target {
         match *self {
             Target::Instance(i) => i == inst,
             Target::Reply { to, .. } => to == inst,
+            Target::Service(_) => false,
         }
     }
 }
 
-/// Longest canonical attenuation encoding ([`Attenuation::id_encoding`]).
-pub const ATTENUATION_ENCODING_MAX: usize = 2;
+/// Longest canonical attenuation encoding ([`Attenuation::id_encoding`]):
+/// the storage body, 245 bytes (`storage::MAX_ENCODED_LEN`; `Message` needs
+/// 2). Under `cfg(kani)` the storage bounds shrink, and this with them.
+pub const ATTENUATION_ENCODING_MAX: usize = storage::MAX_ENCODED_LEN;
+
+// The frame carries the length as `le16`, and `Message` needs 2 bytes.
+const _: () = assert!(ATTENUATION_ENCODING_MAX <= u16::MAX as usize);
+const _: () = assert!(ATTENUATION_ENCODING_MAX >= 2);
 
 /// How a capability is narrowed beyond its target and ops.
 ///
 /// Each variant is one lattice; variants never compare (cross-kind `⊑` is
 /// `false`), so a new variant cannot weaken an existing one.
+// `Storage` is far larger than `Message` on purpose: a fixed-capacity value
+// (no heap, nothing sized by input), `Copy`, stored inline in the static slab.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Attenuation {
     /// Bus traffic carrying at most `max_len` payload bytes. Totally ordered:
@@ -352,6 +404,9 @@ pub enum Attenuation {
         /// Largest payload this capability carries, `<= MAX_PAYLOAD`.
         max_len: u16,
     },
+    /// The SentinelFS storage lattice (FS-1c, [`storage`]): tree, path prefix
+    /// by components, blob scope, quota.
+    Storage(storage::StorageAttenuation),
 }
 
 impl Attenuation {
@@ -365,6 +420,8 @@ impl Attenuation {
     pub fn is_attenuation_of(&self, parent: &Attenuation) -> bool {
         match (self, parent) {
             (Attenuation::Message { max_len: a }, Attenuation::Message { max_len: b }) => a <= b,
+            (Attenuation::Storage(a), Attenuation::Storage(b)) => a.is_attenuation_of(b),
+            _ => false,
         }
     }
 
@@ -374,6 +431,8 @@ impl Attenuation {
             (Attenuation::Message { max_len }, Access::Message { len, .. }) => {
                 *len <= usize::from(*max_len)
             }
+            (Attenuation::Storage(s), Access::Storage(a)) => s.admits(a),
+            _ => false,
         }
     }
 
@@ -384,32 +443,68 @@ impl Attenuation {
             (Attenuation::Message { max_len }, Target::Instance(_) | Target::Reply { .. }) => {
                 usize::from(*max_len) <= MAX_PAYLOAD
             }
+            // Canonical by construction (the lattice's types admit nothing else).
+            (Attenuation::Storage(_), Target::Service(ServiceId::Storage)) => true,
+            _ => false,
         }
     }
 
     /// The canonical encoding the v2 component id frames for a request's
-    /// attenuation (spec §6, A12): `(kind, bytes)`, `bytes` of length
-    /// `len`. Kind 0 is `Message`, `le16(max_len)`. Every variant has exactly
-    /// one encoding and no two values share one, so the frame stays
-    /// injective; FS-1c's storage attenuation is kind 1 with its own
-    /// canonical bytes (and grows [`ATTENUATION_ENCODING_MAX`]) — additive.
-    pub const fn id_encoding(&self) -> (u8, [u8; ATTENUATION_ENCODING_MAX], usize) {
+    /// attenuation (spec §6, A12): writes the body to the start of `out` and
+    /// returns `(kind, len)`. Kind 0 is `Message`, `le16(max_len)`; kind 1
+    /// ([`storage::KIND`]) is `StorageAttenuation::encode`'s canonical body
+    /// (at most [`ATTENUATION_ENCODING_MAX`] bytes). Every variant has exactly
+    /// one encoding and no two values of one kind share one (storage: Kani,
+    /// `storage::proofs::storage_wire_*` — each field decoder reads back
+    /// exactly its encoder's bytes, so `decode ∘ encode = id` and encode is
+    /// injective), and the kind byte separates the kinds, so the frame stays
+    /// injective.
+    pub fn id_encoding(&self, out: &mut [u8; ATTENUATION_ENCODING_MAX]) -> (u8, usize) {
         match self {
-            Attenuation::Message { max_len } => (0, max_len.to_le_bytes(), 2),
+            Attenuation::Message { max_len } => {
+                // Byte by byte: a `memcpy` hides constants from the request
+                // framing harness (`host::proofs`).
+                let b = max_len.to_le_bytes();
+                out[0] = b[0];
+                out[1] = b[1];
+                (0, 2)
+            }
+            Attenuation::Storage(s) => {
+                // `out` is `MAX_ENCODED_LEN` long and every value encodes in
+                // at most that, so this never fails. If it ever did, every
+                // failing value would frame as the same bytes (kind 1, length
+                // 0) and their ids would collide — which is why the max-shape
+                // test (`cap::storage::tests::the_longest_value_*`) pins that
+                // the longest value fits exactly.
+                let len = s.encode(out).unwrap_or(0);
+                (storage::KIND, len)
+            }
         }
     }
 
-    /// The greatest lower bound by `⊑` where the two are comparable, else
-    /// `None` (no grant). Written against [`Self::is_attenuation_of`] only, so
-    /// a new variant needs no meet of its own: incomparable values simply do
-    /// not grant. For `Message` (a total order) this is the exact meet.
+    /// The greatest lower bound by `⊑`, or `None` (no grant) when there is
+    /// none. `Message` (a total order): the smaller limit. `Storage`:
+    /// `storage::StorageAttenuation::meet` — same tree, the deeper of two
+    /// comparable prefixes, the blob scopes' meet, the field-wise minimum
+    /// quota; `None` for different trees or incomparable prefixes (Kani
+    /// `storage::proofs::storage_meet_is_the_greatest_lower_bound`).
+    /// Cross-kind: `None`. A future variant without a meet of its own falls
+    /// back to "the smaller of the two when comparable, else `None`" — never
+    /// above either argument.
     pub fn meet(&self, other: &Attenuation) -> Option<Attenuation> {
-        if self.is_attenuation_of(other) {
-            Some(*self)
-        } else if other.is_attenuation_of(self) {
-            Some(*other)
-        } else {
-            None
+        match (self, other) {
+            (Attenuation::Storage(a), Attenuation::Storage(b)) => {
+                a.meet(b).map(Attenuation::Storage)
+            }
+            _ => {
+                if self.is_attenuation_of(other) {
+                    Some(*self)
+                } else if other.is_attenuation_of(self) {
+                    Some(*other)
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -424,6 +519,8 @@ pub enum Access {
         /// Payload bytes it carries.
         len: usize,
     },
+    /// A storage operation (FS-1c; presented by FS-4's storage service).
+    Storage(storage::StorageAccess),
 }
 
 impl Access {
@@ -431,6 +528,7 @@ impl Access {
     pub const fn op(&self) -> Op {
         match self {
             Access::Message { op, .. } => *op,
+            Access::Storage(a) => a.op,
         }
     }
 }
@@ -696,13 +794,25 @@ pub struct CapRequest {
 impl CapRequest {
     /// Whether this request means something, so the declaration an id binds
     /// is never vacuous: at least one operation, only operations an [`Op`]
-    /// names today (undefined bits — FS-1c's reserved 8..=12 included — are
-    /// refused, not ignored), and an attenuation that fits an instance target
-    /// (`Message.max_len <= MAX_PAYLOAD`). `Manifest::verify` refuses a
-    /// manifest with any request for which this is false.
+    /// names (undefined bits are refused, not ignored), storage operations
+    /// (bits 8..=12) only together with a storage attenuation, and an
+    /// attenuation that fits the only kind of target a request can name — a
+    /// component's instance (`Message.max_len <= MAX_PAYLOAD`).
+    ///
+    /// So a storage request (storage ops or a storage attenuation) is refused
+    /// today: a storage attenuation fits only `Target::Service(Storage)`,
+    /// which no route reaches. Storage authority is granted by the kernel
+    /// alone (`bus::service`, `pub(crate)`) and **must not become reachable
+    /// from a component manifest before FS-4 adds a route form for kernel
+    /// services**; when it does, this check accepts a storage request exactly
+    /// on that target. `Manifest::verify` refuses a manifest with any request
+    /// for which this is false.
     pub fn is_meaningful(&self) -> bool {
+        let storage_ops = !self.ops.intersect(storage::STORAGE_OPS).is_empty();
+        let storage_att = matches!(self.attenuation, Attenuation::Storage(_));
         !self.ops.is_empty()
             && self.ops.is_subset_of(OpSet::DEFINED)
+            && (!storage_ops || storage_att)
             && self.attenuation.fits(&Target::Instance(InstanceId::KERNEL))
     }
 }
@@ -1072,22 +1182,29 @@ mod tests {
 pub(crate) mod proofs {
     use super::*;
 
-    /// A symbolic target of every kind. FS-1c adds its variant here.
+    /// A symbolic target of every kind, the storage service included.
     pub(crate) fn any_target() -> Target {
-        if kani::any() {
-            Target::Instance(InstanceId(kani::any()))
-        } else {
-            Target::Reply {
+        match kani::any::<u8>() % 3 {
+            0 => Target::Instance(InstanceId(kani::any())),
+            1 => Target::Reply {
                 to: InstanceId(kani::any()),
                 tag: ReplyTag(kani::any()),
-            }
+            },
+            _ => Target::Service(ServiceId::Storage),
         }
     }
 
-    /// A symbolic attenuation of every kind. FS-1c adds its variant here.
+    /// A symbolic attenuation of every kind: any `Message`, or one constant
+    /// storage value (`storage::proofs::constant_storage_attenuation`) — just
+    /// enough to reach every cross-kind arm. The storage lattice itself is
+    /// proven over every canonical value in `storage::proofs`.
     pub(crate) fn any_attenuation() -> Attenuation {
-        Attenuation::Message {
-            max_len: kani::any(),
+        if kani::any() {
+            Attenuation::Message {
+                max_len: kani::any(),
+            }
+        } else {
+            Attenuation::Storage(storage::proofs::constant_storage_attenuation())
         }
     }
 
@@ -1101,8 +1218,46 @@ pub(crate) mod proofs {
         }
     }
 
-    /// A symbolic access of every kind. FS-1c adds its variant here.
+    /// A symbolic capability whose target and attenuation are of one kind —
+    /// bus (`Instance` or `Reply`, `Message`) or storage (`Service(Storage)`,
+    /// `Storage`) — with any ops and expiry: every parent `grant` can
+    /// install is one of these.
+    pub(crate) fn any_capability_of_kind(storage: bool) -> Capability {
+        let (target, attenuation) = if storage {
+            (
+                Target::Service(ServiceId::Storage),
+                Attenuation::Storage(storage::proofs::some_storage_attenuation()),
+            )
+        } else {
+            let target = if kani::any() {
+                Target::Instance(InstanceId(kani::any()))
+            } else {
+                Target::Reply {
+                    to: InstanceId(kani::any()),
+                    tag: ReplyTag(kani::any()),
+                }
+            };
+            (
+                target,
+                Attenuation::Message {
+                    max_len: kani::any(),
+                },
+            )
+        };
+        Capability {
+            target,
+            ops: OpSet::from_bits(kani::any()),
+            attenuation,
+            expires: if kani::any() { Some(kani::any()) } else { None },
+        }
+    }
+
+    /// A symbolic access of every kind: any `Message` access, or one
+    /// constant storage access (`storage::proofs::constant_storage_access`).
     pub(crate) fn any_access() -> Access {
+        if kani::any() {
+            return Access::Storage(storage::proofs::constant_storage_access());
+        }
         let op = match kani::any::<u8>() % 4 {
             0 => Op::Send,
             1 => Op::Request,
@@ -1121,8 +1276,11 @@ pub(crate) mod proofs {
     /// delegations never amplifies either. The meet `grant` uses lies below
     /// both of its arguments. A well-formed capability on a reply target is
     /// exactly `{Reply}` — never delegable, never a send right — and the
-    /// tables hold only well-formed capabilities (`table::proofs`). All over
-    /// fully symbolic capabilities, accesses and ticks; no loops.
+    /// tables hold only well-formed capabilities (`table::proofs`). Over
+    /// symbolic capabilities, accesses and ticks — every bus value, and one
+    /// constant storage attenuation and access, which reach every cross-kind
+    /// arm (storage soundness is `storage::proofs::storage_delegate_never_amplifies`,
+    /// over every canonical storage value).
     #[kani::proof]
     fn attenuation_order_is_sound_and_transitive() {
         let a = any_capability();
