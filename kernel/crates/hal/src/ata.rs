@@ -29,7 +29,23 @@
 //! - [`read_sectors`] — read `count` contiguous 512-byte sectors starting at
 //!   `lba` into a caller buffer.
 //! - [`write_sectors`] — write `count` contiguous 512-byte sectors starting at
-//!   `lba` from a caller buffer (followed by a cache FLUSH so data hits media).
+//!   `lba` from a caller buffer. **Unflushed** (SentinelFS FS-1b): it returns
+//!   once the drive has accepted every sector and dropped BSY, which with a
+//!   write cache means "in the drive's cache", not "on the media".
+//! - [`flush`] — `FLUSH CACHE`: make every earlier write durable. Waits for
+//!   BSY to clear *before* issuing the command (the pre-FS-1b code issued it
+//!   straight after the data phase, while the drive could still be busy) and
+//!   again for its completion, then checks ERR/DF.
+//!
+//! # Durability contract
+//!
+//! Between two successful [`flush`] calls the drive may persist any subset of
+//! the sectors written, in any order; a single 512-byte sector write is
+//! atomic; [`flush`] returning `Ok` means every earlier write is durable. That
+//! is the model SentinelFS's commit protocol is designed against (spec §8:
+//! dirty blocks → flush → superblock → flush). A caller that needs a write to
+//! survive power loss calls [`flush`] after it (the toy `kernel::fs` does,
+//! once per save).
 //!
 //! # Concurrency model
 //!
@@ -38,11 +54,12 @@
 //! module does not serialise its callers; the kernel does. Since SentinelFS
 //! FS-1a two kernel paths drive the disk (`kernel::fs` and the `sfs-commit`
 //! task), and every call goes through `kernel::blk::ata`, which holds a
-//! kernel-side channel lock (`CHANNEL`) for exactly one command; no other
+//! kernel-side channel lock (`CHANNEL`) for exactly one command — `identify`,
+//! `read_sectors`, `write_sectors` and `flush` are one command each; no other
 //! kernel file may name this module (`cargo xtask check-ata-callers`, run in
 //! CI). That lock protects disk integrity, not memory safety: the port
 //! accesses below are sound however callers interleave — an interleaved
-//! command can corrupt a transfer, never memory (hal-tcb §7).
+//! command can corrupt a transfer, never memory (hal-tcb §4 invariant 16, §7).
 
 use core::arch::asm;
 
@@ -102,10 +119,49 @@ const CMD_FLUSH: u8 = 0xE7;
 /// holds LBA bits 24..27. The master is drive 0 (bit 4 clear).
 const DRIVE_LBA_MASTER: u8 = 0xE0;
 
-/// A bounded poll budget so a wedged/absent controller can never hang the kernel.
-/// At PIO timescales 100 000 status reads is comfortably more than one command
-/// ever needs, yet completes near-instantly under emulation.
-const POLL_LIMIT: u32 = 100_000;
+/// Device Control register (`0x3F6`, written; the same port reads as
+/// Alternate Status).
+const REG_DEVICE_CONTROL: u16 = 0x3F6;
+/// Device Control: software reset (SRST, bit 2).
+const CTRL_SRST: u8 = 1 << 2;
+/// Device Control: device interrupts disabled (nIEN, bit 1). This driver
+/// polls; after a reset it states "no device interrupts" explicitly rather
+/// than inherit whatever the firmware left.
+const CTRL_NIEN: u8 = 1 << 1;
+/// TSC cycles SRST is held: ≥ 5 µs at any TSC ≤ 5 GHz.
+const SRST_HOLD: u64 = 25_000;
+/// TSC cycles to wait after clearing SRST before polling BSY: ≥ 2 ms at any
+/// TSC ≤ 5 GHz (the drive may not even assert BSY sooner).
+const SRST_SETTLE: u64 = 10_000_000;
+
+/// Status waits are bounded by **time**, not by a count of status reads (a
+/// count is no deadline: QEMU completes IDE PIO and `FLUSH CACHE`
+/// asynchronously through host `pwrite`/`fdatasync`, and under host write
+/// pressure 100 000 reads under TCG proved too short — CI's FS-1c runs).
+/// Deadlines are in TSC cycles, uncalibrated, so the budgets are generous for
+/// any plausible TSC rate (0.5–5 GHz): a sector or a command start ≥ 0.8 s,
+/// a `FLUSH CACHE` ≥ 8 s. A real disk that never answers still fails.
+const SECTOR_BUDGET: u64 = 4_000_000_000;
+/// See [`SECTOR_BUDGET`].
+const FLUSH_BUDGET: u64 = 40_000_000_000;
+/// The wait for BSY to clear after a software reset: ATA allows a drive up to
+/// 31 s, so this is ≥ 31 s at any TSC ≤ 5 GHz. Only a drive that already
+/// timed out ever waits here.
+const RESET_BUDGET: u64 = 160_000_000_000;
+// ≥ 0.8 s per sector and ≥ 8 s per flush or reset even at 5 GHz, and the
+// backstop far above the old 100 000-read limit.
+const _: () = {
+    assert!(SECTOR_BUDGET >= 5_000_000_000 * 8 / 10);
+    assert!(FLUSH_BUDGET >= 5_000_000_000 * 8);
+    assert!(RESET_BUDGET >= 5_000_000_000 * 31);
+    assert!(SRST_HOLD >= 5_000 * 5); // 5 µs at 5 GHz
+    assert!(SRST_SETTLE >= 5_000_000 * 2); // 2 ms at 5 GHz
+    assert!(POLL_BACKSTOP > 100_000 * 1000);
+};
+
+/// A backstop on status reads in case the TSC does not advance (it always
+/// does on x86-64; this keeps the loop bounded regardless).
+const POLL_BACKSTOP: u64 = 500_000_000;
 
 /// Why an ATA operation failed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -169,14 +225,18 @@ unsafe fn inb(port: u16) -> u8 {
 ///
 /// The caller must ensure `port` names a register that is safe to write with
 /// `value`. All call sites write only primary-channel ATA command-block
-/// registers (`0x1F2..=0x1F7`) with documented command/parameter bytes.
+/// registers (`0x1F2..=0x1F7`) with documented command/parameter bytes, or
+/// the control-block Device Control register (`0x3F6`) with `SRST | nIEN`
+/// or `nIEN` (the timeout recovery, [`reset_channel`]).
 #[inline]
 unsafe fn outb(port: u16, value: u8) {
     // SAFETY: `out dx, al` writes the byte in `al` to the I/O port in `dx`. The
     // contract that `port`/`value` are a valid, write-safe ATA register pair is
     // delegated to this function's `# Safety` section and upheld by every caller
-    // (only ATA command-block registers with defined LBA/seccount/command bytes).
-    // Device-only effect, `nomem`/`nostack`.
+    // (ATA command-block registers `0x1F2..=0x1F7` with defined LBA/seccount/
+    // command bytes, and the Device Control register `0x3F6` with
+    // `SRST | nIEN` or `nIEN` from `reset_channel`). Device-only effect,
+    // `nomem`/`nostack`.
     unsafe {
         asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack));
     }
@@ -248,36 +308,136 @@ fn delay_400ns() {
     }
 }
 
-/// Spin (bounded) until BSY clears, returning the final status byte.
-fn wait_not_busy() -> Result<u8, AtaError> {
-    for _ in 0..POLL_LIMIT {
-        let s = status();
-        if s & STATUS_BSY == 0 {
-            return Ok(s);
+/// What one status read means to a wait.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Poll {
+    /// The condition holds: stop, `Ok(status)`.
+    Ready,
+    /// Not yet: read again.
+    Wait,
+    /// The drive reported an error: stop, `DeviceError`.
+    Fail,
+}
+
+/// The wait loop, pure (no ports, no clock of its own) so the host tests and
+/// Kani can drive it: read the status, classify it, and stop when it is
+/// ready or failed, when `now()` has moved more than `budget` past its first
+/// reading, or after `backstop` reads. A clock that steps backwards counts as
+/// no time elapsed (the backstop still bounds the loop).
+fn poll_until(
+    mut read: impl FnMut() -> u8,
+    mut now: impl FnMut() -> u64,
+    budget: u64,
+    backstop: u64,
+    classify: impl Fn(u8) -> Poll,
+) -> Result<u8, AtaError> {
+    let start = now();
+    let mut polls = 0u64;
+    loop {
+        let s = read();
+        match classify(s) {
+            Poll::Ready => return Ok(s),
+            Poll::Fail => return Err(AtaError::DeviceError),
+            Poll::Wait => {}
         }
+        polls += 1;
+        if polls >= backstop || now().saturating_sub(start) > budget {
+            return Err(AtaError::Timeout);
+        }
+        // A pause hint only; Kani cannot model the `pause` intrinsic.
+        #[cfg(not(kani))]
         core::hint::spin_loop();
     }
-    Err(AtaError::Timeout)
+}
+
+/// BSY clear: ready.
+fn not_busy(s: u8) -> Poll {
+    if s & STATUS_BSY == 0 {
+        Poll::Ready
+    } else {
+        Poll::Wait
+    }
+}
+
+/// BSY clear and DRQ set: ready; BSY clear with ERR/DF: failed.
+fn drq_ready(s: u8) -> Poll {
+    if s & STATUS_BSY != 0 {
+        Poll::Wait
+    } else if s & (STATUS_ERR | STATUS_DF) != 0 {
+        Poll::Fail
+    } else if s & STATUS_DRQ != 0 {
+        Poll::Ready
+    } else {
+        Poll::Wait
+    }
+}
+
+/// Wait (deadline `budget` TSC cycles) for BSY to clear; returns the status.
+fn wait_not_busy_for(budget: u64) -> Result<u8, AtaError> {
+    poll_until(status, crate::cpu::rdtsc, budget, POLL_BACKSTOP, not_busy)
+}
+
+/// Spin (deadline-bounded) until BSY clears, returning the final status byte.
+fn wait_not_busy() -> Result<u8, AtaError> {
+    wait_not_busy_for(SECTOR_BUDGET)
 }
 
 /// Spin (bounded) until BSY clears and DRQ sets (the drive wants a data word), or
 /// surface ERR/DF as a [`AtaError::DeviceError`].
 fn wait_for_drq() -> Result<(), AtaError> {
-    for _ in 0..POLL_LIMIT {
-        let s = status();
-        if s & STATUS_BSY != 0 {
-            core::hint::spin_loop();
-            continue;
+    poll_until(
+        status,
+        crate::cpu::rdtsc,
+        SECTOR_BUDGET,
+        POLL_BACKSTOP,
+        drq_ready,
+    )
+    .map(|_| ())
+}
+
+/// Recover the channel after a timeout: a command that timed out may still be
+/// running, or stopped mid-transfer with DRQ pending, and the next command
+/// must not start against that. Software reset (SRST) aborts whatever the
+/// drive is doing and returns it to the post-reset state: write
+/// `SRST | nIEN`, hold ≥ 5 µs ([`SRST_HOLD`]), write `nIEN` (SRST clear,
+/// device interrupts off — this driver polls), wait ≥ 2 ms
+/// ([`SRST_SETTLE`]), then wait for BSY to clear (bounded by
+/// [`RESET_BUDGET`], the 31 s ATA allows). The next command selects the drive
+/// and programs every register again, as each one already does.
+fn reset_channel() {
+    // SAFETY: writes the primary channel's Device Control register (`0x3F6`)
+    // with `SRST | nIEN` — a documented control-block register and value. A
+    // reset only affects the drive (it aborts the command in progress, and
+    // nIEN only gates the drive's interrupt line, which this driver never
+    // uses); it cannot alias or corrupt Rust memory. `outb`'s contract holds.
+    unsafe { outb(REG_DEVICE_CONTROL, CTRL_SRST | CTRL_NIEN) };
+    spin_cycles(SRST_HOLD);
+    // SAFETY: as above, with SRST clear and nIEN set.
+    unsafe { outb(REG_DEVICE_CONTROL, CTRL_NIEN) };
+    spin_cycles(SRST_SETTLE);
+    let _ = wait_not_busy_for(RESET_BUDGET);
+}
+
+/// Busy-wait at least `cycles` TSC cycles (bounded by the read backstop if
+/// the TSC does not advance).
+fn spin_cycles(cycles: u64) {
+    let start = crate::cpu::rdtsc();
+    for _ in 0..POLL_BACKSTOP {
+        if crate::cpu::rdtsc().saturating_sub(start) >= cycles {
+            return;
         }
-        if s & (STATUS_ERR | STATUS_DF) != 0 {
-            return Err(AtaError::DeviceError);
-        }
-        if s & STATUS_DRQ != 0 {
-            return Ok(());
-        }
+        #[cfg(not(kani))]
         core::hint::spin_loop();
     }
-    Err(AtaError::Timeout)
+}
+
+/// After a timeout, reset the channel before handing the error back (see
+/// [`reset_channel`]); every other outcome passes through.
+fn recover<T>(r: Result<T, AtaError>) -> Result<T, AtaError> {
+    if r.as_ref().is_err_and(|e| *e == AtaError::Timeout) {
+        reset_channel();
+    }
+    r
 }
 
 /// Select the primary master and program the LBA28 address + sector count for the
@@ -306,6 +466,14 @@ fn select_lba(lba: u32, count: u8) -> Result<(), AtaError> {
 }
 
 /// Issue an ATA command byte to the command register (`0x1F7`).
+///
+/// A command written while the drive is busy is ignored, so callers make sure
+/// BSY is clear first: `read_sectors` / `write_sectors` poll `wait_not_busy`
+/// after `select_lba`, and `flush` after its select (the FS-1b fix).
+/// `identify` (unchanged) does not poll first: it runs once per opener, and
+/// under the kernel's channel lock the previous command has always finished
+/// — `write_sectors` and `flush` now return only after BSY clears, and a read
+/// ends with its last data word.
 fn issue_command(cmd: u8) {
     // SAFETY: writes the command register on the primary channel with a defined
     // ATA opcode (`IDENTIFY`/`READ`/`WRITE`/`FLUSH`). Issuing a command only
@@ -327,7 +495,17 @@ fn issue_command(cmd: u8) {
 /// `0xFF`, the classic "floating bus" of an absent drive, or IDENTIFY never
 /// asserts DRQ), so the kernel can boot without a disk attached. Returns
 /// [`AtaError::DeviceError`]/[`AtaError::Timeout`] on a misbehaving controller.
+///
+/// An absent disk answers at once (`NoDevice`); a present one that never
+/// answers now blocks its caller for up to [`SECTOR_BUDGET`] then the reset's
+/// [`SRST_SETTLE`] + [`RESET_BUDGET`] — seconds to tens of seconds, by design
+/// (deadlines, not read counts). The kernel calls it from the `sfs-commit`
+/// task and the toy `kernel::fs` probe, never from an interrupt path.
 pub fn identify() -> Result<DiskInfo, AtaError> {
+    recover(identify_inner())
+}
+
+fn identify_inner() -> Result<DiskInfo, AtaError> {
     // Select the primary master (no LBA programming needed for IDENTIFY itself,
     // but the drive must be selected and the LBA/seccount registers zeroed).
     // SAFETY: writes the drive-select register and zeroes the seccount/LBA
@@ -394,6 +572,10 @@ pub fn identify() -> Result<DiskInfo, AtaError> {
 /// - [`AtaError::OutOfRange`] if the LBA range exceeds LBA28 or `count > 256`.
 /// - [`AtaError::DeviceError`]/[`AtaError::Timeout`] on a drive error/stall.
 pub fn read_sectors(lba: u32, count: u16, buf: &mut [u8]) -> Result<(), AtaError> {
+    recover(read_sectors_inner(lba, count, buf))
+}
+
+fn read_sectors_inner(lba: u32, count: u16, buf: &mut [u8]) -> Result<(), AtaError> {
     let count = validate(lba, count, buf.len())?;
 
     select_lba(lba, count as u8)?;
@@ -420,13 +602,22 @@ pub fn read_sectors(lba: u32, count: u16, buf: &mut [u8]) -> Result<(), AtaError
 ///
 /// `buf.len()` must equal `count * 512`. The transfer is one PIO `WRITE SECTORS`
 /// command followed by `count * 256` word writes of the data register (BSY/DRQ
-/// polled before each sector), then a `FLUSH CACHE` so the data reaches media.
+/// polled before each sector); it returns once the drive has dropped BSY after
+/// the last sector without reporting ERR/DF.
+///
+/// **Not durable on its own** (FS-1b API split, hal-tcb row A2): the data may
+/// sit in the drive's write cache until the next [`flush`]. Before FS-1b this
+/// function ended every command with `FLUSH CACHE`.
 ///
 /// # Errors
 ///
 /// Same as [`read_sectors`]: [`AtaError::BadBuffer`], [`AtaError::OutOfRange`],
 /// or [`AtaError::DeviceError`]/[`AtaError::Timeout`].
 pub fn write_sectors(lba: u32, count: u16, buf: &[u8]) -> Result<(), AtaError> {
+    recover(write_sectors_inner(lba, count, buf))
+}
+
+fn write_sectors_inner(lba: u32, count: u16, buf: &[u8]) -> Result<(), AtaError> {
     let count = validate(lba, count, buf.len())?;
 
     select_lba(lba, count as u8)?;
@@ -446,10 +637,44 @@ pub fn write_sectors(lba: u32, count: u16, buf: &[u8]) -> Result<(), AtaError> {
         }
     }
 
-    // FLUSH CACHE so write-cached sectors are committed to the backing media —
-    // without this, data can be lost on power-off (the persistence guarantee).
-    issue_command(CMD_FLUSH);
+    // The command completes when the drive drops BSY after the last sector;
+    // ERR/DF then report a failed write. Waiting here also means the next
+    // command on the channel (often `flush`) never starts against a busy drive.
     let s = wait_not_busy()?;
+    if s & (STATUS_ERR | STATUS_DF) != 0 {
+        return Err(AtaError::DeviceError);
+    }
+    Ok(())
+}
+
+/// `FLUSH CACHE`: make every sector written before this call durable.
+///
+/// Selects the primary master, waits for BSY to clear (a command written while
+/// the drive is busy is ignored — the A2 weakness of the pre-FS-1b code, which
+/// issued `FLUSH CACHE` straight after a write's data phase), issues
+/// `FLUSH CACHE`, and waits (bounded) for it to complete. A drive without a
+/// write cache completes it at once.
+///
+/// # Errors
+///
+/// [`AtaError::Timeout`] if the drive stays busy past its deadline (before
+/// or after the command), [`AtaError::DeviceError`] if it reports ERR/DF. On
+/// either error nothing is known about the durability of the writes since the
+/// last successful flush.
+pub fn flush() -> Result<(), AtaError> {
+    recover(flush_inner())
+}
+
+fn flush_inner() -> Result<(), AtaError> {
+    // SAFETY: writes the primary channel's drive/head register (`0x1F6`) with
+    // the defined "LBA mode, master" select byte — a documented command-block
+    // register and value. Selecting the drive only routes the next command; it
+    // cannot alias or corrupt Rust-managed memory. `outb`'s contract holds.
+    unsafe { outb(REG_DRIVE, DRIVE_LBA_MASTER) };
+    delay_400ns();
+    wait_not_busy()?;
+    issue_command(CMD_FLUSH);
+    let s = wait_not_busy_for(FLUSH_BUDGET)?;
     if s & (STATUS_ERR | STATUS_DF) != 0 {
         return Err(AtaError::DeviceError);
     }
@@ -527,6 +752,101 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+
+    /// A clock that advances `step` per reading.
+    fn clock(step: u64) -> impl FnMut() -> u64 {
+        let mut t = 0u64;
+        move || {
+            t += step;
+            t
+        }
+    }
+
+    #[test]
+    fn a_wait_ends_at_its_deadline_not_at_a_read_count() {
+        // A drive busy forever: a 100-cycle budget at 10 cycles per read ends
+        // after ~10 reads, far below the backstop.
+        let mut reads = 0u64;
+        let r = poll_until(
+            || {
+                reads += 1;
+                STATUS_BSY
+            },
+            clock(10),
+            100,
+            1_000_000,
+            not_busy,
+        );
+        assert_eq!(r, Err(AtaError::Timeout));
+        assert!((9..=12).contains(&reads), "{reads}");
+        // A slow but answering drive: busy for 150 000 reads (more than the
+        // old fixed 100 000-read limit) is fine within the deadline.
+        let mut n = 0u64;
+        let r = poll_until(
+            || {
+                n += 1;
+                if n > 150_000 {
+                    STATUS_DRDY
+                } else {
+                    STATUS_BSY
+                }
+            },
+            clock(1),
+            SECTOR_BUDGET,
+            POLL_BACKSTOP,
+            not_busy,
+        );
+        assert_eq!(r, Ok(STATUS_DRDY));
+    }
+
+    #[test]
+    fn drq_waits_report_errors_and_readiness() {
+        let mut seq = [STATUS_BSY, STATUS_DRDY, STATUS_DRDY | STATUS_DRQ].into_iter();
+        assert_eq!(
+            poll_until(|| seq.next().unwrap_or(0), clock(1), 100, 100, drq_ready),
+            Ok(STATUS_DRDY | STATUS_DRQ)
+        );
+        let mut seq = [STATUS_BSY, STATUS_ERR].into_iter();
+        assert_eq!(
+            poll_until(|| seq.next().unwrap_or(0), clock(1), 100, 100, drq_ready),
+            Err(AtaError::DeviceError)
+        );
+        // BSY masks ERR/DRQ (their bits are not valid while busy).
+        assert_eq!(drq_ready(STATUS_BSY | STATUS_ERR | STATUS_DRQ), Poll::Wait);
+    }
+
+    #[test]
+    fn a_stuck_or_backwards_clock_is_bounded_by_the_backstop() {
+        let mut reads = 0u64;
+        let r = poll_until(
+            || {
+                reads += 1;
+                STATUS_BSY
+            },
+            || 7,
+            0,
+            50,
+            not_busy,
+        );
+        assert_eq!((r, reads), (Err(AtaError::Timeout), 50));
+        let mut t = 1_000u64;
+        let r = poll_until(
+            || STATUS_BSY,
+            || {
+                t -= 1;
+                t
+            },
+            10,
+            20,
+            not_busy,
+        );
+        assert_eq!(r, Err(AtaError::Timeout), "backwards time is no time");
+    }
+}
+
 /// Kani proof harness — exhaustive proof of the disk-I/O safety gate.
 ///
 /// Compiled only under `cargo kani`; the normal stable build excludes it. Run
@@ -534,6 +854,50 @@ mod tests {
 #[cfg(kani)]
 mod proofs {
     use super::*;
+
+    /// The wait loop over any status sequence and any clock (three reads at
+    /// most): `Ok(s)` only for a status classified ready, `DeviceError` only
+    /// for one classified failed, and `Timeout` only once the clock moved
+    /// past the budget or the backstop was reached — so a timeout is always
+    /// a deadline, and a ready drive is never reported as one.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn poll_until_is_a_deadline() {
+        let statuses: [u8; 3] = kani::any();
+        let times: [u64; 4] = kani::any();
+        let budget: u64 = kani::any();
+        let (mut ri, mut ti) = (0usize, 0usize);
+        let mut last_status = 0u8;
+        let mut last_time = 0u64;
+        let start = times[0];
+        let r = poll_until(
+            || {
+                let s = statuses[ri.min(2)];
+                ri += 1;
+                last_status = s;
+                s
+            },
+            || {
+                let t = times[ti.min(3)];
+                ti += 1;
+                last_time = t;
+                t
+            },
+            budget,
+            3,
+            drq_ready,
+        );
+        match r {
+            Ok(s) => assert!(drq_ready(s) == Poll::Ready),
+            Err(AtaError::DeviceError) => assert!(drq_ready(last_status) == Poll::Fail),
+            Err(AtaError::Timeout) => {
+                assert!(drq_ready(last_status) == Poll::Wait);
+                assert!(ri >= 3 || last_time.saturating_sub(start) > budget);
+            }
+            Err(_) => panic!("poll_until reports only ready, failed or timeout"),
+        }
+        assert!(ri <= 3);
+    }
 
     /// `validate` is the gate every PIO transfer passes through, so its acceptance
     /// set *is* the safety contract of `read_sectors`/`write_sectors`. Prove that

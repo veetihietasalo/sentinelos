@@ -1,5 +1,5 @@
 //! `AtaDevice` — [`BlockDevice`] over `hal::ata`'s existing safe PIO API
-//! (spec §6; **zero `hal` delta**).
+//! (spec §6).
 //!
 //! One 4 KiB block is 8 ATA sectors. A device is a **window** of the disk,
 //! `[base_lba, base_lba + 8 · blocks)`: until FS-2 deletes the old serialiser,
@@ -7,27 +7,27 @@
 //! ≤ 64 KiB of payload), so SentinelFS lives past it — block 0 of the window
 //! is sector [`SFS_BASE_LBA`] of the disk (spec §11, "coexistence").
 //!
-//! # What `flush` means on ATA today (FS-1a)
+//! # Durability (FS-1b)
 //!
-//! `hal::ata::write_sectors` ends **every** command with `FLUSH CACHE` and
-//! waits for it (hal-tcb row A2), and `hal` has no separate flush entry point.
-//! So every [`write_blocks`](BlockDevice::write_blocks) here is already as
-//! durable as `hal` can make it when it returns `Ok`, and
-//! [`flush`](BlockDevice::flush) has nothing left to do: it returns `Ok(())`
-//! without touching the device. The §8 protocol still issues it at the right
-//! points, so nothing changes above this file when FS-1b splits `hal::ata` into
-//! an unflushed `write_sectors` plus a public `flush()` — at which point this
-//! becomes the real barrier. One known weakness carries over unchanged and is
-//! FS-1b's to fix (amendment A2): `hal` issues `FLUSH CACHE` without first
-//! waiting for the data phase's BSY to clear.
+//! Since FS-1b split `hal::ata`'s API (hal-tcb row A2), [`write_sectors`] is
+//! **unflushed** — it returns once the drive has the data, possibly only in
+//! its write cache — and [`flush`] issues `FLUSH CACHE` (after waiting for
+//! the drive to go idle, the A2 fix). So
+//! [`write_blocks`](BlockDevice::write_blocks) here is exactly the §8 model's
+//! unflushed write and [`flush`](BlockDevice::flush) is the real barrier the
+//! commit protocol issues twice per commit. (Under FS-1a every write was
+//! flushed by `hal` and `flush` was a no-op.) The toy `kernel::fs` calls
+//! [`flush`] once at the end of each save.
 //!
 //! # Serialising the channel
 //!
 //! `hal::ata` requires that no two command sequences interleave on the primary
 //! channel. There are now two callers — the `sfs-commit` task and `kernel::fs`
 //! — so this file is the kernel's **only** door to `hal::ata`: [`identify`],
-//! [`read_sectors`] and [`write_sectors`] each hold a kernel-side channel lock
-//! (`CHANNEL`) for exactly one command, and [`AtaDevice`] is built on them.
+//! [`read_sectors`], [`write_sectors`] and [`flush`] each hold a kernel-side
+//! channel lock (`CHANNEL`) for exactly one command, and [`AtaDevice`] is
+//! built on them. `CHANNEL` is the command-serialising lock hal-tcb §4
+//! invariant 16 names.
 //! `cargo xtask check-ata-callers` (run in CI) fails the build if any other
 //! kernel file names `hal::ata`. A holder preempted mid-command is waited for
 //! by **yielding**, never by spinning: on the BSP, where both callers run, the
@@ -87,13 +87,23 @@ pub fn read_sectors(lba: u32, count: u16, buf: &mut [u8]) -> Result<(), AtaError
 }
 
 /// `hal::ata::write_sectors` with the channel held: write `count` sectors at
-/// `lba` from `buf` (`hal` ends the command with `FLUSH CACHE`).
+/// `lba` from `buf`. **Unflushed**: durable only after a later [`flush`].
 ///
 /// # Errors
 ///
 /// As `hal::ata::write_sectors`.
 pub fn write_sectors(lba: u32, count: u16, buf: &[u8]) -> Result<(), AtaError> {
     with_channel(|| hal::ata::write_sectors(lba, count, buf))
+}
+
+/// `hal::ata::flush` with the channel held: `FLUSH CACHE`, making every
+/// earlier write on the disk durable.
+///
+/// # Errors
+///
+/// As `hal::ata::flush`.
+pub fn flush() -> Result<(), AtaError> {
+    with_channel(hal::ata::flush)
 }
 
 fn map_err(e: AtaError) -> BlkError {
@@ -178,17 +188,18 @@ impl BlockDevice for AtaDevice {
             let lba = self.lba_of(at)?;
             let sectors = (chunk.len() * SECTORS_PER_BLOCK) as u16;
             let bytes = chunk.as_flattened();
-            // `hal::ata::write_sectors` ends with FLUSH CACHE (module docs).
+            // Unflushed: durable at the next `flush` (module docs).
             write_sectors(lba, sectors, bytes).map_err(map_err)?;
             at += chunk.len() as u64;
         }
         Ok(())
     }
 
-    /// Nothing to do on today's `hal::ata`: every write above was already
-    /// flushed by `hal` before it returned. See the module docs.
+    /// `FLUSH CACHE` on the whole disk (the window has no flush of its own):
+    /// every earlier [`write_blocks`](BlockDevice::write_blocks) is durable
+    /// when this returns `Ok`.
     fn flush(&mut self) -> Result<(), BlkError> {
-        Ok(())
+        flush().map_err(map_err)
     }
 }
 
@@ -225,7 +236,6 @@ mod tests {
         );
         assert_eq!(d.write_blocks(BlockNo(4), &out), Err(BlkError::OutOfRange));
         assert_eq!(d.read_blocks(BlockNo(0), &mut []), Err(BlkError::BadBuffer));
-        assert_eq!(d.flush(), Ok(()));
     }
 
     #[test]

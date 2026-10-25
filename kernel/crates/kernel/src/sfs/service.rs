@@ -47,13 +47,16 @@
 //! blocks on the 16 MiB dev image, one group), past the old `kernel::fs`
 //! image, which keeps working until FS-2 replaces it (spec §11).
 
+use super::proof::{self, Control};
+use super::scrub::{scrub, Report, ScrubWs};
 use super::short_hex;
 use super::volume::{
     self, write_commit, CommitError, CommitInfo, FormatError, FormatInfo, FormatParams, MountError,
     MountInfo, Volume, Workspace,
 };
 use crate::blk::ata::{AtaDevice, SFS_BASE_LBA};
-use crate::blk::{BlkError, BlockDevice};
+use crate::blk::layout::Pointer;
+use crate::blk::{BlkError, Block, BlockDevice, BlockNo};
 use crate::clock;
 use crate::sched::{SpawnError, TaskId, TaskIdCell};
 use alloc::boxed::Box;
@@ -119,6 +122,24 @@ pub struct Sfs {
     served: u64,
     last: Option<Result<CommitInfo, CommitError>>,
     last_commit_tick: u64,
+    /// FS-1b: one outstanding miss to read for a caller (ticketed).
+    read_req: Option<(Pointer, u64)>,
+    read_ticket: u64,
+    read_served: u64,
+    read_last: Option<Result<(), CommitError>>,
+    /// FS-1b: scrub requests, the last report, and the task's scrub scratch.
+    scrub_req: u64,
+    scrub_served: u64,
+    scrub_last: Option<Result<Report, BlkError>>,
+    scrub_ws: Option<Box<ScrubWs>>,
+    /// FS-1b: no interval commit while a caller's multi-operation group is in
+    /// progress (requested commits are still served). A single flag: one
+    /// group at a time (the boot proof). FS-2's facade, with concurrent
+    /// callers, needs a count or an owner here.
+    hold: bool,
+    /// FS-1b: the boot's test-control sector, and the armed commit cut.
+    control: Control,
+    cut: Option<u32>,
 }
 
 /// What the commit task does next (see [`Sfs::next_step`]).
@@ -145,6 +166,17 @@ impl Sfs {
             served: 0,
             last: None,
             last_commit_tick: 0,
+            read_req: None,
+            read_ticket: 0,
+            read_served: 0,
+            read_last: None,
+            scrub_req: 0,
+            scrub_served: 0,
+            scrub_last: None,
+            scrub_ws: None,
+            hold: false,
+            control: Control::None,
+            cut: None,
         }
     }
 
@@ -166,9 +198,28 @@ impl Sfs {
         self.formatted
     }
 
-    /// Whether a commit is due: requested, or a dirty transaction older than
-    /// [`COMMIT_INTERVAL`] ticks at `now`.
+    /// The mounted volume (FS-1b callers run tree operations on it under
+    /// the lock, through [`with_sfs`]).
+    pub fn volume_mut(&mut self) -> Option<&mut Volume> {
+        self.volume.as_deref_mut()
+    }
+
+    /// The boot's test-control request (normally [`Control::None`]).
+    #[must_use]
+    pub const fn control(&self) -> Control {
+        self.control
+    }
+
+    /// Whether the task has work: a caller's read or scrub request, or a
+    /// commit ([`commit_wanted`](Self::commit_wanted)). The task's loop asks
+    /// this; [`run_commit`] serves whichever it is.
     fn commit_due(&self, now: u64) -> bool {
+        self.read_req.is_some() || self.scrub_req > self.scrub_served || self.commit_wanted(now)
+    }
+
+    /// Whether a commit is due: requested, or a dirty transaction older than
+    /// [`COMMIT_INTERVAL`] ticks at `now` while no caller holds commits.
+    fn commit_wanted(&self, now: u64) -> bool {
         let Some(v) = self.volume.as_ref() else {
             return false;
         };
@@ -176,7 +227,9 @@ impl Sfs {
             return false;
         }
         self.requested > self.served
-            || (v.is_dirty() && now >= self.last_commit_tick.saturating_add(COMMIT_INTERVAL))
+            || (!self.hold
+                && v.is_dirty()
+                && now >= self.last_commit_tick.saturating_add(COMMIT_INTERVAL))
     }
 
     /// Whether a mounted volume has uncommitted changes (host tests).
@@ -186,14 +239,18 @@ impl Sfs {
     }
 
     /// The commit task's decision at `now`: commit if [`Sfs::commit_due`];
-    /// else, with a dirty writable volume, park until its pacing deadline;
-    /// else park until unparked.
+    /// else, with a dirty writable volume and no [`hold_commits`] in force,
+    /// park until its pacing deadline; else park until unparked. While held
+    /// the pacing deadline does not apply, so the answer is `Park` — a
+    /// deadline already past would return at once and the task would spin on
+    /// the BSP for as long as the hold lasts. Releasing the hold changes the
+    /// decision, which kicks the task ([`with_sfs`]).
     fn next_step(&self, now: u64) -> Next {
         if self.commit_due(now) {
             return Next::Commit;
         }
         match self.volume.as_ref() {
-            Some(v) if !v.is_read_only() && v.is_dirty() => {
+            Some(v) if !v.is_read_only() && v.is_dirty() && !self.hold => {
                 Next::ParkUntil(self.last_commit_tick.saturating_add(COMMIT_INTERVAL))
             }
             _ => Next::Park,
@@ -310,6 +367,69 @@ pub fn commit_outcome(ticket: u64) -> Option<Result<CommitInfo, CommitError>> {
     with_sfs(|s| if s.served >= ticket { s.last } else { None })
 }
 
+/// Hold (`true`) or release interval commits around a group of operations
+/// that must commit together (requested commits are still served). FS-1b's
+/// boot ledger uses it; FS-2's facade calls will.
+pub fn hold_commits(on: bool) {
+    with_sfs(|s| s.hold = on);
+}
+
+/// Have the task read the committed block `p` names into the cache
+/// (verified), for a caller whose operation reported `Miss(p)` in commit
+/// `epoch` ([`Volume::epoch`], read under the same lock hold); waits,
+/// yielding, up to `timeout` mono ticks. The caller then retries its
+/// operation. A failed read or a block that no longer matches its hash
+/// leaves the volume read-only — unless a commit has completed since the
+/// miss, which makes it stale, not damage ([`Volume::resolve_tree_miss`];
+/// the host race model found that case).
+///
+/// # Errors
+///
+/// The read's [`CommitError`]; [`CommitError::Busy`] if the task never
+/// answered in time.
+pub fn read_block(p: Pointer, epoch: u64, timeout: u64) -> Result<(), CommitError> {
+    let posted = wait_for(timeout, || {
+        with_sfs(|s| {
+            if s.read_req.is_some() {
+                return None;
+            }
+            s.read_ticket += 1;
+            s.read_req = Some((p, epoch));
+            Some(s.read_ticket)
+        })
+    });
+    let ticket = posted.ok_or(CommitError::Busy)?;
+    let outcome = wait_for(timeout, || {
+        with_sfs(|s| (s.read_served >= ticket).then_some(s.read_last))
+    });
+    match outcome {
+        Some(Some(r)) => r,
+        _ => Err(CommitError::Busy),
+    }
+}
+
+/// Ask the task to scrub the committed generation. Returns a ticket for
+/// [`scrub_outcome`], or `None` unless mounted.
+pub fn request_scrub() -> Option<u64> {
+    with_sfs(|s| {
+        s.volume.as_ref()?;
+        s.scrub_req += 1;
+        Some(s.scrub_req)
+    })
+}
+
+/// Once `ticket` has been served: the latest scrub's report.
+#[must_use]
+pub fn scrub_outcome(ticket: u64) -> Option<Result<Report, BlkError>> {
+    with_sfs(|s| {
+        if s.scrub_served >= ticket {
+            s.scrub_last
+        } else {
+            None
+        }
+    })
+}
+
 /// Identity for a fresh format: SHA-256-derived from the clocks. Not secret
 /// (the uuid only has to differ between filesystems; the dirent key is
 /// re-derived per §10 once keys exist).
@@ -355,8 +475,16 @@ fn commit_task() {
         }
     };
     let mut ws = Workspace::new();
+    let control = read_control(ws.block());
+    let scrub_ws = Box::new(ScrubWs::new());
     match mount_or_format(&mut dev, &mut ws, format_params) {
         Ok((vol, formatted)) => with_sfs(|s| {
+            s.control = control;
+            s.cut = match control {
+                Control::Cut { after } => Some(after),
+                _ => None,
+            };
+            s.scrub_ws = Some(scrub_ws);
             s.mounted = Some(vol.info());
             s.formatted = formatted;
             s.volume = Some(vol);
@@ -382,9 +510,133 @@ fn commit_task() {
     }
 }
 
-/// One commit, start to finish, with the lock released around all I/O.
+/// Read the test-control sector ([`proof::CONTROL_LBA`]) through the
+/// channel lock; anything unreadable or without the magic is no request.
+/// Only kernels built with the `test-hooks` feature (the boot tests') read
+/// it at all: a production kernel never halts because a disk carries it.
+#[cfg(not(feature = "test-hooks"))]
+fn read_control(_buf: &mut Block) -> Control {
+    Control::None
+}
+
+/// See the production variant above: this is the boot tests' build.
+#[cfg(feature = "test-hooks")]
+fn read_control(buf: &mut Block) -> Control {
+    let sector = &mut buf[..crate::blk::SECTOR_SIZE];
+    match crate::blk::ata::read_sectors(proof::CONTROL_LBA, 1, sector) {
+        Ok(()) => proof::parse_control(sector),
+        Err(_) => Control::None,
+    }
+}
+
+/// Serve whatever the task's loop found due ([`Sfs::commit_due`]): a
+/// caller's read, then a scrub, then a commit if one is wanted.
 fn run_commit(dev: &mut AtaDevice, ws: &mut Workspace) {
+    serve_read(dev, ws);
+    serve_scrub(dev);
     let now = clock::mono_ticks();
+    if with_sfs(|s| s.commit_wanted(now)) {
+        commit_once(dev, ws, now);
+    }
+}
+
+/// A caller's miss: read with the lock released, insert (verified) under it.
+fn serve_read(dev: &mut AtaDevice, ws: &mut Workspace) {
+    let Some((p, epoch)) = with_sfs(|s| s.read_req) else {
+        return;
+    };
+    let staging = ws.block();
+    let read = dev
+        .read_blocks(p.block, core::slice::from_mut(staging))
+        .map(|()| &*staging);
+    let res = with_sfs(|s| match s.volume.as_mut() {
+        Some(v) => v.resolve_tree_miss(&p, read, epoch),
+        None => Err(CommitError::Internal),
+    });
+    with_sfs(|s| {
+        s.read_req = None;
+        s.read_served = s.read_ticket;
+        s.read_last = Some(res);
+    });
+}
+
+/// A scrub of the committed generation, entirely with the lock released
+/// (module docs of [`super::scrub`]: no commit can run underneath, the task
+/// does both). Damage leaves the volume read-only.
+fn serve_scrub(dev: &mut AtaDevice) {
+    let job = with_sfs(|s| {
+        if s.scrub_req <= s.scrub_served {
+            return Ok(None);
+        }
+        // A request that cannot run is answered with an error, never with
+        // the previous scrub's report.
+        let (Some(v), Some(sws)) = (s.volume.as_ref(), s.scrub_ws.take()) else {
+            return Err(());
+        };
+        let info = v.info();
+        Ok(Some((*v.superblock(), info.sb_hash, info.slot, sws)))
+    });
+    let (sb, hash, slot, mut sws) = match job {
+        Ok(Some(job)) => job,
+        Ok(None) => return,
+        Err(()) => {
+            with_sfs(|s| {
+                s.scrub_served = s.scrub_req;
+                s.scrub_last = Some(Err(BlkError::BadBuffer));
+            });
+            return;
+        }
+    };
+    let report = scrub(dev, &mut sws, &sb, &hash, slot);
+    with_sfs(|s| {
+        if report.is_err() || report.is_ok_and(|r| r.bad > 0) {
+            if let Some(v) = s.volume.as_mut() {
+                v.mark_read_only();
+            }
+        }
+        s.scrub_ws = Some(sws);
+        s.scrub_served = s.scrub_req;
+        s.scrub_last = Some(report);
+    });
+}
+
+/// The FS-1b torn-commit cut: a device that halts the machine after its
+/// `after`-th block write (spec §11; armed by the test-control sector).
+struct Cut<'a> {
+    dev: &'a mut AtaDevice,
+    after: u32,
+    written: u32,
+    gen: u64,
+    dirty: usize,
+}
+
+impl BlockDevice for Cut<'_> {
+    fn blocks(&self) -> u64 {
+        self.dev.blocks()
+    }
+
+    fn read_blocks(&mut self, start: BlockNo, out: &mut [Block]) -> Result<(), BlkError> {
+        self.dev.read_blocks(start, out)
+    }
+
+    fn write_blocks(&mut self, start: BlockNo, data: &[Block]) -> Result<(), BlkError> {
+        self.dev.write_blocks(start, data)?;
+        self.written = self.written.saturating_add(data.len() as u32);
+        if self.written >= self.after {
+            proof::print_cut(self.after, self.gen, self.dirty);
+            hal::cpu::disable_interrupts();
+            hal::cpu::halt_loop();
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), BlkError> {
+        self.dev.flush()
+    }
+}
+
+/// One commit, start to finish, with the lock released around all I/O.
+fn commit_once(dev: &mut AtaDevice, ws: &mut Workspace, now: u64) {
     let ticket = with_sfs(|s| s.requested);
     // Phase 1 under the lock; a miss is read with the lock released and
     // handed back to the volume, which goes read-only if the read failed or
@@ -413,9 +665,30 @@ fn run_commit(dev: &mut AtaDevice, ws: &mut Workspace) {
     // Phase 2 without the lock (each block is copied out under it), then
     // phase 3 under it.
     let result = plan.and_then(|plan| {
-        let io = write_commit(dev, ws.block(), &plan, |stage, out| {
+        let fetch = |stage, out: &mut Block| {
             with_sfs(|s| s.volume.as_ref().and_then(|v| v.fetch(stage, out)))
-        });
+        };
+        // The cut applies to the first commit that writes a dirty block, and
+        // only inside the dirty set (cutting after the superblock would not
+        // be a torn commit).
+        let cut = with_sfs(|s| if plan.dirty > 0 { s.cut.take() } else { None });
+        let io = match cut {
+            Some(after) if after >= 1 && after as usize <= plan.dirty => {
+                let mut c = Cut {
+                    dev: &mut *dev,
+                    after,
+                    written: 0,
+                    gen: plan.gen,
+                    dirty: plan.dirty,
+                };
+                write_commit(&mut c, ws.block(), &plan, fetch)
+            }
+            Some(after) => {
+                proof::print_cut_refused(after, plan.dirty);
+                write_commit(dev, ws.block(), &plan, fetch)
+            }
+            None => write_commit(dev, ws.block(), &plan, fetch),
+        };
         with_sfs(|s| match s.volume.as_mut() {
             Some(v) => v.finish_commit(io),
             None => Err(CommitError::Internal),
@@ -429,9 +702,10 @@ fn run_commit(dev: &mut AtaDevice, ws: &mut Workspace) {
 }
 
 /// Wait (yielding) until `poll` yields a value or `timeout` mono ticks pass.
-/// Its only caller is kmain's boot proof, and kmain is the BSP's idle task,
-/// which may not park; a yield hands the BSP straight to the commit task.
-fn wait_for<T>(timeout: u64, mut poll: impl FnMut() -> Option<T>) -> Option<T> {
+/// Its only callers are kmain's boot proofs (this file's and `sfs::proof`'s),
+/// and kmain is the BSP's idle task, which may not park; a yield hands the BSP
+/// straight to the commit task.
+pub(super) fn wait_for<T>(timeout: u64, mut poll: impl FnMut() -> Option<T>) -> Option<T> {
     let deadline = clock::mono_ticks().saturating_add(timeout);
     loop {
         if let Some(v) = poll() {
@@ -528,11 +802,22 @@ pub fn prove_mount() {
     write_dec(u64::from(info.reserve));
     write_str(" ok\n");
 
+    // FS-1b: verify the tree this generation committed (and, on a recovery
+    // boot, that the torn commit left exactly it), then queue the next
+    // generation's ledger changes as one group of tree operations.
+    hold_commits(true);
+    let staged = proof::check_and_stage(info.gen, PROOF_TIMEOUT_TICKS);
+    if !staged {
+        hold_commits(false);
+        return;
+    }
     let Some(ticket) = request_commit() else {
+        hold_commits(false);
         write_str("[sfs] commit: refused (not mounted read-write) FAIL\n");
         return;
     };
     let outcome = wait_for(PROOF_TIMEOUT_TICKS, || commit_outcome(ticket));
+    hold_commits(false);
     write_str("[sfs] commit: ");
     match outcome {
         Some(Ok(c)) => {
@@ -547,6 +832,7 @@ pub fn prove_mount() {
             write_str(" flushes=");
             write_dec(c.flushes);
             write_str(" ok\n");
+            proof::prove_scrub(PROOF_TIMEOUT_TICKS);
         }
         Some(Err(e)) => {
             write_str(e.label());
@@ -645,5 +931,58 @@ mod tests {
             run_noting_wake(&mut s, now, |s| s.is_dirty()),
             (true, false)
         );
+    }
+
+    /// FS-1b's wake reasons reach the decision: while commits are held a
+    /// dirty volume parks without a deadline even when the deadline has
+    /// passed (no hot spin), releasing the hold changes the decision (so the
+    /// section that releases it kicks the task), and a posted read or scrub
+    /// request is a commit-task wake-up like a commit request.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn hold_parks_and_releasing_it_or_posting_a_read_or_scrub_kicks() {
+        let mut s = Sfs::new();
+        let mut d = MemDevice::new(256);
+        let mut ws = Workspace::new();
+        format(&mut d, &mut ws, &FormatParams::from_seed(b"hold", 1)).unwrap();
+        let mut v = Volume::mount(&mut d, &mut ws).unwrap();
+        v.alloc(AllocClass::Normal, None).unwrap();
+        s.volume = Some(v);
+        s.last_commit_tick = 0;
+        let past = COMMIT_INTERVAL * 3;
+        assert_eq!(
+            s.next_step(past),
+            Next::Commit,
+            "unheld: the deadline passed"
+        );
+
+        assert_eq!(run_noting_wake(&mut s, past, |s| s.hold = true), ((), true));
+        assert_eq!(
+            s.next_step(past),
+            Next::Park,
+            "held + dirty + past deadline"
+        );
+        assert_eq!(s.next_step(0), Next::Park, "held + dirty, deadline ahead");
+        // Releasing the hold changes the decision: the releasing section kicks.
+        assert_eq!(
+            run_noting_wake(&mut s, past, |s| s.hold = false),
+            ((), true)
+        );
+        assert_eq!(s.next_step(past), Next::Commit);
+
+        // While held, a posted read or scrub is still a wake-up.
+        s.hold = true;
+        let p = crate::blk::layout::Pointer::NULL;
+        assert_eq!(
+            run_noting_wake(&mut s, past, |s| s.read_req = Some((p, 0))),
+            ((), true)
+        );
+        assert_eq!(s.next_step(past), Next::Commit);
+        s.read_req = None;
+        assert_eq!(
+            run_noting_wake(&mut s, past, |s| s.scrub_req += 1),
+            ((), true)
+        );
+        assert_eq!(s.next_step(past), Next::Commit);
     }
 }

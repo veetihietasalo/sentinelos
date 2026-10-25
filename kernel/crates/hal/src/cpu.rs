@@ -404,9 +404,10 @@ pub(crate) unsafe fn xrstor(area: *const u8, mask: u64) {
 }
 
 /// Read the time-stamp counter (`rdtsc`). Monotonic per core only (no
-/// cross-core ordering is assumed). Used only as a coarse bound on boot-time
-/// waits on one core (`kernel::ioapic`'s PIT-liveness check), never as
-/// a calibrated clock.
+/// cross-core ordering is assumed), never calibrated: a coarse bound on waits
+/// that stay on one core, never a clock. Two callers (TCB row C16):
+/// `kernel::ioapic`'s boot-time PIT-liveness check, and `hal::ata`'s status
+/// waits, whose deadlines are generous TSC-cycle budgets (SentinelFS FS-1b).
 #[inline]
 #[must_use]
 pub fn rdtsc() -> u64 {

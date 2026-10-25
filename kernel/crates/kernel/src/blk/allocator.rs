@@ -169,6 +169,86 @@ impl Group {
     };
 }
 
+/// Most allocation groups one [`Allocator::check_ops`] preflight may involve
+/// (a tree operation touches at most a handful: its path's groups and the
+/// hinted one).
+pub const MAX_OP_GROUPS: usize = 16;
+
+/// [`Allocator::check_ops`]' per-group simulation: the working free count and
+/// whether the group has (or will have) its copy-on-write copy.
+#[derive(Clone, Copy, Debug)]
+struct SimGroup {
+    g: u32,
+    free: u32,
+    cowed: bool,
+    /// The group has no copy yet (its committed bitmap is a clean, evictable
+    /// cache entry) and the preflight looked that bitmap up: it must stay
+    /// resident until the operation copies it.
+    looked: bool,
+    /// Whether the group already had its copy when the preflight began.
+    copied: bool,
+}
+
+impl SimGroup {
+    fn look(&mut self) {
+        if !self.copied {
+            self.looked = true;
+        }
+    }
+}
+
+struct OpSim {
+    groups: [SimGroup; MAX_OP_GROUPS],
+    n: usize,
+}
+
+impl OpSim {
+    const fn new() -> OpSim {
+        OpSim {
+            groups: [SimGroup {
+                g: 0,
+                free: 0,
+                cowed: false,
+                looked: false,
+                copied: false,
+            }; MAX_OP_GROUPS],
+            n: 0,
+        }
+    }
+
+    /// Committed bitmaps looked up that must stay resident until used.
+    fn looked_up(&self) -> usize {
+        self.groups.iter().take(self.n).filter(|s| s.looked).count()
+    }
+
+    fn index(&mut self, a: &Allocator, g: u32) -> Result<usize, AllocError> {
+        if let Some(i) = self.groups.iter().take(self.n).position(|s| s.g == g) {
+            return Ok(i);
+        }
+        let grp = a.group(g)?;
+        let slot = self.groups.get_mut(self.n).ok_or(AllocError::Invalid)?;
+        *slot = SimGroup {
+            g,
+            free: grp.free,
+            cowed: grp.work.is_some(),
+            looked: false,
+            copied: grp.work.is_some(),
+        };
+        self.n += 1;
+        Ok(self.n - 1)
+    }
+
+    fn get(&mut self, a: &Allocator, g: u32) -> Result<SimGroup, AllocError> {
+        let i = self.index(a, g)?;
+        self.groups.get(i).copied().ok_or(AllocError::Invalid)
+    }
+
+    fn get_mut(&mut self, a: &Allocator, g: u32) -> Result<&mut SimGroup, AllocError> {
+        let i = self.index(a, g)?;
+        self.groups.get_mut(i).ok_or(AllocError::Invalid)
+    }
+}
+
 /// The free-space allocator of one mounted filesystem.
 pub struct Allocator {
     geo: Geometry,
@@ -674,6 +754,103 @@ impl Allocator {
             }
         }
         Err(AllocError::NoSpace)
+    }
+
+    /// Preflight for a multi-step operation (a tree mutation): would `allocs`
+    /// single-block [`alloc`](Self::alloc)s with `hint` and `class`, followed
+    /// by one [`free`](Self::free) of each block in `frees` in order, all
+    /// succeed if made next — with the caller creating `extra_dirty` more
+    /// dirty cache entries of its own after them?
+    ///
+    /// Reads only (lookups refresh LRU positions). It runs the same checks
+    /// the real calls make, against a simulation of the per-group counts, and
+    /// is at least as strict as each of them, so `Ok` means none of the calls
+    /// can be refused. It also proves no needed bitmap can be evicted midway:
+    /// the groups it looked up (`P`, at most [`MAX_OP_GROUPS`]) were touched
+    /// last, so they outlive the next `cows + extra_dirty + seal` evictions as
+    /// long as those plus `P` fit in the cache's non-dirty entries — which is
+    /// checked. That is what lets a tree operation plan in memory, preflight
+    /// here, and then apply without any step able to fail half-way (§8: a
+    /// commit never publishes a half-applied metadata operation).
+    ///
+    /// # Errors
+    ///
+    /// [`AllocError::Sealed`], [`AllocError::Miss`] (read that bitmap and
+    /// retry), [`AllocError::NoSpace`], [`AllocError::Invalid`] (a free the
+    /// real call would refuse, or too many groups), [`AllocError::NeedCommit`]
+    /// (the dirty, pending or cache budget is spent: commit, then retry).
+    pub fn check_ops(
+        &self,
+        cache: &mut Cache,
+        allocs: u32,
+        hint: Option<u32>,
+        frees: &[BlockNo],
+        class: AllocClass,
+        extra_dirty: usize,
+    ) -> Result<(), AllocError> {
+        if self.sealed {
+            return Err(AllocError::Sealed);
+        }
+        let mut sim = OpSim::new();
+        let mut cows = 0usize;
+        let (order, n) = self.preference(hint);
+        for _ in 0..allocs {
+            let mut placed = false;
+            for &g in order.iter().take(n) {
+                let g = u32::from(g);
+                let s = sim.get(self, g)?;
+                let cow = u32::from(!s.cowed);
+                if s.free < 1 + cow + self.floor(g, class) {
+                    continue;
+                }
+                self.current_view(cache, g)?;
+                let s = sim.get_mut(self, g)?;
+                s.look();
+                s.free -= 1 + cow;
+                s.cowed = true;
+                cows += cow as usize;
+                placed = true;
+                break;
+            }
+            if !placed {
+                return Err(AllocError::NoSpace);
+            }
+        }
+        for (i, &b) in frees.iter().enumerate() {
+            let (g, bit) = self.geo.locate(b).ok_or(AllocError::Invalid)?;
+            let pending = self.pending.get(..self.npending).unwrap_or(&[]);
+            if self.is_metadata(b)
+                || pending.contains(&b)
+                || frees.get(..i).is_some_and(|f| f.contains(&b))
+            {
+                return Err(AllocError::Invalid);
+            }
+            let view = self.current_view(cache, g)?;
+            sim.get_mut(self, g)?.look();
+            let s = sim.get(self, g)?;
+            let current = cache.read(view).ok_or(AllocError::Corrupt)?;
+            if bitmap::get(bits(current), bit) != Some(true) {
+                return Err(AllocError::Invalid);
+            }
+            if !s.cowed {
+                if s.free == 0 {
+                    return Err(AllocError::NoSpace);
+                }
+                let s = sim.get_mut(self, g)?;
+                s.free -= 1;
+                s.cowed = true;
+                cows += 1;
+            }
+        }
+        let pending_after = self.npending + frees.len() + cows;
+        if pending_after + SEAL_SLOTS > PENDING_MAX {
+            return Err(AllocError::NeedCommit);
+        }
+        let need = cows + extra_dirty + self.seal_need();
+        if cache.dirty_room() < need || need + sim.looked_up() > cache.not_dirty() {
+            return Err(AllocError::NeedCommit);
+        }
+        Ok(())
     }
 
     /// Whether `b` is allocator metadata (never freeable by callers).

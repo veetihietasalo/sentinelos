@@ -15,3 +15,8 @@ path = "src/main.rs"
 hal = { path = "../hal" }
 kernel = { path = "../kernel" }
 limine = "0.5.0"
+
+[features]
+# Boot-test kernels only (`make test` / `make test-kvm`): honour SentinelFS's
+# test-control sector (the torn-commit stage). Off in every other build.
+test-hooks = ["kernel/test-hooks"]
