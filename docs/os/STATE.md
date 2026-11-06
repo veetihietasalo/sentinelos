@@ -2,7 +2,7 @@
 
 One page for a fresh session (or a fresh container) to pick the kernel work back
 up without re-deriving state from git. Update it at the end of any session that
-changes direction; keep it short. Last updated **2026-10-06** (component PR-2, PR-2b, SentinelFS FS-1a, park/unpark and SMP 3b-ii IOAPIC landed; SentinelFS FS-1b PR open).
+changes direction; keep it short. Last updated **2026-11-06** (SentinelFS FS-1b #44 and FS-1c #42 merged 2026-10-25, team memory #45; no PRs open; #44's hal sign-off not on record).
 
 ## Landed (main)
 
@@ -79,14 +79,14 @@ changes direction; keep it short. Last updated **2026-10-06** (component PR-2, P
   plus the toy FS's `persistence PROVEN` line. Scheduler: zombies are reaped only on the
   idle path (`sched::idle_reap`), never in `reschedule`. Zero `hal` code delta (hal-tcb §5e
   and §7 text corrected).
-- **SentinelFS FS-1b (CoW tree + transactions + durability) — PR open 2026-10-04.**
+- **SentinelFS FS-1b (CoW tree + transactions + durability) — #44, merged 2026-10-25.**
   `kernel::sfs::tree`: `Node<V, CAP>` algebra + separate 4 KiB codec + item encodings;
   every mutation planned in memory, preflighted against every budget
   (`Allocator::check_ops`), then applied — refusals change nothing, ≤ 13 dirty blocks per
   op asserted (worst 9). `sfs::scrub` hashes every reachable block and checks structure and
   allocation; damage → read-only, objects named. `hal::ata` flush split (row A2,
   invariant 16) and time-bounded ATA waits (TSC deadline on `hal::cpu::rdtsc`, row C16 shared with the IOAPIC wait, SRST
-  channel reset after a timeout — the FS-1c CI flake); hal review owed. Host: crash-point property test (2 744 crash points,
+  channel reset after a timeout — the FS-1c CI flake); the staff review asked for Veeti's hal sign-off on 4 `ata.rs` items (SRST reset, flush split, 5 GHz TSC budgets, C16 same-core wait) and none is on record yet. Host: crash-point property test (2 744 crash points,
   ddmin shrinker), replay/order determinism, counting-allocator heap cap (`test-alloc`
   crate, 435 636 B on 16 MiB and 1 GiB), threaded race model (found and fixed a stale-miss
   bug: misses carry a commit epoch). `make test` adds a QEMU torn-commit stage (test-control
@@ -113,7 +113,7 @@ hashes on every pointer, two generation-numbered superblock slots (no journal), 
 content-addressed blobs, logged privileged snapshots/rollback, one 64-block cache slab, an
 `sfs-commit` task that does all I/O (never PIO under the lock), deterministic allocation,
 metadata reserve. **Zero new `hal` rows** (`FLUSH CACHE` already exists; FS-1b splits the
-API). Staging: **FS-1a** (landed, see above), **FS-1b** (PR open, see above) → **FS-1c** (storage-cap lattice type + `⊑` +
+API). Staging: **FS-1a** (landed, see above), **FS-1b** (landed, see above) → **FS-1c** (landed, #42) (storage-cap lattice type + `⊑` +
 Kani never-amplifies, on top of component PR-2's `kernel::cap`; moved out of FS-1a
 2026-10-03 because `kernel::cap` did not exist yet) → **FS-2** (files + facade; `read_file` becomes
 into-buffer, `Corrupt`/`NoSpace` errors; fuzz lane; persistent orphan list for removes
@@ -124,7 +124,7 @@ Follow-ups owned in the spec as A25–A31. **A25 shipped (2026-10-04):** `sched:
 the commit task's yield-poll — it is now a normal blocked task and the BSP idles after boot
 (`[sched] park: … sfs-commit=parked bsp-idles=yes ok`); FS-2's blocking callers still need a
 waiter list the task unparks.
-**FS-1c (storage-cap lattice) rebased onto PR-2b (2026-10-06), PR open, not yet merged:**
+**FS-1c (storage-cap lattice) — #42, merged 2026-10-25:**
 `kernel::cap::storage` (tree / component-wise prefix / blob scope / lineage-charged quota
 ceiling; storage op bits 8–12 on `Target::Service(ServiceId::Storage)`), boot line
 `[sfs] cap: narrow=ok … tree-from-live=refused ok`. Decisions: the §9 ops and expiry live on
@@ -132,9 +132,10 @@ the capability; trees are pairwise incomparable; quota fan-out (T-STO-6) is char
 grant's lineage counter in FS-4; storage has a real meet (greatest lower bound, Kani); its
 attenuation is framed as v2 kind 1 (≤ 245 bytes); every storage manifest request is refused and
 storage capabilities are kernel-granted only (`pub(crate) grant_service`) until FS-4 adds a
-route form for kernel services. Open, not FS-1c's: `hal::ata` waits are poll-count bounded
-(100 000 status reads), so a slow host flush under I/O pressure times out a write (`[sfs]
-mount/commit: io FAIL`, reproduced on main) — needs a time-bounded wait and recovery in `hal`.
+route form for kernel services. The `hal::ata` poll-count timeout seen in FS-1c's CI (100 000
+status reads, `[sfs] mount/commit: io FAIL` under host I/O pressure) is fixed by FS-1b's
+TSC-deadline waits and SRST recovery. Settle before FS-4 (team memory `storage-caps-fs4-checks`):
+SnapshotRo binds by name only, and unusable op bits still install.
 Login/identity spec next: it must solve Argon2id's ≥19 MiB vs the 4 MiB heap (a `hal::mm`
 arena outside the heap), wrap both the tree key and the KeyAgent key from one unlock secret
 (resolving component §18.1), and decide the rollback anchor. The superblock already reserves
