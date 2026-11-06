@@ -461,7 +461,7 @@ pub fn calibrate_tsc() {
     hal::cpu::disable_interrupts();
 
     let hz = tsc_hz_from(cycles, window).unwrap_or(0);
-    if hal::ata::set_tsc_hz(hz) {
+    if crate::blk::ata::set_tsc_hz(hz) {
         hal::serial::write_str("[tsc] ");
         hal::serial::write_dec(hz / 1_000_000);
         hal::serial::write_str(" MHz measured against the PIT; ata waits in real time\n");

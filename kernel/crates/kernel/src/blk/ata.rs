@@ -106,6 +106,14 @@ pub fn flush() -> Result<(), AtaError> {
     with_channel(hal::ata::flush)
 }
 
+/// `hal::ata::set_tsc_hz`: give the ATA waits the TSC rate measured against
+/// the PIT (`kernel::interrupts::calibrate_tsc`). Not under the channel lock:
+/// it issues no command, it is one set-once atomic store that only sizes later
+/// deadlines.
+pub fn set_tsc_hz(hz: u64) -> bool {
+    hal::ata::set_tsc_hz(hz)
+}
+
 fn map_err(e: AtaError) -> BlkError {
     match e {
         AtaError::NoDevice => BlkError::NoDevice,
