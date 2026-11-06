@@ -1,8 +1,9 @@
 //! Wall-clock date and time from the CMOS RTC (`hal::rtc`), read once at boot.
 //!
-//! The RTC is read a single time ([`init`]); after that the time of day is the
-//! boot reading plus whole PIT seconds since, so the lock screen and the
-//! desktop clock never touch the CMOS ports again. Decoding the raw registers
+//! The idle loop reads the RTC live ([`now`], ~10 times a second) for the lock
+//! screen and desktop clock. Counting PIT seconds from a boot reading drifts
+//! under a hypervisor (lost ticks), so that ([`at`]) is only the fallback when
+//! a live read fails. Decoding the raw registers
 //! (BCD or binary, 12 or 24 h, century) is plain arithmetic, kept here and out
 //! of the TCB.
 //!
@@ -107,6 +108,16 @@ pub fn at(elapsed_secs: u64) -> Option<WallTime> {
     }
     let since = elapsed_secs.saturating_sub(BOOT_ELAPSED_SECS.load(Ordering::Relaxed));
     Some(from_epoch_secs(boot.saturating_add(since)))
+}
+
+/// The current wall time: a live RTC reading, or, if the RTC doesn't give a
+/// valid one, the boot reading plus `elapsed_secs` ([`at`]). Call from the BSP
+/// only (`hal::rtc`'s single-caller contract): the idle loop does.
+#[must_use]
+pub fn now(elapsed_secs: u64) -> Option<WallTime> {
+    hal::rtc::read()
+        .and_then(|raw| decode(&raw))
+        .or_else(|| at(elapsed_secs))
 }
 
 /// The lock screen's date line, e.g. `FRIDAY  NOVEMBER 6` (two spaces, as the

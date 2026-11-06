@@ -344,7 +344,7 @@ pub fn kmain() -> ! {
     let framebuffer = hal::framebuffer::get();
     if let Some(fb) = framebuffer.as_ref() {
         let elapsed = hal::pit::ticks() / hal::pit::TICK_HZ;
-        let (h, m, s) = wall_clock(elapsed);
+        let ((h, m, s), _) = clock_reading(elapsed);
         match wall::at(elapsed) {
             Some(t) => ui::draw_boot_screen(fb, &wall::date_line(&t), h, m, s),
             None => ui::draw_boot_screen(fb, ui::CLOCK_DATE, h, m, s),
@@ -391,7 +391,10 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
     let tick_hz = hal::pit::TICK_HZ;
     // Seconds elapsed at the previous clock redraw; "none drawn yet" so the first
     // whole second forces a draw.
-    let mut last_secs: u64 = u64::MAX;
+    // The clock polls the RTC every `CLOCK_POLL_TICKS` and redraws when the
+    // shown `HH:MM:SS` changes (`None` forces a redraw).
+    let mut last_poll: u64 = u64::MAX;
+    let mut last_hms: Option<(u8, u8, u8)> = None;
     // Day of month the lock screen's date line shows; redrawn when it rolls over.
     let mut shown_day: Option<u8> = None;
     // Last hint-pulse phase we drew, so we only repaint the hint when its
@@ -475,18 +478,20 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
         // 2) Advance whichever state we are in.
         match state {
             LockState::Locked => {
-                // Per-second clock.
-                let secs = now / tick_hz;
-                if secs != last_secs {
-                    last_secs = secs;
-                    if let Some(fb) = fb {
-                        let (h, m, s) = wall_clock(secs);
-                        ui::draw_clock(fb, h, m, s);
-                        if let Some(t) = wall::at(secs) {
-                            if shown_day.is_some_and(|d| d != t.day) {
-                                ui::draw_date(fb, &wall::date_line(&t));
+                // Clock: poll the RTC a few times a second, redraw on change.
+                if now / CLOCK_POLL_TICKS != last_poll {
+                    last_poll = now / CLOCK_POLL_TICKS;
+                    let (hms, t) = clock_reading(now / tick_hz);
+                    if last_hms != Some(hms) {
+                        last_hms = Some(hms);
+                        if let Some(fb) = fb {
+                            ui::draw_clock(fb, hms.0, hms.1, hms.2);
+                            if let Some(t) = t {
+                                if shown_day.is_some_and(|d| d != t.day) {
+                                    ui::draw_date(fb, &wall::date_line(&t));
+                                }
+                                shown_day = Some(t.day);
                             }
-                            shown_day = Some(t.day);
                         }
                     }
                 }
@@ -521,7 +526,7 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
                     hal::serial::print_line("[input] unlock complete -> desktop");
                     hal::serial::print_line("[wm] desktop ready");
                     state = LockState::Desktop;
-                    last_secs = u64::MAX; // force the desktop clock to redraw
+                    last_hms = None; // force the desktop clock to redraw
                 } else {
                     // Map elapsed ticks → progress byte 0..=255 and draw the frame
                     // (only when the byte changes, so identical frames are skipped).
@@ -536,13 +541,15 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
             }
 
             LockState::Desktop => {
-                // Keep the top-bar clock ticking once per second.
-                let secs = now / tick_hz;
-                if secs != last_secs {
-                    last_secs = secs;
-                    if let Some(fb) = fb {
-                        let (h, m, s) = wall_clock(secs);
-                        ui::draw_desktop_clock(fb, h, m, s);
+                // Keep the top-bar clock current (same RTC poll as the lock screen).
+                if now / CLOCK_POLL_TICKS != last_poll {
+                    last_poll = now / CLOCK_POLL_TICKS;
+                    let (hms, _) = clock_reading(now / tick_hz);
+                    if last_hms != Some(hms) {
+                        last_hms = Some(hms);
+                        if let Some(fb) = fb {
+                            ui::draw_desktop_clock(fb, hms.0, hms.1, hms.2);
+                        }
                     }
                 }
 
@@ -563,12 +570,18 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
     }
 }
 
-/// Derive `HH:MM:SS` from whole seconds elapsed since boot: the RTC's boot
-/// reading plus the elapsed time (`wall`), or, without one, counting up from
-/// the UI's fallback start (21:04:00), wrapping at 24 h.
-fn wall_clock(elapsed_secs: u64) -> (u8, u8, u8) {
-    if let Some(t) = wall::at(elapsed_secs) {
-        return (t.hour, t.minute, t.second);
+/// How often the idle loop re-reads the RTC for the on-screen clock: every 10
+/// PIT ticks (~0.1 s at 100 Hz). The RTC is read live rather than counted
+/// forward from boot because PIT ticks get lost under a hypervisor: VirtualBox
+/// on Hyper-V showed a clock 13 minutes slow after 21 minutes of uptime.
+const CLOCK_POLL_TICKS: u64 = 10;
+
+/// The on-screen `HH:MM:SS` (and the full wall time when the RTC answers):
+/// a live RTC reading, else the boot reading plus PIT seconds (`wall::at`),
+/// else counting up from the UI's fallback start (21:04:00), wrapping at 24 h.
+fn clock_reading(elapsed_secs: u64) -> ((u8, u8, u8), Option<wall::WallTime>) {
+    if let Some(t) = wall::now(elapsed_secs) {
+        return ((t.hour, t.minute, t.second), Some(t));
     }
     const DAY: u64 = 24 * 60 * 60;
     let start = (ui::CLOCK_START_H as u64 * 3600)
@@ -578,5 +591,5 @@ fn wall_clock(elapsed_secs: u64) -> (u8, u8, u8) {
     let h = (t / 3600) as u8;
     let m = ((t % 3600) / 60) as u8;
     let s = (t % 60) as u8;
-    (h, m, s)
+    ((h, m, s), None)
 }

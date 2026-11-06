@@ -12,8 +12,8 @@
 //!
 //! Index writes leave bit 7 of port `0x70` clear, so NMIs stay enabled: we
 //! don't change the NMI mask the firmware left. Call from one core at a time
-//! (boot does it once, on the BSP, before the APs run kernel code): the
-//! index/data port pair is not atomic.
+//! (the kernel reads it on the BSP only: at boot, then from `kmain`'s idle
+//! loop): the index/data port pair is not atomic.
 //!
 //! All `unsafe` is registered in `kernel/docs/hal-tcb.md` (§2n).
 
@@ -103,7 +103,7 @@ unsafe fn cmos_read(reg: u8) -> u8 {
 fn read_once() -> RtcRaw {
     for _ in 0..UIP_SPIN_LIMIT {
         // SAFETY: Status A is a read-only status register (`cmos_read` contract);
-        // boot calls `read` from the BSP alone.
+        // the kernel calls `read` from the BSP alone.
         if unsafe { cmos_read(REG_STATUS_A) } & STATUS_A_UIP == 0 {
             break;
         }
