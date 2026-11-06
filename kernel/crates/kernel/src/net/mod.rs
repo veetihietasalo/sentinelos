@@ -123,8 +123,8 @@ pub fn status() -> NetStatus {
     }
 }
 
-/// Bring up the NIC and the stack, log the MAC, and (if the link is up) send an
-/// ARP request + ICMP echo to the gateway as a TX proof.
+/// Bring up the NIC and the stack, log the MAC, wait (bounded) for the link,
+/// then send an ARP request + ICMP echo to the gateway as a TX proof.
 ///
 /// Degrades gracefully: if no NIC is present (`hal::e1000::init` returns
 /// `NotFound`) it logs that and leaves the stack down, so the boot path is never
@@ -145,7 +145,12 @@ pub fn init() {
             log_ip("[net] gateway: ", &GATEWAY_IP);
             hal::serial::write_str("\n");
 
-            let link = hal::e1000::link_up();
+            let (link, waited) = wait_for_link();
+            if link && waited > 0 {
+                hal::serial::write_str("[net] link came up after ");
+                hal::serial::write_dec(waited);
+                hal::serial::write_str(" ticks\n");
+            }
             hal::serial::write_str(if link {
                 "[net] link: UP\n"
             } else {
@@ -175,6 +180,38 @@ pub fn init() {
             hal::serial::write_str("\n");
         }
     }
+}
+
+/// How long [`init`] waits for the link after the NIC reset: 6 s of PIT ticks
+/// (100 Hz). A real link needs seconds of auto-negotiation, and VirtualBox's
+/// e1000 holds the link down for its `LinkUpDelay` (5 s by default) after every
+/// reset; a TX sent before then never completes. QEMU's link is up at once.
+const LINK_WAIT_TICKS: u64 = 600;
+
+/// Wait (bounded, real time) for the NIC's link-up bit. Returns whether the
+/// link is up and how many PIT ticks it took (`0` if it already was).
+///
+/// Called from boot with interrupts disabled: like `smp::wait_online`, it opens
+/// them only for the wait so the PIT ticks, halting between ticks, and
+/// restores the prior state. The NIC's own line is not unmasked yet.
+fn wait_for_link() -> (bool, u64) {
+    if hal::e1000::link_up() {
+        return (true, 0);
+    }
+    let were_enabled = hal::cpu::interrupts_enabled();
+    hal::cpu::enable_interrupts();
+    let start = hal::pit::ticks();
+    let deadline = start.saturating_add(LINK_WAIT_TICKS);
+    while !hal::e1000::link_up() && hal::pit::ticks() < deadline {
+        hal::cpu::halt();
+    }
+    if !were_enabled {
+        hal::cpu::disable_interrupts();
+    }
+    (
+        hal::e1000::link_up(),
+        hal::pit::ticks().saturating_sub(start),
+    )
 }
 
 /// Spin (bounded) draining received frames, to capture the gateway's immediate

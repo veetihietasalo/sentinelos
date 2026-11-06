@@ -38,6 +38,7 @@ pub mod sched;
 pub mod sfs;
 pub mod shell;
 pub mod smp;
+pub mod wall;
 pub mod wm;
 
 /// Kernel entry point — called by `boot::_start` after serial initialisation.
@@ -337,9 +338,17 @@ pub fn kmain() -> ! {
     // boot test sees `boot-bringup-ok` immediately and is never delayed by the
     // (slow, per-pixel) software rendering. If no framebuffer was provided, we
     // simply skip it and stay headless.
+    // Read the CMOS RTC once for the lock screen's date and clock (`wall`);
+    // without a usable reading the UI keeps its fixed fallback.
+    wall::init(hal::pit::ticks() / hal::pit::TICK_HZ);
     let framebuffer = hal::framebuffer::get();
     if let Some(fb) = framebuffer.as_ref() {
-        ui::draw_boot_screen(fb);
+        let elapsed = hal::pit::ticks() / hal::pit::TICK_HZ;
+        let (h, m, s) = wall_clock(elapsed);
+        match wall::at(elapsed) {
+            Some(t) => ui::draw_boot_screen(fb, &wall::date_line(&t), h, m, s),
+            None => ui::draw_boot_screen(fb, ui::CLOCK_DATE, h, m, s),
+        }
     }
 
     // Now that every handler is registered, open the interrupt window. From here
@@ -546,9 +555,13 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
     }
 }
 
-/// Derive `HH:MM:SS` from whole seconds elapsed since boot, counting up from the
-/// boot screen's start time (21:04:00) and wrapping at 24 h.
+/// Derive `HH:MM:SS` from whole seconds elapsed since boot: the RTC's boot
+/// reading plus the elapsed time (`wall`), or, without one, counting up from
+/// the UI's fallback start (21:04:00), wrapping at 24 h.
 fn wall_clock(elapsed_secs: u64) -> (u8, u8, u8) {
+    if let Some(t) = wall::at(elapsed_secs) {
+        return (t.hour, t.minute, t.second);
+    }
     const DAY: u64 = 24 * 60 * 60;
     let start = (ui::CLOCK_START_H as u64 * 3600)
         + (ui::CLOCK_START_M as u64 * 60)

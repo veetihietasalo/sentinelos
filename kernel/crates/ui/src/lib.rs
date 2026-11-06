@@ -148,8 +148,9 @@ const UNLOCK_PILL_LABEL: &str = "swipe to unlock →";
 /// Everything is centered to the live `fb.width()/height()`, so the layout
 /// adapts to whatever resolution Limine handed us. The whole screen is drawn
 /// once (it is a static boot frame); per-pixel work is bounded by the framebuffer
-/// area.
-pub fn draw_boot_screen(fb: &Framebuffer) {
+/// area. `date` is the line above the clock (the kernel passes the RTC date, or
+/// [`CLOCK_DATE`] without one) and `(hh, mm, ss)` the clock's first reading.
+pub fn draw_boot_screen(fb: &Framebuffer, date: &str, hh: u8, mm: u8, ss: u8) {
     let w = fb.width();
     let h = fb.height();
     if w == 0 || h == 0 {
@@ -168,7 +169,7 @@ pub fn draw_boot_screen(fb: &Framebuffer) {
 
     // 3) Centered date + large clock above the card.
     let cx = w / 2;
-    draw_clock_block(fb, cx, h);
+    draw_clock_block(fb, cx, h, date, (hh, mm, ss));
 
     // 4) Centered translucent glass card.
     draw_glass_card(fb, &gradient, w, h);
@@ -276,14 +277,15 @@ fn isqrt_u64(n: u64) -> u64 {
     x
 }
 
-/// The date line shown above the clock (no RTC wired in, so this is static).
-const CLOCK_DATE: &str = "TUESDAY  JUNE 3";
+/// The date line the boot screen falls back to when the kernel has no RTC
+/// reading.
+pub const CLOCK_DATE: &str = "TUESDAY  JUNE 3";
 /// Text scale of the date line.
 const DATE_SCALE: usize = 2;
 /// Text scale of the large `HH:MM:SS` clock.
 const CLOCK_SCALE: usize = 8;
-/// Initial wall-clock time the boot screen starts from: 21:04:00. The live
-/// timer advances from here as PIT ticks accumulate.
+/// Fallback wall-clock start (21:04:00) when the kernel has no RTC reading. The
+/// live timer advances from here as PIT ticks accumulate.
 pub const CLOCK_START_H: u8 = 21;
 /// Initial minute (see [`CLOCK_START_H`]).
 pub const CLOCK_START_M: u8 = 4;
@@ -303,21 +305,21 @@ const fn clock_y(h: usize) -> usize {
 }
 
 /// Centered date line and a large clock, placed in the upper third.
-fn draw_clock_block(fb: &Framebuffer, cx: usize, h: usize) {
-    let date_w = font::text_width(CLOCK_DATE, DATE_SCALE);
+fn draw_clock_block(fb: &Framebuffer, cx: usize, h: usize, date: &str, start: (u8, u8, u8)) {
+    let date_w = font::text_width(date, DATE_SCALE);
     let date_x = cx.saturating_sub(date_w / 2);
     font::draw_text(
         fb,
         date_x,
         date_y(h),
-        CLOCK_DATE,
+        date,
         DATE_SCALE,
         TEXT_SECONDARY.pack(fb),
     );
 
     // Initial clock string, drawn through the shared formatter so the static and
     // live paths render identically.
-    draw_clock(fb, CLOCK_START_H, CLOCK_START_M, CLOCK_START_S);
+    draw_clock(fb, start.0, start.1, start.2);
 }
 
 /// Format a two-digit field into `buf[off..off+2]` (00–99), zero-padded.
