@@ -64,6 +64,11 @@ pub const VECTOR_RESCHED_IPI: u8 = 0xF0;
 /// timer-preempted exactly like the BSP's. LAPIC-delivered, so it owes a LAPIC
 /// EOI.
 pub const VECTOR_LAPIC_TIMER: u8 = 0xF1;
+/// Vector 242 (`0xF2`): the **AP wake IPI**. `hal::smp::start_cpu` sends it to
+/// release an application processor parked early by `hal::smp::park_cpu` (asleep
+/// in `sti; hlt` before the kernel owns it). The handler only EOIs: the release
+/// itself is a flag the AP re-checks after every wake.
+pub const VECTOR_AP_WAKE: u8 = 0xF2;
 
 /// Scheduler tick rate every core's LAPIC timer is programmed to: the same
 /// 100 Hz as the PIT, so `sched`'s `TIME_SLICE_TICKS` quantum keeps its meaning
@@ -314,6 +319,12 @@ fn handle_resched_ipi(_frame: &InterruptFrame) {
     crate::sched::on_resched_ipi();
 }
 
+/// Vector 242 — the AP wake IPI. Runs on a parked AP before the kernel owns it,
+/// so it touches no kernel state: EOI and return to the park wait.
+fn handle_ap_wake(_frame: &InterruptFrame) {
+    hal::apic::eoi();
+}
+
 // ── Public initialisation ─────────────────────────────────────────────────────
 
 /// Register CPU exception handlers and arm the GDT + TSS + IDT.
@@ -383,6 +394,9 @@ pub fn init_timer() {
     // Register the reschedule-IPI handler now too: `kmain` releases the
     // application processors after this, and the first IPI must find a handler.
     hal::interrupts::set_handler(VECTOR_RESCHED_IPI, handle_resched_ipi as Handler);
+    // The AP wake IPI: APs are parked (`smp::park_aps`) long before they are
+    // started, and each start sends this vector.
+    hal::interrupts::set_handler(VECTOR_AP_WAKE, handle_ap_wake as Handler);
     // And the per-core LAPIC-timer tick: registered before any core's timer is
     // started (`init_lapic_timer` on the BSP, `start_lapic_timer_here` on APs).
     hal::interrupts::set_handler(VECTOR_LAPIC_TIMER, handle_lapic_timer as Handler);

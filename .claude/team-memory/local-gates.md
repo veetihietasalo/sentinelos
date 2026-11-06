@@ -12,3 +12,5 @@ Gates that ran locally for #44 on 2026-10-25 (Rust 1.99.1 per `rust-toolchain.to
 **Why:** Veeti's box has no cargo or xorriso (company memory workstation-toolchain); the repo's SessionStart hook bootstraps a cloud container instead.
 
 **How to apply:** run the same list before asking for review and name the CI run for Miri and Kani. The Limine tag must match `.github/workflows/kernel.yml`.
+
+2026-11-06: `make test-kvm` runs locally too. Fedora WSL2 on Veeti's box has `/dev/kvm` (nested AMD-V); pass `--device /dev/kvm` to the same Debian container. It passed on `fix/ap-park-early` (#48).

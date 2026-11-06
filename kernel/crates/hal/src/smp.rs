@@ -29,21 +29,29 @@
 //! # Contract with the safe kernel
 //!
 //! - [`cpus`] / [`bsp_lapic_id`] expose the enumerated CPU list as plain data.
+//! - Early in boot (right after `apic::enable_bsp`, before the first `sti`) the
+//!   kernel may call [`park_cpu`] once per AP, passing the dense per-CPU index it
+//!   assigned: the AP leaves Limine's spin loop at once, runs its setup, and
+//!   sleeps in `sti; hlt` (see [`park_cpu`] for why spinning hangs VirtualBox).
 //! - The kernel registers its AP main with [`set_ap_main`], then calls
-//!   [`start_cpu`] once per AP (serially), passing the dense per-CPU index it
-//!   assigned. The AP arrives in the kernel's `ApMain` with an [`ApInfo`] after
-//!   [`ap_entry`] has, in a **fixed, branch-free order**: loaded this AP's private
-//!   GDT/TSS (with its own double-fault IST stack), loaded the shared IDT, enabled
-//!   its own vector state (`simd::enable`), and enabled its LAPIC (`apic::enable_ap`).
-//!   Interrupts stay masked throughout; the *kernel* decides when to `sti`.
-//! - **Invariant:** there is exactly one AP entry (`ap_entry`) and its sequence
-//!   contains no `sti`, so `CR4.OSXSAVE` is always set on an AP before its first
-//!   interrupt — and `isr_common` independently gates on the live bit anyway.
+//!   [`start_cpu`] once per AP (serially) with the same index and a wake vector
+//!   it has a handler for. The AP arrives in the kernel's `ApMain` with an
+//!   [`ApInfo`] after [`ap_entry`] has, in a **fixed order**: loaded this AP's
+//!   private GDT/TSS (with its own double-fault IST stack), loaded the shared
+//!   IDT, enabled its own vector state (`simd::enable`), enabled its LAPIC
+//!   (`apic::enable_ap`), and waited for its release flag.
+//! - **Invariant:** there is exactly one AP entry (`ap_entry`). Its only `sti` is
+//!   in the release wait, *after* `simd::enable`, so `CR4.OSXSAVE` is always set
+//!   on an AP before its first interrupt — and `isr_common` independently gates
+//!   on the live bit anyway. The wait clears IF on every wake, so `ApMain` is
+//!   entered with interrupts masked and the *kernel* decides when to `sti` there.
+//!   Before release only the wake IPI and LAPIC spurious (0xFF) can reach the AP:
+//!   its LINT0 is masked, its timer unarmed, and the IOAPIC routes to the BSP.
 //!
 //! All `unsafe` is registered in `kernel/docs/hal-tcb.md` (§2k).
 
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use limine::mp::Cpu;
 use limine::request::MpRequest;
@@ -101,6 +109,15 @@ pub type ApMain = fn(ApInfo) -> !;
 /// and parks defensively if it somehow did.
 static AP_MAIN: AtomicPtr<()> = AtomicPtr::new(null_mut());
 
+/// Per-AP "sent into [`ap_entry`]" flags, indexed by dense cpu index (slot 0, the
+/// BSP, is never set). Makes the `goto_address` write happen at most once per AP,
+/// whether [`park_cpu`] or [`start_cpu`] gets there first.
+static PARKED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Per-AP release flags, indexed by dense cpu index. [`ap_entry`] waits on its
+/// own flag after its setup and before it reads [`AP_MAIN`]; [`start_cpu`] sets it.
+static RELEASED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
 /// Why [`start_cpu`] declined to release an AP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartError {
@@ -115,6 +132,8 @@ pub enum StartError {
     BadCpuIndex,
     /// [`set_ap_main`] has not been called yet.
     NoApMain,
+    /// The AP was already parked by [`park_cpu`] under a different `cpu_index`.
+    IndexMismatch,
 }
 
 /// Iterate the bootloader's CPU list (BSP included), in its order.
@@ -163,23 +182,61 @@ pub fn set_ap_main(main: ApMain) {
 /// state its `ApMain` publishes (the kernel's per-CPU `online` flag) and should
 /// bring APs up **serially** — start one, wait for it (with a timeout), then the
 /// next — so a dead AP is logged and skipped rather than hanging the machine.
-pub fn start_cpu(limine_index: usize, cpu_index: u32) -> Result<(), StartError> {
-    if cpu_index == 0 || cpu_index as usize >= MAX_CPUS {
-        return Err(StartError::BadCpuIndex);
-    }
+pub fn start_cpu(limine_index: usize, cpu_index: u32, wake_vector: u8) -> Result<(), StartError> {
     if AP_MAIN.load(Ordering::Acquire).is_null() {
         return Err(StartError::NoApMain);
+    }
+    let cpu = enter_ap_entry(limine_index, cpu_index)?;
+    // Let the AP past its park wait, then wake it. The flag store is ordered
+    // before the IPI, and the AP checks the flag with IF = 0 before each
+    // `sti; hlt` — so an IPI that lands before the AP halts stays pending in its
+    // IRR and wakes the `hlt` at once (the `sti` shadow). `send_ipi` returns
+    // false without a LAPIC access path; the AP then polls instead of halting.
+    RELEASED[cpu_index as usize].store(true, Ordering::Release);
+    let _sent = crate::apic::send_ipi(cpu.lapic_id, wake_vector);
+    Ok(())
+}
+
+/// Send the AP at `limine_index` into [`ap_entry`] **now**, tagged with
+/// `cpu_index`, without releasing it to the kernel: it runs its setup, then
+/// sleeps in `sti; hlt` until [`start_cpu`] wakes it.
+///
+/// Why: Limine parks APs in a `pause` loop on `goto_address`. Under VirtualBox
+/// on Hyper-V (NEM) a vCPU in that loop never exits to the VMM, and VirtualBox
+/// runs device timers on its last vCPU's thread — so with 2+ vCPUs the PIT never
+/// fires and the BSP hangs at its first timer wait. Halted APs exit; spinning
+/// ones don't. Call once per AP right after [`crate::apic::enable_bsp`] (the AP
+/// reaches the LAPIC through the page it mapped) and before the first `sti`.
+/// Optional: [`start_cpu`] alone still works, as before.
+pub fn park_cpu(limine_index: usize, cpu_index: u32) -> Result<(), StartError> {
+    enter_ap_entry(limine_index, cpu_index).map(|_| ())
+}
+
+/// The shared half of [`park_cpu`] / [`start_cpu`]: validate, then write the
+/// AP's `extra` and `goto_address` exactly once. A repeat call for an AP
+/// already sent in must name the same `cpu_index`.
+fn enter_ap_entry(limine_index: usize, cpu_index: u32) -> Result<&'static Cpu, StartError> {
+    if cpu_index == 0 || cpu_index as usize >= MAX_CPUS {
+        return Err(StartError::BadCpuIndex);
     }
     // SAFETY: same response borrow as `cpus` (B1-pattern); the `&Cpu` we index
     // out of it points into the bootloader-owned, never-reclaimed CPU array and
     // is valid for the whole run.
     let response = MP_REQUEST.get_response().ok_or(StartError::NoResponse)?;
-    let cpu: &Cpu = response
+    let cpu: &'static Cpu = response
         .cpus()
         .get(limine_index)
         .ok_or(StartError::BadIndex)?;
     if cpu.lapic_id == response.bsp_lapic_id() {
         return Err(StartError::IsBsp);
+    }
+    if PARKED[cpu_index as usize].swap(true, Ordering::AcqRel) {
+        // Already sent in by an earlier call: only the index must agree.
+        return if cpu.extra.load(Ordering::Acquire) == u64::from(cpu_index) {
+            Ok(cpu)
+        } else {
+            Err(StartError::IndexMismatch)
+        };
     }
     // Hand the AP its dense index through the protocol's free-for-use slot. The
     // `goto_address` store below is `SeqCst`, and the protocol guarantees the AP
@@ -191,7 +248,7 @@ pub fn start_cpu(limine_index: usize, cpu_index: u32) -> Result<(), StartError> 
     // `ap_entry` is. The soundness obligation (that `ap_entry` is a valid AP entry
     // for the state Limine parks an AP in) is discharged at `ap_entry`.
     cpu.goto_address.write(ap_entry);
-    Ok(())
+    Ok(cpu)
 }
 
 /// The single AP entry point: the fixed, ordered privileged sequence every
@@ -234,7 +291,25 @@ unsafe extern "C" fn ap_entry(cpu: &Cpu) -> ! {
     // through the MMIO page the BSP mapped in `enable_bsp`.
     let lapic = crate::apic::enable_ap();
 
-    // (5) Hand off to the safe kernel. `start_cpu` refused to release us while
+    // (5) Wait for `start_cpu`. This is the sequence's only `sti`, and it comes
+    // after (3), so OSXSAVE is still set before this core's first interrupt.
+    // Each pass checks the flag with IF = 0, then `sti; hlt` as one asm block, so
+    // the wake IPI cannot slip in between; IF is cleared again on every wake, so
+    // the kernel's `ApMain` still starts with interrupts masked. With no LAPIC
+    // access path no IPI can reach us, so poll instead.
+    let Some(released) = RELEASED.get(cpu_index as usize) else {
+        crate::cpu::halt_loop();
+    };
+    while !released.load(Ordering::Acquire) {
+        if lapic.is_some() {
+            crate::cpu::enable_interrupts_and_halt();
+            crate::cpu::disable_interrupts();
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+
+    // (6) Hand off to the safe kernel. `start_cpu` refused to release us while
     // `AP_MAIN` was null, so it is set; park defensively if not.
     let raw = AP_MAIN.load(Ordering::Acquire);
     if raw.is_null() {
