@@ -240,3 +240,126 @@ fn write_dec_pad(v: u64, width: u32) {
     }
     hal::serial::write_dec(v);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hal::rtc::RtcRaw;
+
+    /// Status B as firmware usually leaves it: BCD, 24-hour.
+    const BCD_24H: u8 = STATUS_B_24H;
+
+    fn raw(status_b: u8, hours: u8) -> RtcRaw {
+        // 2026-11-06 23:40:01 in BCD, century 0x20.
+        RtcRaw {
+            seconds: 0x01,
+            minutes: 0x40,
+            hours,
+            day: 0x06,
+            month: 0x11,
+            year: 0x26,
+            century: 0x20,
+            status_b,
+        }
+    }
+
+    #[test]
+    fn decodes_bcd_24h() {
+        let t = decode(&raw(BCD_24H, 0x23)).unwrap();
+        assert_eq!((t.year, t.month, t.day), (2026, 11, 6));
+        assert_eq!((t.hour, t.minute, t.second), (23, 40, 1));
+        // 2026-11-06 is a Friday.
+        assert_eq!(t.weekday, 5);
+    }
+
+    #[test]
+    fn decodes_binary() {
+        let r = RtcRaw {
+            seconds: 1,
+            minutes: 40,
+            hours: 23,
+            day: 6,
+            month: 11,
+            year: 26,
+            century: 20,
+            status_b: STATUS_B_BINARY | STATUS_B_24H,
+        };
+        assert_eq!(decode(&r), decode(&raw(BCD_24H, 0x23)));
+    }
+
+    #[test]
+    fn twelve_hour_mode() {
+        // 12-hour BCD: bit 7 = PM.
+        assert_eq!(decode(&raw(0, 0x12)).unwrap().hour, 0); // 12 AM
+        assert_eq!(decode(&raw(0, 0x80 | 0x12)).unwrap().hour, 12); // 12 PM
+        assert_eq!(decode(&raw(0, 0x80 | 0x11)).unwrap().hour, 23); // 11 PM
+        assert_eq!(decode(&raw(0, 0x01)).unwrap().hour, 1); // 1 AM
+        assert_eq!(decode(&raw(0, 0x00)), None); // no hour 0 in 12-hour mode
+    }
+
+    #[test]
+    fn rejects_bad_values() {
+        assert_eq!(decode(&raw(BCD_24H, 0x24)), None); // hour 24
+        assert_eq!(decode(&raw(BCD_24H, 0x1A)), None); // not BCD
+        let mut r = raw(BCD_24H, 0x23);
+        r.month = 0x13;
+        assert_eq!(decode(&r), None);
+        r.month = 0x11;
+        r.day = 0x00;
+        assert_eq!(decode(&r), None);
+    }
+
+    #[test]
+    fn century_falls_back_to_20() {
+        let mut r = raw(BCD_24H, 0x23);
+        r.century = 0x00; // firmware doesn't keep one
+        assert_eq!(decode(&r).unwrap().year, 2026);
+        r.century = 0xFF; // garbage
+        assert_eq!(decode(&r).unwrap().year, 2026);
+    }
+
+    #[test]
+    fn calendar_math() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(weekday(0), 4); // Thursday
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        // Leap day, and the day after.
+        let leap = days_from_civil(2024, 2, 29);
+        assert_eq!(civil_from_days(leap), (2024, 2, 29));
+        assert_eq!(civil_from_days(leap + 1), (2024, 3, 1));
+        // 2100 is not a leap year.
+        assert_eq!(
+            civil_from_days(days_from_civil(2100, 2, 28) + 1),
+            (2100, 3, 1)
+        );
+    }
+
+    #[test]
+    fn rolls_over_midnight_and_year() {
+        let t = decode(&RtcRaw {
+            seconds: 0x59,
+            minutes: 0x59,
+            hours: 0x23,
+            day: 0x31,
+            month: 0x12,
+            year: 0x26,
+            century: 0x20,
+            status_b: BCD_24H,
+        })
+        .unwrap();
+        let next = from_epoch_secs(to_epoch_secs(&t) + 1);
+        assert_eq!((next.year, next.month, next.day), (2027, 1, 1));
+        assert_eq!((next.hour, next.minute, next.second), (0, 0, 0));
+        // 2027-01-01 is a Friday.
+        assert_eq!(next.weekday, 5);
+    }
+
+    #[test]
+    fn date_line_format() {
+        let t = decode(&raw(BCD_24H, 0x23)).unwrap();
+        assert_eq!(date_line(&t), "FRIDAY  NOVEMBER 6");
+        let mut r = raw(BCD_24H, 0x23);
+        r.day = 0x14; // 2026-11-14, a Saturday
+        assert_eq!(date_line(&decode(&r).unwrap()), "SATURDAY  NOVEMBER 14");
+    }
+}

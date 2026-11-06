@@ -385,6 +385,39 @@ pub fn draw_clock(fb: &Framebuffer, h: u8, m: u8, s: u8) {
     font::draw_text(fb, clock_x, cy, clock, CLOCK_SCALE, TEXT_PRIMARY.pack(fb));
 }
 
+/// Redraw **only** the lock screen's date line with `date` (the kernel calls
+/// this when the day rolls over).
+///
+/// Old and new dates differ in width, so the whole row is repainted from the
+/// same backdrop as [`draw_clock`] uses, then the new line is drawn centered
+/// where [`draw_boot_screen`] put it.
+pub fn draw_date(fb: &Framebuffer, date: &str) {
+    let w = fb.width();
+    let screen_h = fb.height();
+    if w == 0 || screen_h == 0 {
+        return;
+    }
+    let gradient = Gradient::three_stop(GRAD_START, GRAD_MID, GRAD_END, w, screen_h);
+    let pad = DATE_SCALE;
+    let y0 = date_y(screen_h).saturating_sub(pad);
+    let y1 = (date_y(screen_h) + font::GLYPH_SIZE * DATE_SCALE + pad).min(screen_h);
+    for py in y0..y1 {
+        for px in 0..w {
+            let c = backdrop_at(&gradient, px, py, w, screen_h);
+            fb.put_pixel(px, py, c.pack(fb));
+        }
+    }
+    let date_w = font::text_width(date, DATE_SCALE);
+    font::draw_text(
+        fb,
+        (w / 2).saturating_sub(date_w / 2),
+        date_y(screen_h),
+        date,
+        DATE_SCALE,
+        TEXT_SECONDARY.pack(fb),
+    );
+}
+
 /// The central translucent glass card with the wordmark, tagline and pill.
 fn draw_glass_card(fb: &Framebuffer, gradient: &Gradient, w: usize, h: usize) {
     // Card geometry: ~46 % of width, centered, sitting in the vertical middle.

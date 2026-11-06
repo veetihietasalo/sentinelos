@@ -423,6 +423,10 @@ fn do_run() -> ExitCode {
         "256M",
         "-cdrom",
         iso.to_str().unwrap(),
+        // The RTC keeps local time, as VirtualBox and Windows PCs do: the kernel
+        // shows the RTC as-is (no time zones yet, `kernel::wall`).
+        "-rtc",
+        "base=localtime",
         "-serial",
         "stdio",
         "-display",
@@ -1964,6 +1968,10 @@ fn qemu_base_args(kvm: bool, iso: &Path, serial_arg: &str) -> Vec<String> {
         "256M",
         "-cdrom",
         iso.to_str().unwrap(),
+        // The RTC keeps local time, as VirtualBox and Windows PCs do: the kernel
+        // shows the RTC as-is (no time zones yet, `kernel::wall`).
+        "-rtc",
+        "base=localtime",
         "-serial",
         serial_arg,
         "-display",
@@ -3060,6 +3068,10 @@ fn do_screenshot() -> ExitCode {
             "256M",
             "-cdrom",
             iso.to_str().unwrap(),
+            // The RTC keeps local time, as VirtualBox and Windows PCs do: the kernel
+            // shows the RTC as-is (no time zones yet, `kernel::wall`).
+            "-rtc",
+            "base=localtime",
             "-display",
             "none",
             "-no-reboot",

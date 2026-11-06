@@ -392,6 +392,8 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
     // Seconds elapsed at the previous clock redraw; "none drawn yet" so the first
     // whole second forces a draw.
     let mut last_secs: u64 = u64::MAX;
+    // Day of month the lock screen's date line shows; redrawn when it rolls over.
+    let mut shown_day: Option<u8> = None;
     // Last hint-pulse phase we drew, so we only repaint the hint when its
     // brightness step actually changes (keeps the locked screen cheap).
     let mut last_hint_phase: u64 = u64::MAX;
@@ -480,6 +482,12 @@ fn idle_loop(fb: Option<&hal::framebuffer::Framebuffer>) -> ! {
                     if let Some(fb) = fb {
                         let (h, m, s) = wall_clock(secs);
                         ui::draw_clock(fb, h, m, s);
+                        if let Some(t) = wall::at(secs) {
+                            if shown_day.is_some_and(|d| d != t.day) {
+                                ui::draw_date(fb, &wall::date_line(&t));
+                            }
+                            shown_day = Some(t.day);
+                        }
                     }
                 }
                 // Pulse the hint. Quantise the phase to a handful of steps per
