@@ -563,6 +563,15 @@ multi-core lock); APs publish into their slot and the BSP reports after `online`
 > stage; until then, trusting Limine's AP path is the same trust we already place
 > in its BSP path.
 
+## 2n. `hal::rtc` — CMOS real-time clock, read-only (VM polish)
+
+Reads the MC146818-compatible RTC's raw time/date registers for the lock-screen date and clock. Read-only, used once at boot on the BSP; decoding (BCD/binary, 12/24 h, century, weekday) is safe arithmetic in `kernel::wall`, outside the TCB. Index writes keep port `0x70` bit 7 clear, so the firmware's NMI mask is left as it was.
+
+| # | Location | Unsafe op | Why needed | Soundness argument | Verification |
+|---|----------|-----------|------------|--------------------|--------------|
+| RTC1 | `rtc.rs` · `cmos_read()` | `out 0x70, al` (register index, `& 0x7F`) then `in al, 0x71` | The only way to read the RTC | Port I/O touches no Rust memory (`nomem`, `nostack`, `preserves_flags`). Only read-only time/date/status registers are selected (0x00–0x0B, 0x32), so the read changes no device state. Not atomic across cores: the contract is a single caller, and boot reads it once on the BSP before the parked APs run kernel code. | Reasoned + QEMU, VirtualBox (`[rtc] YYYY-MM-DD HH:MM:SS` matches the host clock) |
+| RTC2 | `rtc.rs` · `read_once()` / `read()` | callers of RTC1 | Avoid a read that straddles the once-a-second update | Bounded waits only: UIP poll capped at 100 000 reads, read-until-stable capped at 8 attempts (then `None`, and the UI keeps its fixed fallback), so a missing or stuck RTC cannot hang boot. | Reasoned |
+
 ## 5. `hal::mm` — memory management (sub-project #2 part 1)
 
 Brings the kernel from "no heap" to a working `#[global_allocator]`: a physical
