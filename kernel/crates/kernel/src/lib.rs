@@ -157,6 +157,9 @@ pub fn kmain() -> ! {
     // precede `bring_up_aps`, and follow `init_timer` (PIT ticking) and
     // `apic::enable_bsp` (a LAPIC access path). Without one, the PIT keeps
     // driving preemption on the BSP alone, exactly as before.
+    // Measure the TSC against the PIT so the ATA waits are real durations
+    // (before the first disk access, `fs::prove_persistence` below).
+    interrupts::calibrate_tsc();
     interrupts::init_lapic_timer();
 
     // SMP phase 2: bring every application processor the bootloader parked into

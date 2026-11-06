@@ -62,6 +62,7 @@
 //! command can corrupt a transfer, never memory (hal-tcb §4 invariant 16, §7).
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Bytes per ATA sector (the universal 512-byte block size).
 pub const SECTOR_SIZE: usize = 512;
@@ -128,34 +129,104 @@ const CTRL_SRST: u8 = 1 << 2;
 /// polls; after a reset it states "no device interrupts" explicitly rather
 /// than inherit whatever the firmware left.
 const CTRL_NIEN: u8 = 1 << 1;
-/// TSC cycles SRST is held: ≥ 5 µs at any TSC ≤ 5 GHz.
-const SRST_HOLD: u64 = 25_000;
-/// TSC cycles to wait after clearing SRST before polling BSY: ≥ 2 ms at any
-/// TSC ≤ 5 GHz (the drive may not even assert BSY sooner).
-const SRST_SETTLE: u64 = 10_000_000;
 
 /// Status waits are bounded by **time**, not by a count of status reads (a
 /// count is no deadline: QEMU completes IDE PIO and `FLUSH CACHE`
 /// asynchronously through host `pwrite`/`fdatasync`, and under host write
 /// pressure 100 000 reads under TCG proved too short — CI's FS-1c runs).
-/// Deadlines are in TSC cycles, uncalibrated, so the budgets are generous for
-/// any plausible TSC rate (0.5–5 GHz): a sector or a command start ≥ 0.8 s,
-/// a `FLUSH CACHE` ≥ 8 s. A real disk that never answers still fails.
-const SECTOR_BUDGET: u64 = 4_000_000_000;
-/// See [`SECTOR_BUDGET`].
-const FLUSH_BUDGET: u64 = 40_000_000_000;
+/// Every budget is a **duration** ([`SECTOR_US`], [`FLUSH_US`], [`RESET_US`],
+/// [`SRST_HOLD_US`], [`SRST_SETTLE_US`]) turned into TSC cycles by
+/// [`cycles_for`]. Once the kernel has measured the TSC against the PIT
+/// ([`set_tsc_hz`]) the cycles are that rate plus a 25 % margin, so a wedged
+/// drive holds the channel about as long on a 0.5 GHz TSC as on a 5 GHz one.
+/// Until then (or if the measurement was refused) the rate is assumed to be
+/// [`FALLBACK_TSC_HZ`], the fastest plausible TSC, so a wait is never shorter
+/// than its duration at any TSC ≤ 5 GHz — only longer on a slower one. A real
+/// disk that never answers still fails.
+const SECTOR_US: u64 = 800_000;
+/// A `FLUSH CACHE`: ≥ 8 s.
+const FLUSH_US: u64 = 8_000_000;
 /// The wait for BSY to clear after a software reset: ATA allows a drive up to
-/// 31 s, so this is ≥ 31 s at any TSC ≤ 5 GHz. Only a drive that already
-/// timed out ever waits here.
-const RESET_BUDGET: u64 = 160_000_000_000;
-// ≥ 0.8 s per sector and ≥ 8 s per flush or reset even at 5 GHz, and the
-// backstop far above the old 100 000-read limit.
+/// 31 s. Only a drive that already timed out ever waits here.
+const RESET_US: u64 = 31_000_000;
+/// SRST is held ≥ 5 µs.
+const SRST_HOLD_US: u64 = 5;
+/// After clearing SRST, wait ≥ 2 ms before polling BSY (the drive may not even
+/// assert BSY sooner).
+const SRST_SETTLE_US: u64 = 2_000;
+
+/// The TSC rate assumed while none has been measured: the fastest plausible
+/// TSC, so every budget is at least its duration on any TSC up to this rate.
+const FALLBACK_TSC_HZ: u64 = 5_000_000_000;
+/// Measured rates outside `TSC_HZ_MIN..=TSC_HZ_MAX` are refused by
+/// [`set_tsc_hz`] (the waits keep the fallback): no x86-64 TSC runs slower
+/// than 100 MHz or faster than 10 GHz, so such a reading is a broken
+/// measurement, not a CPU.
+pub const TSC_HZ_MIN: u64 = 100_000_000;
+/// See [`TSC_HZ_MIN`].
+pub const TSC_HZ_MAX: u64 = 10_000_000_000;
+
+/// The measured TSC rate in Hz, `0` until [`set_tsc_hz`] accepts one.
+static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// Record the TSC rate the kernel measured against the PIT, so the ATA waits
+/// become real durations. **Set once:** the first accepted rate stays, later
+/// calls return `false`. A rate outside [`TSC_HZ_MIN`]`..=`[`TSC_HZ_MAX`] is
+/// refused (`false`) and the waits keep [`FALLBACK_TSC_HZ`]. Safe: the value
+/// only sizes deadlines; a wrong one makes a wait end early (`Timeout`, a
+/// channel reset, an error) or late, never a wrong success.
+pub fn set_tsc_hz(hz: u64) -> bool {
+    (TSC_HZ_MIN..=TSC_HZ_MAX).contains(&hz)
+        && TSC_HZ
+            .compare_exchange(0, hz, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
+/// The TSC rate the waits use: the measured one, if [`set_tsc_hz`] accepted
+/// one.
+#[must_use]
+pub fn tsc_hz() -> Option<u64> {
+    match TSC_HZ.load(Ordering::Relaxed) {
+        0 => None,
+        hz => Some(hz),
+    }
+}
+
+/// TSC cycles for a wait of `us` microseconds: at the measured rate plus 25 %
+/// (covers the calibration's error, a few PIT-interrupt latencies over a
+/// 100 ms window), or at [`FALLBACK_TSC_HZ`] when no rate is known. Pure, so
+/// the budgets are checked at compile time. No overflow: `us ≤ RESET_US` and
+/// `hz ≤ TSC_HZ_MAX` keep `us × hz × 5` below 2^61.
+const fn cycles_for(us: u64, measured_hz: Option<u64>) -> u64 {
+    match measured_hz {
+        Some(hz) => us * hz / 1_000_000 * 5 / 4,
+        None => us * FALLBACK_TSC_HZ / 1_000_000,
+    }
+}
+
+/// [`cycles_for`] at the rate the waits use now.
+fn budget(us: u64) -> u64 {
+    cycles_for(us, tsc_hz())
+}
+
+/// The fallback sector budget, in cycles (what [`budget`]`(SECTOR_US)` is
+/// before a rate is measured).
+#[cfg(test)]
+const SECTOR_BUDGET: u64 = cycles_for(SECTOR_US, None);
+
+// Unmeasured: the same cycle budgets as before the TSC was measured (≥ 0.8 s
+// per sector, ≥ 8 s per flush, ≥ 31 s per reset, ≥ 5 µs hold, ≥ 2 ms settle,
+// all at 5 GHz). Measured: at least the duration at the slowest and fastest
+// accepted rates. The backstop stays far above the old 100 000-read limit.
 const _: () = {
-    assert!(SECTOR_BUDGET >= 5_000_000_000 * 8 / 10);
-    assert!(FLUSH_BUDGET >= 5_000_000_000 * 8);
-    assert!(RESET_BUDGET >= 5_000_000_000 * 31);
-    assert!(SRST_HOLD >= 5_000 * 5); // 5 µs at 5 GHz
-    assert!(SRST_SETTLE >= 5_000_000 * 2); // 2 ms at 5 GHz
+    assert!(cycles_for(SECTOR_US, None) == 4_000_000_000);
+    assert!(cycles_for(FLUSH_US, None) == 40_000_000_000);
+    assert!(cycles_for(RESET_US, None) >= 5_000_000_000 * 31);
+    assert!(cycles_for(SRST_HOLD_US, None) >= 5_000 * 5);
+    assert!(cycles_for(SRST_SETTLE_US, None) >= 5_000_000 * 2);
+    assert!(cycles_for(SECTOR_US, Some(TSC_HZ_MIN)) >= TSC_HZ_MIN * 8 / 10);
+    assert!(cycles_for(RESET_US, Some(TSC_HZ_MAX)) >= TSC_HZ_MAX * 31);
+    assert!(cycles_for(SRST_HOLD_US, Some(TSC_HZ_MIN)) >= TSC_HZ_MIN / 200_000);
     assert!(POLL_BACKSTOP > 100_000 * 1000);
 };
 
@@ -372,14 +443,15 @@ fn drq_ready(s: u8) -> Poll {
     }
 }
 
-/// Wait (deadline `budget` TSC cycles) for BSY to clear; returns the status.
+/// Wait (deadline `budget` TSC cycles, from [`budget`]) for BSY to clear;
+/// returns the status.
 fn wait_not_busy_for(budget: u64) -> Result<u8, AtaError> {
     poll_until(status, crate::cpu::rdtsc, budget, POLL_BACKSTOP, not_busy)
 }
 
 /// Spin (deadline-bounded) until BSY clears, returning the final status byte.
 fn wait_not_busy() -> Result<u8, AtaError> {
-    wait_not_busy_for(SECTOR_BUDGET)
+    wait_not_busy_for(budget(SECTOR_US))
 }
 
 /// Spin (bounded) until BSY clears and DRQ sets (the drive wants a data word), or
@@ -388,7 +460,7 @@ fn wait_for_drq() -> Result<(), AtaError> {
     poll_until(
         status,
         crate::cpu::rdtsc,
-        SECTOR_BUDGET,
+        budget(SECTOR_US),
         POLL_BACKSTOP,
         drq_ready,
     )
@@ -399,10 +471,10 @@ fn wait_for_drq() -> Result<(), AtaError> {
 /// running, or stopped mid-transfer with DRQ pending, and the next command
 /// must not start against that. Software reset (SRST) aborts whatever the
 /// drive is doing and returns it to the post-reset state: write
-/// `SRST | nIEN`, hold ≥ 5 µs ([`SRST_HOLD`]), write `nIEN` (SRST clear,
+/// `SRST | nIEN`, hold ≥ 5 µs ([`SRST_HOLD_US`]), write `nIEN` (SRST clear,
 /// device interrupts off — this driver polls), wait ≥ 2 ms
-/// ([`SRST_SETTLE`]), then wait for BSY to clear (bounded by
-/// [`RESET_BUDGET`], the 31 s ATA allows). The next command selects the drive
+/// ([`SRST_SETTLE_US`]), then wait for BSY to clear (bounded by
+/// [`RESET_US`], the 31 s ATA allows). The next command selects the drive
 /// and programs every register again, as each one already does.
 fn reset_channel() {
     // SAFETY: writes the primary channel's Device Control register (`0x3F6`)
@@ -411,11 +483,11 @@ fn reset_channel() {
     // nIEN only gates the drive's interrupt line, which this driver never
     // uses); it cannot alias or corrupt Rust memory. `outb`'s contract holds.
     unsafe { outb(REG_DEVICE_CONTROL, CTRL_SRST | CTRL_NIEN) };
-    spin_cycles(SRST_HOLD);
+    spin_cycles(budget(SRST_HOLD_US));
     // SAFETY: as above, with SRST clear and nIEN set.
     unsafe { outb(REG_DEVICE_CONTROL, CTRL_NIEN) };
-    spin_cycles(SRST_SETTLE);
-    let _ = wait_not_busy_for(RESET_BUDGET);
+    spin_cycles(budget(SRST_SETTLE_US));
+    let _ = wait_not_busy_for(budget(RESET_US));
 }
 
 /// Busy-wait at least `cycles` TSC cycles (bounded by the read backstop if
@@ -497,8 +569,8 @@ fn issue_command(cmd: u8) {
 /// [`AtaError::DeviceError`]/[`AtaError::Timeout`] on a misbehaving controller.
 ///
 /// An absent disk answers at once (`NoDevice`); a present one that never
-/// answers now blocks its caller for up to [`SECTOR_BUDGET`] then the reset's
-/// [`SRST_SETTLE`] + [`RESET_BUDGET`] — seconds to tens of seconds, by design
+/// answers now blocks its caller for up to [`SECTOR_US`] then the reset's
+/// [`SRST_SETTLE_US`] + [`RESET_US`] — seconds to tens of seconds, by design
 /// (deadlines, not read counts). The kernel calls it from the `sfs-commit`
 /// task and the toy `kernel::fs` probe, never from an interrupt path.
 pub fn identify() -> Result<DiskInfo, AtaError> {
@@ -674,7 +746,7 @@ fn flush_inner() -> Result<(), AtaError> {
     delay_400ns();
     wait_not_busy()?;
     issue_command(CMD_FLUSH);
-    let s = wait_not_busy_for(FLUSH_BUDGET)?;
+    let s = wait_not_busy_for(budget(FLUSH_US))?;
     if s & (STATUS_ERR | STATUS_DF) != 0 {
         return Err(AtaError::DeviceError);
     }

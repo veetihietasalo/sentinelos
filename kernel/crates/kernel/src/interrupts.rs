@@ -412,6 +412,66 @@ fn counts_per_period(elapsed: u32, window_ticks: u64) -> Option<u32> {
     u32::try_from(per).ok().filter(|&p| p > 0)
 }
 
+/// PIT ticks the TSC measurement spans (10 ticks = 100 ms at 100 Hz). Both
+/// ends sit on a tick edge, so the error is a couple of interrupt latencies,
+/// well inside the 25 % margin `hal::ata` adds.
+const TSC_CALIBRATION_TICKS: u64 = 10;
+
+/// TSC rate in Hz from `cycles` counted over `window_ticks` PIT ticks. Pure
+/// integer math. `None` for an empty window or if the product overflows.
+#[must_use]
+fn tsc_hz_from(cycles: u64, window_ticks: u64) -> Option<u64> {
+    if window_ticks == 0 {
+        return None;
+    }
+    cycles
+        .checked_mul(hal::pit::TICK_HZ)
+        .map(|c| c / window_ticks)
+}
+
+/// Measure the BSP's TSC rate against the PIT and give it to `hal::ata`, so
+/// the disk waits are real durations instead of cycle counts sized for a
+/// 5 GHz TSC. **BSP only, once**, after `init_timer` (the PIT must be
+/// ticking) and before the first disk access (`fs::prove_persistence`).
+/// Opens the interrupt window for about [`TSC_CALIBRATION_TICKS`] + 1 PIT
+/// ticks and restores interrupts to disabled (the state `kmain` holds here).
+/// The TSC is assumed to tick at one rate on every core (constant TSC, every
+/// x86-64 CPU since ~2006); offsets between cores do not matter here, only
+/// the rate.
+///
+/// Prints one of:
+///
+/// ```text
+/// [tsc] 2995 MHz measured against the PIT; ata waits in real time
+/// [tsc] measurement refused (12 Hz); ata waits keep the 5 GHz fallback
+/// ```
+pub fn calibrate_tsc() {
+    hal::cpu::enable_interrupts();
+    let edge = hal::pit::ticks();
+    while hal::pit::ticks() == edge {
+        hal::cpu::halt();
+    }
+    let start_ticks = hal::pit::ticks();
+    let start_tsc = hal::cpu::rdtsc();
+    while hal::pit::ticks().wrapping_sub(start_ticks) < TSC_CALIBRATION_TICKS {
+        hal::cpu::halt();
+    }
+    let cycles = hal::cpu::rdtsc().wrapping_sub(start_tsc);
+    let window = hal::pit::ticks().wrapping_sub(start_ticks);
+    hal::cpu::disable_interrupts();
+
+    let hz = tsc_hz_from(cycles, window).unwrap_or(0);
+    if crate::blk::ata::set_tsc_hz(hz) {
+        hal::serial::write_str("[tsc] ");
+        hal::serial::write_dec(hz / 1_000_000);
+        hal::serial::write_str(" MHz measured against the PIT; ata waits in real time\n");
+    } else {
+        hal::serial::write_str("[tsc] measurement refused (");
+        hal::serial::write_dec(hz);
+        hal::serial::write_str(" Hz); ata waits keep the 5 GHz fallback\n");
+    }
+}
+
 /// Calibrate this core's LAPIC timer against the PIT and move the scheduler
 /// tick onto it (SMP phase 3). **BSP only, once**, after `init_timer` (the PIT
 /// must be ticking) and `hal::apic::enable_bsp` (a LAPIC access path must
