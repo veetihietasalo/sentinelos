@@ -5,3 +5,4 @@
 - [storage-caps-fs4-checks](storage-caps-fs4-checks.md) — Before FS-4 enforces storage caps, settle two FS-1c items - SnapshotRo binds by name only (bind the gen), and unusable op bits still install (refuse them in is_well_formed)
 - [kani-evidence](kani-evidence.md) — Read Kani results check by check in the CI log; UNREACHABLE means the check is vacuous and an unmet kani::cover! doesn't fail the run
 - [local-gates](local-gates.md) — The QEMU boot test runs locally in a Debian bookworm podman container (QEMU TCG, xorriso, Limine v11.4.1-binary); Miri and Kani run only in CI
+- [virtualbox-vm](virtualbox-vm.md) — VirtualBox 7.2 on Hyper-V boots 2+ vCPUs only with the early AP park (spinning APs starve its PIT); VM settings matching the QEMU devices

@@ -118,6 +118,11 @@ pub fn kmain() -> ! {
     // silently stopping the clock. See docs/specs/2026-07-14-smp-x2apic-design.md.
     match hal::apic::enable_bsp() {
         Some(lapic) => {
+            // Take the APs out of Limine's spin loop before the first `sti`: they
+            // set themselves up and sleep in `sti; hlt` until `bring_up_aps`
+            // wakes them. Spinning vCPUs starve VirtualBox's timers under
+            // Hyper-V, and the PIT wait below would never end (see `park_aps`).
+            smp::park_aps();
             let start = hal::pit::ticks();
             hal::cpu::enable_interrupts();
             while hal::pit::ticks() < start + 3 {

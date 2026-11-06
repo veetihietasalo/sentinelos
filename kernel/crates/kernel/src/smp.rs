@@ -253,6 +253,25 @@ pub(crate) fn plan(descs: &[CpuDesc], bsp_lapic_fallback: u32) -> BringUpPlan {
 
 // ── the BSP-side driver ───────────────────────────────────────────────────────
 
+/// Send every AP into `hal::smp::park_cpu` at once, with the dense index
+/// [`bring_up_aps`] will start it under: each runs its setup and sleeps in
+/// `sti; hlt` instead of spinning in Limine's loop (which hangs VirtualBox on
+/// Hyper-V with 2+ vCPUs: the PIT never fires). Call once on the BSP right after
+/// `apic::enable_bsp` returns a LAPIC and before the first `sti`.
+pub fn park_aps() {
+    let descs: Vec<CpuDesc> = hal::smp::cpus().collect();
+    if descs.is_empty() {
+        return;
+    }
+    // Same inputs as `bring_up_aps`, so `plan` gives the same dense indices;
+    // `start_cpu` refuses (and `bring_up_aps` logs) any AP parked under another.
+    let plan = plan(&descs, hal::apic::cpuid_apic_id());
+    for &(bootloader_index, cpu_index) in &plan.aps {
+        // A refusal here is reported by `bring_up_aps`, which tries again.
+        let _parked = hal::smp::park_cpu(bootloader_index, cpu_index);
+    }
+}
+
 /// Enumerate the bootloader's CPUs, bring every application processor online
 /// (serially, each bounded by [`AP_ONLINE_TIMEOUT_TICKS`]), and report.
 ///
@@ -330,7 +349,11 @@ pub fn bring_up_aps() {
         let cpu = &CPUS[cpu_index as usize];
         hal::serial::write_str("[smp] cpu");
         hal::serial::write_dec(u64::from(cpu_index));
-        match hal::smp::start_cpu(bootloader_index, cpu_index) {
+        match hal::smp::start_cpu(
+            bootloader_index,
+            cpu_index,
+            crate::interrupts::VECTOR_AP_WAKE,
+        ) {
             Ok(()) => {}
             Err(err) => {
                 aps_failed += 1;
@@ -421,6 +444,7 @@ fn start_error_label(err: StartError) -> &'static str {
         StartError::IsBsp => "entry is the BSP",
         StartError::BadCpuIndex => "bad cpu index",
         StartError::NoApMain => "no AP main registered",
+        StartError::IndexMismatch => "parked under another cpu index",
     }
 }
 
