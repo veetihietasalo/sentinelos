@@ -47,9 +47,12 @@ From power-on to an interactive desktop — all real, all verified in QEMU:
 - ✅ **Scheduler** — cooperative + timer-preemptive kernel threads, proven bit-exact under preemption
 - ✅ **Multi-core** — every application processor online with its own descriptor tables, vector state, LAPIC and timer tick; a per-CPU scheduler places tasks on any core, wakes it by IPI, and preempts them there
 - ✅ **AI/ML compute** — int8 GEMM on scalar / AVX2 / AVX-512 / VNNI tiers, self-tested per core at boot
+- ✅ **Components + capabilities** — content-addressed components on a kernel bus; the kernel stamps the sender, capabilities are deny by default and proven never to amplify
+- ✅ **SentinelFS core** — copy-on-write tree with SHA-256 on every pointer and two superblock slots; a commit torn mid-write in QEMU mounts the previous one intact
+- ✅ **IOAPIC routing** — interrupts routed from the ACPI MADT, legacy PIC masked
 - ✅ **Verified TCB** — Miri + Kani gate every `hal` change in CI
 
-🚧 **In flight:** the component model (native `hello` component verified and answered at boot; capabilities next), IOAPIC interrupt routing, the AMX inference tier, and a richer windowed desktop.
+🚧 **In flight:** SentinelFS FS-2 (files on the new tree), login and identity (spec proposed), component delegates (PR-3, waits on the memory-boundary decision), the AMX inference tier, and a richer windowed desktop.
 
 <div align="center">
 <img src="docs/images/shell.png" width="720" alt="The SentinelOS interactive shell — typing 'about' and getting real output"/>
@@ -118,9 +121,9 @@ The spine, from bare metal toward a usable, private desktop OS:
 - [x] **3 — Input + GUI** · keyboard, the Cyber Dusk boot screen, an interactive shell
 - [x] **4 — A real shell** · persistent filesystem, more built-ins
 - [x] **5 — Networking** · e1000 driver + ARP / IPv4 / ICMP *(TCP/UDP still to come)*
-- [x] **5b — SMP** · every core online, per-CPU scheduler, IPI wake-ups, per-core timer preemption *(IOAPIC next)*
+- [x] **5b — SMP** · every core online, per-CPU scheduler, IPI wake-ups, per-core timer preemption, IOAPIC routing
 - [ ] **6 — A windowed desktop** · compositor, launcher, multiple apps *(first slice landed)*
-- [ ] **7 — Component model** · content-addressed components, kernel-attested messaging, capabilities, delegates *(PR-1 landed: framed SHA-256 ids, envelope codec, inbox rings, native runtime)*
+- [ ] **7 — Component model** · content-addressed components, kernel-attested messaging, capabilities, delegates *(PR-1, PR-2, PR-2b landed: SHA-256 ids, bus, capabilities, routed services; delegates next)*
 - [ ] **8 — Sentinel as components** · `sentinel-core` unchanged as a component, a signed integrity log, PolicyAgent
 - [ ] **9 — The long road** · our own browser engine, broader hardware & app support
 
