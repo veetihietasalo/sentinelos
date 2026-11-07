@@ -221,7 +221,7 @@ the KDF params at [352,384) and a `keys` pointer at [392,440) to a kind-6 keyrin
   is always bootable.
 - **Commit identity split (standing rule).** Commits Claude authors are
   committed as `Claude <noreply@anthropic.com>` (the repo's stop hook checks
-  this) and **always** carry a `Co-Authored-By: Veeti Väinö Valtteri Hietasalo <33787357+veetihietasalo@users.noreply.github.com>`
+  this) and **always** carry a `Co-Authored-By: Veeti Väinö Valtteri Hietasalo <…>` (his GitHub noreply address, copy it from any recent commit)
   trailer so Veeti is credited as a contributor on every one, plus the Claude
   attribution trailers last.
 - Boot proofs are hard assertions in `kernel/xtask` (`make test`), never prose.

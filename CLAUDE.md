@@ -1,3 +1,3 @@
 # SentinelOS
 
-Team memory: read `.claude/team-memory/INDEX.md` before you start. Record what a teammate would need with the `team-memory` skill; where it isn't loaded (cloud sessions), copy an existing fact file's format and add its INDEX line, on your PR branch or the open `claude/team-memory` PR.
+Team memory is local only: `.claude/team-memory/` is gitignored, since the repo is public (2026-11-07). Read its `INDEX.md` if it exists on this machine, and record what a teammate would need with the `team-memory` skill.
