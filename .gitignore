@@ -39,3 +39,6 @@ graphify-out/
 
 # Limine bootloader (fetched at build time, not tracked)
 kernel/limine/
+
+# Local agent team memory, not published
+.claude/team-memory/
