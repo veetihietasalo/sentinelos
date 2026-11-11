@@ -14,7 +14,7 @@
     "still": "npm run sync-frames && remotion still src/index.ts SentinelDemo out/poster.png --frame=90"
   },
   "dependencies": {
-    "@remotion/cli": "4.0.471",
+    "@remotion/cli": "4.0.542",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "remotion": "4.0.471"
